@@ -1,0 +1,57 @@
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Server: qe/0.1
+Cache-Control: no-cache
+X-Accel-Buffering: no
+Connection: close
+0.000694	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+0.000694	
+2.034984	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":"Both"},"logprobs":null,"finish_reason":null}]}
+2.034984	
+2.162262	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":" commands"},"logprobs":null,"finish_reason":null}]}
+2.162262	
+2.284497	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":" have"},"logprobs":null,"finish_reason":null}]}
+2.284497	
+2.417810	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":" finished"},"logprobs":null,"finish_reason":null}]}
+2.417810	
+2.537660	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":" executing"},"logprobs":null,"finish_reason":null}]}
+2.537660	
+2.648089	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":"."},"logprobs":null,"finish_reason":null}]}
+2.648089	
+2.761149	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"reasoning_content":"\n"},"logprobs":null,"finish_reason":null}]}
+2.761149	
+3.098979	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"\n\nBoth"},"logprobs":null,"finish_reason":null}]}
+3.098979	
+3.209510	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":" finished"},"logprobs":null,"finish_reason":null}]}
+3.209510	
+3.324098	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":":"},"logprobs":null,"finish_reason":null}]}
+3.324098	
+3.442011	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":" `"},"logprobs":null,"finish_reason":null}]}
+3.442011	
+3.556223	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"FIRST"},"logprobs":null,"finish_reason":null}]}
+3.556223	
+3.668780	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"CALL"},"logprobs":null,"finish_reason":null}]}
+3.668780	
+3.782048	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"MARK"},"logprobs":null,"finish_reason":null}]}
+3.782048	
+3.891797	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"`,"},"logprobs":null,"finish_reason":null}]}
+3.891797	
+4.001476	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":" `"},"logprobs":null,"finish_reason":null}]}
+4.001476	
+4.114326	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"SE"},"logprobs":null,"finish_reason":null}]}
+4.114326	
+4.230273	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"CON"},"logprobs":null,"finish_reason":null}]}
+4.230273	
+4.341686	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"DCALL"},"logprobs":null,"finish_reason":null}]}
+4.341686	
+4.451616	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"MARK"},"logprobs":null,"finish_reason":null}]}
+4.451616	
+4.561469	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{"content":"`."},"logprobs":null,"finish_reason":null}]}
+4.561469	
+4.680668	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+4.680668	
+4.680685	data: {"id":"chatcmpl-6afdca55000a","object":"chat.completion.chunk","created":1795017301,"model":"qe","choices":[],"usage":{"prompt_tokens":13430,"completion_tokens":23,"total_tokens":13453,"prompt_tokens_details":{"cached_tokens":13342},"completion_tokens_details":{"reasoning_tokens":7}}}
+4.680685	
+4.680695	data: [DONE]
+4.680695	
+4.680695	

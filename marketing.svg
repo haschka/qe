@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Helvetica Neue, Arial, sans-serif" width="1080" height="1080" viewBox="0 0 1080 1080" role="img" aria-label="qe: a CPU-only inference engine for an 87 GiB mixture-of-experts model, benchmarked against llama.cpp on one machine">
+  <defs>
+    <radialGradient id="bg" cx="20%" cy="6%" r="125%">
+      <stop offset="0%" stop-color="#122140"/>
+      <stop offset="52%" stop-color="#080f1f"/>
+      <stop offset="100%" stop-color="#04070f"/>
+    </radialGradient>
+    <linearGradient id="gCy" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="gLi" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#a3e635"/>
+      <stop offset="100%" stop-color="#22c55e"/>
+    </linearGradient>
+    <linearGradient id="gVi" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="gAm" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#f97316"/>
+    </linearGradient>
+    <linearGradient id="gRd" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#fb7185"/>
+      <stop offset="100%" stop-color="#e11d48"/>
+    </linearGradient>
+    <linearGradient id="gTx" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#eafcff"/>
+      <stop offset="55%" stop-color="#7dd3fc"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse">
+      <path d="M60 0H0V60" fill="none" stroke="#3b82f6" stroke-width="1" opacity="0.10"/>
+    </pattern>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="12" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="34"/>
+    </filter>
+  </defs>
+
+
+  <rect width="1080" height="1080" fill="url(#bg)"/>
+  <rect width="1080" height="1080" fill="url(#grid)"/>
+  <g opacity="0.5">
+    <ellipse cx="140" cy="60" rx="300" ry="200" fill="#0ea5e9" filter="url(#soft)"/>
+    <ellipse cx="980" cy="880" rx="290" ry="210" fill="#7c3aed" filter="url(#soft)"/>
+  </g>
+  <g fill="none" stroke="#22d3ee" stroke-width="4" opacity="0.55">
+    <path d="M36 92V36h56"/>
+    <path d="M1044 92V36h-56"/>
+    <path d="M36 1000v44h44"/>
+    <path d="M1044 1000v44h-44"/>
+  </g>
+
+  <!-- header -->
+  <text x="60" y="128" font-size="100" font-weight="700" fill="url(#gTx)" filter="url(#glow)">qe</text>
+  <rect x="742" y="64" width="278" height="58" rx="29" fill="none" stroke="#a3e635" stroke-width="2" opacity="0.85"/>
+  <text x="881" y="104" text-anchor="middle" font-size="28" font-weight="700" letter-spacing="3" fill="#a3e635">NO GPU CODE</text>
+  <text x="60" y="182" font-size="29" font-weight="700" letter-spacing="3" fill="#93abcb">CPU-ONLY INFERENCE, TUNED TO ONE MACHINE</text>
+  <path d="M60 204h960" stroke="#1e3a5f" stroke-width="1.5"/>
+
+  <!-- feature grid -->
+  <text x="60" y="258" font-size="29" font-weight="700" letter-spacing="3" fill="#93abcb">WHAT MAKES IT FAST HERE</text>
+  <g>
+    <rect x="60" y="280" width="305" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+    <rect x="388" y="280" width="305" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+    <rect x="716" y="280" width="304" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+    <rect x="60" y="440" width="305" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+    <rect x="388" y="440" width="305" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+    <rect x="716" y="440" width="304" height="140" rx="10" fill="#0b1526" stroke="#1e3a5f" stroke-width="1.5"/>
+
+    <rect x="60" y="280" width="305" height="6" fill="url(#gCy)"/>
+    <rect x="388" y="280" width="305" height="6" fill="url(#gLi)"/>
+    <rect x="716" y="280" width="304" height="6" fill="url(#gAm)"/>
+    <rect x="60" y="440" width="305" height="6" fill="url(#gVi)"/>
+    <rect x="388" y="440" width="305" height="6" fill="url(#gRd)"/>
+    <rect x="716" y="440" width="304" height="6" fill="url(#gCy)"/>
+
+    <text x="88" y="338" font-size="38" font-weight="700" fill="#ffffff">87 GiB</text>
+    <text x="88" y="376" font-size="30" font-weight="400" fill="#a3b8d4">resident before</text>
+    <text x="88" y="406" font-size="30" font-weight="400" fill="#a3b8d4">the port opens</text>
+
+    <text x="416" y="338" font-size="38" font-weight="700" fill="#ffffff">int8</text>
+    <text x="416" y="376" font-size="30" font-weight="400" fill="#a3b8d4">dense copy is</text>
+    <text x="416" y="406" font-size="30" font-weight="400" fill="#a3b8d4">made at load</text>
+
+    <text x="744" y="338" font-size="38" font-weight="700" fill="#ffffff">10 / 512</text>
+    <text x="744" y="376" font-size="30" font-weight="400" fill="#a3b8d4">experts read</text>
+    <text x="744" y="406" font-size="30" font-weight="400" fill="#a3b8d4">per token</text>
+
+    <text x="88" y="498" font-size="38" font-weight="700" fill="#ffffff">k = 1</text>
+    <text x="88" y="536" font-size="30" font-weight="400" fill="#a3b8d4">the draft length</text>
+    <text x="88" y="566" font-size="30" font-weight="400" fill="#a3b8d4">that wins</text>
+
+    <text x="416" y="498" font-size="38" font-weight="700" fill="#ffffff">83 GB/s</text>
+    <text x="416" y="536" font-size="30" font-weight="400" fill="#a3b8d4">read on 8 cores,</text>
+    <text x="416" y="566" font-size="30" font-weight="400" fill="#a3b8d4">AVX-VNNI</text>
+
+    <text x="744" y="498" font-size="38" font-weight="700" fill="#ffffff">2 libs</text>
+    <text x="744" y="536" font-size="30" font-weight="400" fill="#a3b8d4">pthread, libm:</text>
+    <text x="744" y="566" font-size="30" font-weight="400" fill="#a3b8d4">nothing else</text>
+  </g>
+
+  <!-- benchmark panels -->
+  <text x="60" y="636" font-size="29" font-weight="700" letter-spacing="3" fill="#93abcb">AGAINST LLAMA.CPP &#183; TOKENS/SEC</text>
+  <g>
+    <rect x="60" y="656" width="470" height="292" rx="10" fill="#0a1424" stroke="#1b3355" stroke-width="1.5"/>
+    <text x="88" y="706" font-size="31" font-weight="700" letter-spacing="2" fill="#e0ecfd">PREFILL</text>
+    <text x="502" y="710" text-anchor="end" fill="#22d3ee" font-size="56" font-weight="700">1.22x</text>
+
+    <text x="88" y="754" font-size="30" font-weight="400" fill="#b6cae4">qe</text>
+    <text x="502" y="756" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">62.9</text>
+    <rect x="88" y="768" width="414" height="26" rx="4" fill="url(#gCy)"/>
+
+    <text x="88" y="826" font-size="30" font-weight="400" fill="#b6cae4">llama.cpp</text>
+    <text x="502" y="828" text-anchor="end" fill="#c3d3e8" font-size="35" font-weight="700" >51.3</text>
+    <rect x="88" y="840" width="338" height="26" rx="4" fill="#3b5c8c"/>
+
+    <text x="88" y="906" font-size="29" font-weight="400" fill="#7d92b0">512 rows, one batch</text>
+
+    <rect x="550" y="656" width="470" height="292" rx="10" fill="#0a1424" stroke="#1b3355" stroke-width="1.5"/>
+    <text x="578" y="706" font-size="31" font-weight="700" letter-spacing="2" fill="#e0ecfd">GENERATE</text>
+    <text x="992" y="710" text-anchor="end" fill="#a3e635" font-size="56" font-weight="700">1.51x</text>
+
+    <text x="578" y="750" font-size="30" font-weight="400" fill="#b6cae4">qe + MTP</text>
+    <text x="992" y="752" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">11.5</text>
+    <rect x="578" y="762" width="414" height="24" rx="4" fill="url(#gVi)"/>
+
+    <text x="578" y="812" font-size="30" font-weight="400" fill="#b6cae4">qe</text>
+    <text x="992" y="814" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">10.9</text>
+    <rect x="578" y="824" width="393" height="24" rx="4" fill="url(#gLi)"/>
+
+    <text x="578" y="874" font-size="30" font-weight="400" fill="#b6cae4">llama.cpp</text>
+    <text x="992" y="876" text-anchor="end" fill="#c3d3e8" font-size="35" font-weight="700" >7.65</text>
+    <rect x="578" y="886" width="276" height="24" rx="4" fill="#3b5c8c"/>
+
+    <text x="578" y="926" font-size="29" font-weight="400" fill="#7d92b0">one token at a time</text>
+  </g>
+
+  <!-- footer -->
+  <path d="M60 990h960" stroke="#1e3a5f" stroke-width="1.5"/>
+  <text x="60" y="1028" font-family="DejaVu Sans Mono, ui-monospace, monospace" font-size="29" font-weight="400" fill="#a3e635">$ make &amp;&amp; ./bin/qe-serve --model qwen.gguf</text>
+  <text x="60" y="1062" font-size="29" font-weight="400" fill="#7d92b0">48 layers &#183; 2560 wide &#183; 512 experts &#183; one CPU, no accelerator</text>
+</svg>
