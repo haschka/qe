@@ -40,6 +40,8 @@
 */
 #include "qe.h"
 
+#include "kern.h"
+
 #include <math.h>
 #include <string.h>
 
@@ -47,31 +49,9 @@
 #include <immintrin.h>
 #endif
 
-#define LOG2E 1.4426950408889634f
-
-/* exp2 for eight floats, ~1e-7 relative: round to an integer exponent, degree-5
- * minimax for the remaining [-0.5, 0.5], and put the integer into the exponent
- * field by addition. Clamped first because the exponent trick has no meaning
- * outside the float range and the only caller saturates anyway. */
-static inline __m256 qe_exp2_avx2(__m256 x) {
-    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-100.0f)), _mm256_set1_ps(100.0f));
-    __m256i n = _mm256_cvtps_epi32(x);
-    __m256 f = _mm256_sub_ps(x, _mm256_cvtepi32_ps(n));
-    __m256 p = _mm256_set1_ps(1.3333558146428443e-3f);
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(9.6181291076284778e-3f));
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.5504108664815974e-2f));
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(2.4022650695910071e-1f));
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(6.9314718055994531e-1f));
-    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
-    /* p is in [0.707, 1.414], so adding to the exponent cannot carry into the
-     * sign bit or denormalise; that is why f is reduced to [-0.5, 0.5] first. */
-    return _mm256_castsi256_ps(_mm256_add_epi32(_mm256_castps_si256(p),
-                                                _mm256_slli_epi32(n, 23)));
-}
-
 static inline __m256 qe_sigmoid_avx2(__m256 x) {
     __m256 e = qe_exp2_avx2(_mm256_mul_ps(_mm256_sub_ps(_mm256_setzero_ps(), x),
-                                          _mm256_set1_ps(LOG2E)));
+                                          _mm256_set1_ps(QE_LOG2E)));
     return _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(_mm256_set1_ps(1.0f), e));
 }
 
@@ -472,6 +452,12 @@ static inline void qe_scale_row(float *restrict y, float a, long n) {
         y[i] *= a;
 }
 
+/* The heads of one cell batched so that their weights are one exponential call.
+ * Twelve is `per` at this checkpoint, so a cell is one eight-wide exp2 and four
+ * scalar polynomials; the bound exists to keep the two scratch rows on the stack
+ * and degrades to a head at a time for a checkpoint whose group is wider. */
+#define QE_ATTN_SIMD_MAX 16
+
 void qe_attn_walk(const qe_attn_unit *u) {
     const long hd = u->hd;
     for (int h = 0; h < u->per; h++) {
@@ -493,24 +479,46 @@ void qe_attn_walk(const qe_attn_unit *u) {
             kf = u->kc + (size_t)cell * (long)u->krow + (size_t)u->kv_head * hd;
             vf = u->vc + (size_t)cell * (long)u->krow + (size_t)u->kv_head * hd;
         }
-        for (int h = 0; h < u->per; h++) {
-            const float *q = u->q + (size_t)h * hd;
-            float *y = u->y + (size_t)h * hd;
-            float s = (u->q8 ? qe_dot_q8(q, kq, hd) : qe_dot(q, kf, hd)) * ks;
-            s *= u->scale;
-            float m = u->m[h];
-            if (s - m > QE_ATTN_RESCALE_NATS) {
-                const float alpha = expf(m - s);
-                u->m[h] = m = s;
-                qe_scale_row(y, alpha, hd);
-                u->l[h] *= alpha;
+        for (int h0 = 0; h0 < u->per; h0 += QE_ATTN_SIMD_MAX) {
+            const int nb =
+                u->per - h0 < QE_ATTN_SIMD_MAX ? u->per - h0 : QE_ATTN_SIMD_MAX;
+            float d[QE_ATTN_SIMD_MAX], w[QE_ATTN_SIMD_MAX];
+            /* Scores and bases first, weights after, because the wide form wants a
+             * cell's exponents at once. A head whose score runs past its base still
+             * rescales here, in place, one head at a time: the accumulator it pulls
+             * up cannot be shared with a neighbour's. Its own exponent is then zero,
+             * and both forms return exactly one at zero, which is what keeps a
+             * rescale identical under QE_EXP2_SIMD rather than approximately so. */
+            for (int h = 0; h < nb; h++) {
+                const int hh = h0 + h;
+                const float *q = u->q + (size_t)hh * hd;
+                float s = (u->q8 ? qe_dot_q8(q, kq, hd) : qe_dot(q, kf, hd)) * ks;
+                s *= u->scale;
+                float m = u->m[hh];
+                if (s - m > QE_ATTN_RESCALE_NATS) {
+                    const float alpha = expf(m - s);
+                    u->m[hh] = m = s;
+                    qe_scale_row(u->y + (size_t)hh * hd, alpha, hd);
+                    u->l[hh] *= alpha;
+                    d[h] = 0.0f;
+                } else {
+                    d[h] = s - m;
+                }
             }
-            const float w = expf(s - m);
-            u->l[h] += w;
-            if (u->q8)
-                qe_axpy_q8(y, vq, w * vs, hd);
+            if (u->exp2)
+                qe_exp2v(d, w, nb);
             else
-                qe_axpy(y, vf, w * vs, hd);
+                for (int h = 0; h < nb; h++)
+                    w[h] = expf(d[h]);
+            for (int h = 0; h < nb; h++) {
+                const int hh = h0 + h;
+                float *y = u->y + (size_t)hh * hd;
+                u->l[hh] += w[h];
+                if (u->q8)
+                    qe_axpy_q8(y, vq, w[h] * vs, hd);
+                else
+                    qe_axpy(y, vf, w[h] * vs, hd);
+            }
         }
     }
 }

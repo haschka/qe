@@ -37,9 +37,10 @@ ENGOBJ := $(ENG:.c=.o)
 BIN := bin/bench_kern bin/bench_gemv bin/bench_moe bin/bench_mtp bin/bench_json bin/bench_chat \
        bin/bench_route bin/bench_stage bin/bench_tok bin/bench_ple bin/bench_prefill \
        bin/bench_forward bin/bench_score bin/bench_pool bin/bench_prefix bin/bench_alu \
-       bin/bench_sample bin/bench_turns bin/bench_walk bin/bench_cosched bin/bench_serve
+       bin/bench_sample bin/bench_turns bin/bench_walk bin/bench_cosched bin/bench_serve \
+       bin/bench_batch
 
-.PHONY: all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup
+.PHONY: all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve lane score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup batch
 
 all: $(BIN) bin/qe-serve
 
@@ -139,6 +140,12 @@ bin/bench_forward: $(COREOBJ) src/mtp.o bench/bench_forward.c | bin
 # layer class that stopped helping, and the wall clock of a step by stage.
 bin/bench_score: $(COREOBJ) bench/bench_score.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_score.c $(LDFLAGS)
+
+# B sequences through one walk of the weights: the byte identity of a batched row against
+# that same sequence walked alone, and the aggregate tokens per second the shared weight
+# read is worth.
+bin/bench_batch: $(COREOBJ) bench/bench_batch.c | bin
+	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_batch.c $(LDFLAGS)
 
 bin/qe-serve: $(COREOBJ) $(ENGOBJ) src/main.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) $(ENGOBJ) src/main.c $(LDFLAGS)
@@ -567,6 +574,20 @@ head: bin/bench_forward
 	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_forward --model $(CHECKPOINT) --mtp $(MTP) \
 	  --threads $(THREADS) --fuse $(FUSE) --max 24 --repeat $(REPEAT)
 
+# B sequences through the trunk in one walk of the weights, against B passes of one
+# sequence. The rows have to be byte-identical on the arithmetic a batch shares no copy
+# with, and the shipped one then says what the shared weight read is worth per token and
+# what a multi-row chunk costs the answer. SEQ are the widths to run; the batched pass is
+# opened once, at the widest of them, and a pass at B splits its cells B ways. That last
+# pass then walks a row map that moves - sequences joining mid-conversation, siblings
+# leaving, slots recycled - because a byte-identical row over the full map and a
+# contaminated row of a half-empty one look the same to a client, and only one of them
+# looks like a bug to this target.
+SEQ ?= 1,2,4,8
+batch: bin/bench_batch
+	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_batch $(CHECKPOINT) --threads $(THREADS) \
+	  --seq $(SEQ) --deadline $$(( $(FUSE) + 840 ))
+
 # Sequence reuse over the conversation shapes a client actually sends: five of
 # them, each with its second turn run once reusing what the first left standing
 # and once cold, and the two continuations compared token id by token id -
@@ -586,6 +607,21 @@ prefix: bin/bench_prefix
 serve: bin/bench_serve
 	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_serve --model $(CHECKPOINT) --threads $(THREADS) \
 	  --fuse $(FUSE) --max $(or $(MAX),24) --narrow $(or $(NARROW),512) --wide $(or $(WIDE),2048)
+
+# The same harness with N sequences in the engine, which flips its one ratchet: a wave that
+# still costs the sum of its parts is a lane that never filled, so what gets asserted instead
+# is the step - a step with N rows in it against N steps of one row - plus the two things a
+# shared weight read could plausibly get wrong, which are a lane answered out of another
+# lane's logits and a sequence recycled from the last request still holding a recurrence that
+# changes this one's first token. The makespan is printed and not asserted because it is a
+# function of how much of the traffic is ingestion, and a batch does not make an ingestion
+# cheaper. BATCH is the engine's sequences; the lane's wave uses all of them and asks 64
+# tokens each, and the window widens with BATCH unless --ctx says otherwise.
+BATCH ?= 4
+lane: bin/bench_serve
+	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_serve --model $(CHECKPOINT) --threads $(THREADS) \
+	  --fuse $(FUSE) --batch $(BATCH) --max $(or $(MAX),24) --narrow $(or $(NARROW),512) \
+	  --wide $(or $(WIDE),2048)
 
 # The instrument, and the only thing that can tell a finite wrong answer from a
 # right one: teacher-forced loss per token per variant, greedy text, the depth-probe

@@ -1055,15 +1055,22 @@ int main(int argc, char **argv) {
              * grid lookups, a sign spread and a compare per 32 weights, and that is
              * what the second column stops paying T times. */
             printf("\nshared dequantisation, every row on the same experts, %d threads\n", nthr);
-            printf("%-5s %12s %12s %9s %9s %9s %9s\n", "rows", "per-row ms", "shared ms",
-                   "shared", "reg ms", "int ms", "int+rs ms");
+            printf("%-5s %12s %12s %9s %9s %9s %9s %9s\n", "rows", "per-row ms", "shared ms",
+                   "shared", "reg ms", "int ms", "int+rs ms", "pair q4");
             printf("      (reg = the same walk with the dequantised block held in four\n"
                    "       registers instead of parked in an L1 line; int = the same pass\n"
                    "       with the chunk's activations recoded to int8 and the experts\n"
                    "       walked with vpdpbusd; int+rs = that pass with one scale for a\n"
                    "       whole activation row instead of one per 32 values, which is what\n"
-                   "       takes two of the four exit operands out of the token loop. All\n"
-                   "       three are ratios to shared ms; lower is better)\n");
+                   "       takes two of the four exit operands out of the token loop; pair q4\n"
+                   "       = the first column again with a second output row forced onto the\n"
+                   "       iq4_nl walk as well, which is the one thing this host ships off.\n"
+                   "       All four are ratios to shared ms; lower is better)\n"
+                   "      (gates in force: iq3_s pairs from rows >= %d, iq4_nl from rows >= %d;\n"
+                   "       0 = never. Rows 2 and 4 are a control: no bucket that narrow reaches\n"
+                   "       the pair form on either leg, so the spread between their two\n"
+                   "       readings is this run's noise floor)\n",
+                   qe_iq_pair_min_t(QE_IQ3_S), qe_iq_pair_min_t(QE_IQ4_NL));
             for (int ti = 0; ti < NT; ti++) {
                 int T = TS[ti];
                 qe_moe_desc md = d;
@@ -1082,20 +1089,28 @@ int main(int argc, char **argv) {
                         R[(size_t)t * TOPK + e].expert = e;
                         R[(size_t)t * TOPK + e].weight = 1.0f / TOPK;
                     }
-                /* Four legs and one pool: the walk that parks the dequantised block in an
+                /* Six legs and one pool: the walk that parks the dequantised block in an
                  * L1 line, the walk that keeps it in registers, the pass that walks the
-                 * quantiser once per row, and that pass with a row-scaled panel. The order
+                 * quantiser once per row, that pass with a row-scaled panel, and the first of
+                 * them again with iq4_nl pairing rows whether or not its own gate says to. A
+                 * bucket mixes gate/up iq3_s with down iq4_nl in one pass and the two formats
+                 * do not agree about the second accumulator, so the mixed answer is its own
+                 * measurement and not the average of the two kernel tables. The order
                  * reverses every other pass, because the two shared legs differ by four loads
                  * a row and a leg that always follows the same neighbour inherits its
                  * warm-up. */
-                double tshare = 1e30, tsolo = 1e30, treg = 1e30, ti8 = 1e30, trs = 1e30;
+                double tshare = 1e30, tsolo = 1e30, treg = 1e30, ti8 = 1e30, trs = 1e30, tq4 = 1e30;
+                const int ship4 = qe_iq_pair_min_t(QE_IQ4_NL);
                 const int iters = T <= 16 ? 24 : 8;
                 for (int pass = 0; pass < 3; pass++) {
-                    for (int leg = 0; leg < 5; leg++) {
-                        const int which = (pass & 1) ? 4 - leg : leg;
+                    for (int leg = 0; leg < 6; leg++) {
+                        const int which = (pass & 1) ? 5 - leg : leg;
                         qe_iq3s_set_reg_block(which == 1);
                         qe_i8_set_rowscale(which == 4);
                         qe_moe_set_int8(which == 3 || which == 4);
+                        /* Eight and not one: the pair form is the eight-token one, so below
+                         * eight the dispatcher hands the group to the row walk either way. */
+                        qe_iq_set_pair_min_t(QE_IQ4_NL, which == 5 ? 8 : ship4);
                         const double t0 = now();
                         for (int i = 0; i < iters; i++)
                             qe_moe_forward_multi(which == 2 ? moff : mon, X, K_, R, TOPK, T, Ym,
@@ -1111,13 +1126,17 @@ int main(int argc, char **argv) {
                             ti8 = dt;
                         if (which == 4 && dt < trs)
                             trs = dt;
+                        if (which == 5 && dt < tq4)
+                            tq4 = dt;
                     }
                 }
                 qe_iq3s_set_reg_block(0);
                 qe_i8_set_rowscale(-1);
                 qe_moe_set_int8(-1);
-                printf("%-5d %14.3f %12.3f %10.2fx %10.3f %10.3f %10.3f\n", T, tsolo * 1e3,
-                       tshare * 1e3, tsolo / tshare, treg / tshare, ti8 / tshare, trs / tshare);
+                qe_iq_set_pair_min_t(QE_IQ4_NL, ship4);
+                printf("%-5d %14.3f %12.3f %10.2fx %10.3f %10.3f %10.3f %10.3fx\n", T, tsolo * 1e3,
+                       tshare * 1e3, tsolo / tshare, treg / tshare, ti8 / tshare, trs / tshare,
+                       tq4 / tshare);
                 fflush(stdout);
                 qe_moe_destroy(moff);
                 qe_moe_destroy(mon);

@@ -888,6 +888,10 @@ int main(int argc, char **argv) {
                          "engine has to keep the weights resident in RAM.\n";
     int threads = QE_THREADS_AUTO, fuse = 0, max_new = 24, n_ctx = 4096, greedy = 1;
     int repeat = 1, ab_tokens = 512;
+    /* The width a lone token's weight walk asks for. 0 and `full` are the pass width; the
+     * leg that races widths below reads what the open actually chose, so this only moves
+     * the arm the leg marks as the default. */
+    int walk_threads = 0;
     const char *mtp_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc)
@@ -899,6 +903,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             const char *t = argv[++i];
             threads = (*t == 'a' || *t == 'A') ? QE_THREADS_AUTO : atoi(t);
+        } else if (!strcmp(argv[i], "--walk-threads") && i + 1 < argc) {
+            /* `full` and 0 are the pass width, which is what an arm of the width leg
+             * needs to be able to say. */
+            const char *t = argv[++i];
+            walk_threads = (*t == 'f' || *t == 'F' || *t == 'a' || *t == 'A') ? 0 : atoi(t);
         } else if (!strcmp(argv[i], "--max") && i + 1 < argc)
             max_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc)
@@ -914,8 +923,8 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr,
                     "usage: %s [--model PATH] [--mtp PATH] [--prompt TEXT] [--repeat N]"
-                    " [--threads N]\n       [--max N] [--ctx N] [--fuse S] [--ab-tokens N]"
-                    " [--sample]\n",
+                    " [--threads N]\n       [--walk-threads N] [--max N] [--ctx N]"
+                    " [--fuse S] [--ab-tokens N] [--sample]\n",
                     argv[0]);
             return 2;
         }
@@ -961,7 +970,9 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    qe_forward_opts fo = { .n_ctx = n_ctx, .n_threads = threads, .mtp_model = mh };
+    qe_forward_opts fo = {
+        .n_ctx = n_ctx, .n_threads = threads, .walk_threads = walk_threads, .mtp_model = mh
+    };
     char ferr[512] = { 0 };
     double t0 = now();
     qe_forward *f = qe_forward_open(m, &fo, ferr, sizeof ferr);
@@ -974,6 +985,8 @@ int main(int argc, char **argv) {
     long vocab = qe_forward_vocab(f);
     printf("  vocab %ld, ctx %d, %d threads (%.2f s to look up every tensor)\n", vocab,
            qe_forward_ctx(f), qe_pool_size(), now() - t0);
+    printf("  walk    a lone token's weights are walked on %d of them\n",
+           qe_forward_get_walk_threads(f));
     fflush(stdout);
 
     float *logits = malloc((size_t)vocab * sizeof *logits);
@@ -2304,6 +2317,385 @@ int main(int argc, char **argv) {
         free(l4);
         free(cur);
         free(ref);
+    }
+    fflush(stdout);
+
+    /* ------------------------------------------- a lone token's walk, and its width
+     * A step reads every matrix in the model once, so a step is the bus, and one kernel's
+     * walk of that bus is not fastest at the width the pass uses: over 512 MiB of these
+     * weights as they are actually placed it is 78.3 GB/s on 16 threads and 73.7 on 19,
+     * 77.5 against 71.2 at the worst repetition of each (`make gemv`, `/tmp/gemv_base.log`).
+     * Read on a step, that is 7 % the wrong way round. Six steps fed the same ids at every
+     * width, from the same 128-token prefix, the arms interleaved so a warm socket or a
+     * drifting governor moves all of them and not the first one, best of three repetitions:
+     * 87.0 ms a step at the pass width, 89.2 at one fewer, 93.2 at 16, 101.9 at 13 - worse
+     * monotonically the fewer cores walk it, the sweep's width-1 token agreeing at 83.3
+     * against 77.4 ms and generation at 10.66 against 11.27 tok/s (`/tmp/f37_wide.log`
+     * against `/tmp/f36_wide.log`). What a step has that the kernel bench has not is some
+     * 800 dispatches of it, of this walk and of a 19-thread expert walk between the pieces
+     * of it, and the core the pass leaves out is what keeps a dispatch at 1.6 us instead of
+     * 69 (QE_THREADS_AUTO). The pass width is the width; the arm set below is the gate that
+     * keeps it, and `--walk-threads` is the way to price a differently-shaped host.
+     *
+     * What the leg asserts while it is here is that the width is a scheduling question:
+     * `gemv` gives one output row to one thread and that thread walks the row in one kernel
+     * call, so which threads did the walking is not part of what any row sums to, and the
+     * logits the sixth step left are byte for byte one reading at every width. That is what
+     * makes this the one throughput knob in this engine not priced in nats: the expert
+     * stage, which reassociates across its partials whenever the width moves, is
+     * deliberately left at the pass width. */
+    {
+        const int passw = threads > 0 ? threads : qe_pool_size();
+        const int dflt = qe_forward_get_walk_threads(f); /* what the open chose */
+        int ws[10], nw = 0;
+        for (int c = passw; c >= 4 && nw < 6; c--)
+            ws[nw++] = c;
+        int di = -1;
+        for (int i = 0; i < nw; i++)
+            if (ws[i] == dflt)
+                di = i;
+        if (di < 0 && nw < 10) {
+            ws[nw] = dflt;
+            di = nw++;
+        }
+        const int steps = 6, reps = 3;
+        /* A prefix, because what is being timed is a step and not an ingestion, and a
+         * 400-token prompt would be prefilled once per arm per repetition to find out. */
+        const long npw = np < 128 ? np : 128;
+        double best[10];
+        long first[10];
+        int ident = 1;
+        float *l0 = malloc((size_t)vocab * sizeof *l0);
+        float *lref = malloc((size_t)vocab * sizeof *lref);
+        if (!l0 || !lref)
+            return 1;
+        for (int i = 0; i < nw; i++) {
+            best[i] = 1e30;
+            first[i] = -1;
+        }
+        printf("== a lone token's walk, %d steps after %ld tokens, best of %d passes ==\n", steps,
+               npw, reps);
+        printf("  %12s %10s %9s  %s\n", "walk threads", "ms/token", "vs pass", "then says");
+        fflush(stdout);
+        for (int r = 0; r < reps; r++) {
+            for (int i = 0; i < nw; i++) {
+                qe_forward_set_walk_threads(f, ws[i]);
+                qe_forward_reset(f);
+                if (qe_forward_prefill(f, ids, npw, l0)) {
+                    printf("  %12d  refused\n", ws[i]);
+                    continue;
+                }
+                const double t1 = now();
+                for (int s = 0; s < steps; s++)
+                    if (qe_forward_step(f, ids[(npw + s) % np], l0))
+                        break;
+                const double ms = (now() - t1) * 1000.0 / (double)steps;
+                if (ms < best[i])
+                    best[i] = ms;
+                if (r == 0) { /* what the last of the six left, against arm 0's */
+                    if (!i)
+                        memcpy(lref, l0, (size_t)vocab * sizeof *l0);
+                    else if (memcmp(l0, lref, (size_t)vocab * sizeof *l0))
+                        ident = 0;
+                    first[i] = best_of(l0, vocab);
+                }
+            }
+            fflush(stdout);
+        }
+        int fi = 0;
+        for (int i = 1; i < nw; i++)
+            if (best[i] < best[fi])
+                fi = i;
+        for (int i = 0; i < nw; i++)
+            printf("  %12d %10.1f %8.2fx  #%-8ld%s\n", ws[i], best[i],
+                   best[0] > 0.0 ? best[i] / best[0] : 0.0, first[i],
+                   ws[i] == dflt ? "  <- the width this pass opened on" : "");
+        printf("  fastest: %d threads at %.1f ms/token, %.2fx of the pass width at %d\n", ws[fi],
+               best[fi], best[0] > 0.0 ? best[fi] / best[0] : 0.0, passw);
+        fflush(stdout);
+        check(ident, "a step's logits do not care which threads walked them");
+        /* The fraction in `walk_width_for` is a claim about where this machine's knee is,
+         * and a claim about a knee is worth one leg: 3 % is room for the noise between
+         * arms and no room for the wrong fraction. */
+        check(di >= 0 && best[di] < 1e29 && best[di] <= best[fi] * 1.03,
+              "the walk width this pass opened on is within 3% of the fastest of them");
+
+        /* The two arms worth naming, profiled once each: the stage a narrower walk was
+         * meant to help, named in the same load as the ratio by which it lost. */
+        PassCall pc = { f, NULL, ids, 1, 0, l0, NULL };
+        qe_forward_set_walk_threads(f, passw);
+        profile_pass(f, &pc, ids, np, 0, "one step at the pass width");
+        char narrow[48];
+        snprintf(narrow, sizeof narrow, "one step on %d of them", ws[nw - 1]);
+        qe_forward_set_walk_threads(f, ws[nw - 1]);
+        profile_pass(f, &pc, ids, np, 0, narrow);
+        qe_forward_set_walk_threads(f, dflt);
+        /* The legs above walked the prompt away; generation below starts from the end of it
+         * with the pass back exactly as this run opened it. */
+        qe_forward_reset(f);
+        if (qe_forward_prefill(f, ids, np, logits))
+            return 1;
+        free(l0);
+        free(lref);
+    }
+    fflush(stdout);
+
+    /* --------------------------------------- how often a small projection asks the pool
+     * A projection under the chunk walk's threshold is never walked: `proj` hands it to
+     * `gemv`, which asks the pool for one token's rows - 512 times across a width-512 chunk.
+     * This checkpoint has 180 such projections per token: a hyper-connection mixer's injection
+     * matrix (4 x 10240 f32, 160 KiB, 96 of them), a gated-delta block's alpha and beta (48 x
+     * 2560 f32, 480 KiB, 72) and an indexer's key projection (128 x 2560 bf16, 640 KiB, 12),
+     * each read by every token of the chunk. A dispatch is not free: a hot 19-thread one is
+     * 2.6 us at the median and 77.6 at the twentieth thread (`make pool`), so the loop took
+     * 92,160 barriers a chunk where the walkable projections of the same chunk take 180. One
+     * ask over the flattened (token, row) space performs the same 512 walks and pays the
+     * barrier once, which is worth 0.47 ms of an ingested token by that arithmetic and
+     * measured 0.58 ms/token of the wall and 0.46 of the stages (`/tmp/f39_wide.log`).
+     *
+     * That is a scheduling change, and the leg asserts it as one: every GEMV kernel in
+     * src/kern.c is a loop over output rows, so which rows a call was handed is not part of
+     * what any row sums to - hence the byte-for-byte comparison of a chunk's logits at both
+     * forms, which is the same guard `make prefill` holds the row blocking of the head to.
+     *
+     * A step is out of its reach by construction: one token is one dispatch whichever way the
+     * question is asked, so the step rows below measure the unchanged thing at both settings
+     * and are printed to show that nothing moved, not to claim anything moved. */
+    {
+        const int arms[2] = { 1, 0 };
+        const char *names[2] = { "one ask for the chunk", "one ask per token" };
+        const int dflt = qe_forward_get_small_proj_batch(f);
+        const int was_chunk = qe_forward_get_chunk(f);
+        int di = -1;
+        for (int i = 0; i < 2; i++)
+            if (arms[i] == dflt)
+                di = i;
+        const int reps = 3, steps = 3;
+        const long sl = np < (long)was_chunk ? np : (long)was_chunk;
+        double best[2], step_best[2];
+        double stage[2][QE_ST_N];
+        long first[2];
+        int ident = 1;
+        float *l0 = malloc((size_t)vocab * sizeof *l0);
+        float *lref = malloc((size_t)vocab * sizeof *lref);
+        if (!l0 || !lref)
+            return 1;
+        for (int i = 0; i < 2; i++) {
+            best[i] = 1e30;
+            step_best[i] = 1e30;
+            first[i] = -1;
+            for (int s = 0; s < QE_ST_N; s++)
+                stage[i][s] = 0.0;
+        }
+        printf("== small projections, %ld tokens at width %d and %d steps, best of %d ==\n", sl,
+               was_chunk, steps, reps);
+        printf("  %22s %10s %9s  %8s %8s %10s  %s\n", "form", "ms/token", "vs batch", "hc_attn",
+               "hc_ffn", "one step", "then says");
+        fflush(stdout);
+        for (int r = 0; r < reps; r++) {
+            for (int i = 0; i < 2; i++) {
+                qe_forward_set_small_proj_batch(f, arms[i]);
+                qe_forward_diag d0, d1;
+                qe_forward_reset(f);
+                qe_forward_set_chunk(f, was_chunk);
+                qe_forward_diag_of(f, &d0);
+                qe_forward_reconfigure(f, QE_VARIANT_DEFAULT, 1);
+                const double tc = now();
+                const int rc = qe_forward_prefill(f, ids, sl, l0);
+                const double ms = (now() - tc) * 1000.0 / (double)sl;
+                qe_forward_diag_of(f, &d1);
+                qe_forward_reconfigure(f, QE_VARIANT_DEFAULT, 0);
+                if (rc) {
+                    printf("  %22s  refused\n", names[i]);
+                    continue;
+                }
+                if (r == 0) { /* one chunk of logits, both ways, before any timing noise */
+                    if (!i)
+                        memcpy(lref, l0, (size_t)vocab * sizeof *l0);
+                    else if (memcmp(l0, lref, (size_t)vocab * sizeof *l0))
+                        ident = 0;
+                    first[i] = best_of(l0, vocab);
+                }
+                /* The steps continue from the chunk the arm just ingested, so both forms walk
+                 * the same positions and the same cache; nothing about a step can differ,
+                 * which is exactly what the row is here to disagree with. */
+                const double ts = now();
+                for (int s = 0; s < steps; s++)
+                    if (qe_forward_step(f, ids[((long)sl + s) % np], l0))
+                        break;
+                const double sms = (now() - ts) * 1000.0 / (double)steps;
+                if (sms < step_best[i])
+                    step_best[i] = sms;
+                if (ms < best[i]) {
+                    best[i] = ms;
+                    for (int s = 0; s < QE_ST_N; s++) {
+                        stage[i][s] = 1000.0 * (d1.stage_seconds[s] - d0.stage_seconds[s]) /
+                                      (double)sl;
+                    }
+                }
+            }
+            fflush(stdout);
+        }
+        int fi = 0;
+        for (int i = 1; i < 2; i++)
+            if (best[i] < best[fi])
+                fi = i;
+        for (int i = 0; i < 2; i++)
+            printf("  %22s %10.2f %8.2fx  %8.2f %8.2f %9.1f ms  #%-8ld%s\n", names[i], best[i],
+                   best[0] > 0.0 ? best[i] / best[0] : 0.0, stage[i][QE_ST_HC_ATTN],
+                   stage[i][QE_ST_HC_FFN], step_best[i], first[i],
+                   i == di ? "  <- the form this pass opened on" : "");
+        printf("  fastest: %s at %.2f ms/token, %.3fx of %s at %.2f\n", names[fi], best[fi],
+               best[0] > 0.0 ? best[fi] / best[0] : 0.0, names[1 - fi], best[1 - fi]);
+        for (int i = 0; i < 2; i++) {
+            printf("  %s:\n", names[i]);
+            for (int s = 0; s < QE_ST_N; s++)
+                if (stage[i][s] >= 0.2)
+                    printf("      %-11s %6.2f ms\n", stage_name(s), stage[i][s]);
+        }
+        fflush(stdout);
+        check(ident, "a chunk's logits do not care how often a small projection asked the pool");
+        check(di >= 0 && best[di] < 1e29 && best[di] <= best[fi] * 1.03,
+              "the small-projection form this pass opened on is within 3% of the fastest of them");
+        qe_forward_set_small_proj_batch(f, dflt);
+        qe_forward_set_chunk(f, was_chunk);
+        /* The legs above walked the prompt away; generation below starts from the end of it
+         * with the pass back exactly as this run opened it. */
+        qe_forward_reset(f);
+        if (qe_forward_prefill(f, ids, np, logits))
+            return 1;
+        free(l0);
+        free(lref);
+    }
+    fflush(stdout);
+
+    /* QE_EXP2_SIMD: ideas.md §6.6 asked, notes ago, for one SIMD exp2 wherever the
+     * engine calls expf. It is in the engine for the gates and was never moved to
+     * the two places that also ask for exponentials by the ten thousand: a
+     * gated-delta block's per-head decay and one cell's attention weights inside
+     * the fused walk.
+     *
+     * The element counts are worth stating because they are why §6.6 stayed a note.
+     * A token asks for 48 heads x 16 value rows x 36 gated-delta layers of decay,
+     * 27,648 of them where 1,728 are the same numbers, and for 12 query heads of
+     * weight over as many cells as the indexer selected, 86,400 at the selection a
+     * 600-cell context reaches and 295,344 at the 2051-cell ceiling. At libm's 1.12
+     * to 1.17 ns (`make fast`) that is 0.14 to 0.39 ms of CPU a token, and a step is
+     * nineteen threads: 7 to 20 us of an 88 ms step, 0.01 to 0.02 %. The
+     * approximation is 7.1-7.4x that instrument's own element rate, so the whole of
+     * what §6.6 promised is a rounding error of one stage.
+     *
+     * The decay half of this is not an approximation at all. Sixteen value heads of
+     * one key head each computed exp of the same float for the same token, which is
+     * the seventeen-times-read number above; taking it once per token into a row of
+     * scratch is the same libm call on the same input, and it is what makes the run
+     * long enough to widen. That part ships either way.
+     *
+     * The wide form is arithmetic: 3.5e-06 relative where `expf` is 1e-7, so this
+     * leg cannot assert byte identity and does not try. It prices the nats instead,
+     * on the head of the chunk both arms ingested, and the two numbers together,
+     * rate and nats, are what decides which of them the default runs. */
+    {
+        const int arms[2] = { 0, 1 };
+        const char *names[2] = { "libm expf", "the eight-wide exp2" };
+        const int dflt = qe_forward_get_exp2_simd(f);
+        const int was_chunk = qe_forward_get_chunk(f);
+        int di = -1;
+        for (int i = 0; i < 2; i++)
+            if (arms[i] == dflt)
+                di = i;
+        const int reps = 3, steps = 3;
+        const long sl = np < (long)was_chunk ? np : (long)was_chunk;
+        double best[2], step_best[2];
+        double stage[2][QE_ST_N];
+        long first[2];
+        float *l0 = malloc((size_t)vocab * sizeof *l0);
+        float *lhead[2];
+        lhead[0] = malloc((size_t)vocab * sizeof **lhead);
+        lhead[1] = malloc((size_t)vocab * sizeof **lhead);
+        if (!l0 || !lhead[0] || !lhead[1])
+            return 1;
+        for (int i = 0; i < 2; i++) {
+            best[i] = 1e30;
+            step_best[i] = 1e30;
+            first[i] = -1;
+            for (int s = 0; s < QE_ST_N; s++)
+                stage[i][s] = 0.0;
+        }
+        printf("== exponentials, %ld tokens at width %d and %d steps, best of %d ==\n", sl,
+               was_chunk, steps, reps);
+        printf("  %22s %10s %9s  %8s %8s %10s  %s\n", "form", "ms/token", "vs libm", "hc_attn",
+               "hc_ffn", "one step", "then says");
+        fflush(stdout);
+        for (int r = 0; r < reps; r++) {
+            for (int i = 0; i < 2; i++) {
+                qe_forward_set_exp2_simd(f, arms[i]);
+                qe_forward_diag d0, d1;
+                qe_forward_reset(f);
+                qe_forward_set_chunk(f, was_chunk);
+                qe_forward_diag_of(f, &d0);
+                qe_forward_reconfigure(f, QE_VARIANT_DEFAULT, 1);
+                const double tc = now();
+                const int rc = qe_forward_prefill(f, ids, sl, l0);
+                const double ms = (now() - tc) * 1000.0 / (double)sl;
+                qe_forward_diag_of(f, &d1);
+                qe_forward_reconfigure(f, QE_VARIANT_DEFAULT, 0);
+                if (rc) {
+                    printf("  %22s  refused\n", names[i]);
+                    continue;
+                }
+                if (r == 0) { /* the head both arms agree or disagree about */
+                    memcpy(lhead[i], l0, (size_t)vocab * sizeof *l0);
+                    first[i] = best_of(l0, vocab);
+                }
+                const double ts = now();
+                for (int s = 0; s < steps; s++)
+                    if (qe_forward_step(f, ids[((long)sl + s) % np], l0))
+                        break;
+                const double sms = (now() - ts) * 1000.0 / (double)steps;
+                if (sms < step_best[i])
+                    step_best[i] = sms;
+                if (ms < best[i]) {
+                    best[i] = ms;
+                    for (int s = 0; s < QE_ST_N; s++) {
+                        stage[i][s] = 1000.0 * (d1.stage_seconds[s] - d0.stage_seconds[s]) /
+                                      (double)sl;
+                    }
+                }
+            }
+            fflush(stdout);
+        }
+        int fi = 0;
+        for (int i = 1; i < 2; i++)
+            if (best[i] < best[fi])
+                fi = i;
+        for (int i = 0; i < 2; i++)
+            printf("  %22s %10.2f %8.2fx  %8.2f %8.2f %9.1f ms  #%-8ld%s\n", names[i], best[i],
+                   best[0] > 0.0 ? best[i] / best[0] : 0.0, stage[i][QE_ST_HC_ATTN],
+                   stage[i][QE_ST_HC_FFN], step_best[i], first[i],
+                   i == di ? "  <- the form this pass opened on" : "");
+        printf("  fastest: %s at %.2f ms/token, %.3fx of %s at %.2f\n", names[fi], best[fi],
+               best[0] > 0.0 ? best[fi] / best[0] : 0.0, names[1 - fi], best[1 - fi]);
+        for (int i = 0; i < 2; i++) {
+            printf("  %s:\n", names[i]);
+            for (int s = 0; s < QE_ST_N; s++)
+                if (stage[i][s] >= 0.2)
+                    printf("      %-11s %6.2f ms\n", stage_name(s), stage[i][s]);
+        }
+        fflush(stdout);
+        gate_heads("the eight-wide exp2", lhead[1], lhead[0], vocab, dflt == 1);
+        check(di >= 0 && best[di] < 1e29 && best[di] <= best[fi] * 1.03,
+              "the exponential form this pass opened on is within 3% of the fastest of them");
+        qe_forward_set_exp2_simd(f, dflt);
+        qe_forward_set_chunk(f, was_chunk);
+        /* The legs above walked the prompt away; generation below starts from the end of it
+         * with the pass back exactly as this run opened it. */
+        qe_forward_reset(f);
+        if (qe_forward_prefill(f, ids, np, logits))
+            return 1;
+        free(l0);
+        free(lhead[0]);
+        free(lhead[1]);
     }
     fflush(stdout);
 

@@ -1880,6 +1880,103 @@ static int check_layer_ops(void) {
                "", 96.0 * (3.0 * W * S + W) * 4.0 / 1048576.0, t_libm > 0 ? t_libm / (t_mix > 0 ? t_mix : 1e-9) : 0.0,
                t_libm * 1e3);
     }
+
+    /* 5. the approximation §6.6 asks the engine to use for its two remaining
+     * transcendental hot spots: a gated-delta block's decay and one cell's
+     * attention weights. Same polynomial as the gate above, but the range it is
+     * checked over is the one those two are actually in, an exponent at most zero
+     * and at worst sixteen nats below the base, and the error that matters is
+     * relative rather than absolute: a decay of 1e-6 that is wrong by 1e-6 absolute
+     * is a state that stopped decaying.
+     *
+     * The tail is checked on its own because the eight-wide body and the scalar
+     * remainder are two compilations of one polynomial, and a run whose length is
+     * not a multiple of eight - 48 heads, 12 query heads - answers through both. */
+    {
+        enum { N = 4096, TAIL = 1023 };
+        const int bad0 = bad;
+        static float x[N], got[N];
+        for (long i = 0; i < N; i++)
+            x[i] = (float)(i * 28.0 / (N - 1) - 14.0);
+        qe_exp2v(x, got, N);
+        double worst = 0;
+        for (long i = 0; i < N; i++) {
+            double ref = exp((double)x[i]);
+            double e = fabs(ref - (double)got[i]) / ref;
+            if (e > worst)
+                worst = e;
+        }
+        double worst_tail = 0;
+        qe_exp2v(x, got, TAIL); /* not a multiple of eight: seven lanes of tail */
+        for (long i = 0; i < TAIL; i++) {
+            double ref = exp((double)x[i]);
+            double e = fabs(ref - (double)got[i]) / ref;
+            if (e > worst_tail)
+                worst_tail = e;
+        }
+        if (!(worst < 1e-5 && worst_tail < 1e-5)) {
+            printf("  FAIL exp2: worst relative error %.3e, tail %.3e\n", worst, worst_tail);
+            bad++;
+        }
+        /* Monotone, and exactly one at zero. The walk's rescale hands that weight to
+         * the accumulator unchanged, so an approximation that rounded exp2(0) to
+         * something else would rescale into a scaled answer rather than the same
+         * answer. */
+        qe_exp2v(x, got, N);
+        for (long i = 1; i < N; i++)
+            if (!(got[i] > got[i - 1])) {
+                printf("  FAIL exp2 is not monotonic at %g: %.9g after %.9g\n", x[i], got[i],
+                       got[i - 1]);
+                bad++;
+                break;
+            }
+        {
+            float zero = 0.0f, one;
+            qe_exp2v(&zero, &one, 1);
+            if (!(one == 1.0f)) {
+                printf("  FAIL exp2(0) = %.9g, not 1 exactly\n", one);
+                bad++;
+            }
+        }
+        /* Rate, over the same inputs the accuracy check used. Every arm rewrites its
+         * inputs first, for the reason §12's elementwise row carries: a timing loop
+         * over a constant array is one exponential the compiler is happy to make
+         * once. The perturbation is the same pass in both arms, so the ratio is
+         * theirs and not the loop's. */
+        enum { REPS = 400 };
+        static float base[N];
+        for (long i = 0; i < N; i++)
+            base[i] = x[i];
+        double sink = 0;
+        double t0 = now();
+        for (int r = 0; r < REPS; r++) {
+            for (long i = 0; i < N; i++)
+                x[i] = base[i] + (float)r * 1e-4f;
+            for (long i = 0; i < N; i++)
+                got[i] = expf(x[i]);
+            sink += got[0] + got[N - 1];
+        }
+        double t_libm = now() - t0;
+        t0 = now();
+        for (int r = 0; r < REPS; r++) {
+            for (long i = 0; i < N; i++)
+                x[i] = base[i] + (float)r * 1e-4f;
+            qe_exp2v(x, got, N);
+            sink += got[0] + got[N - 1];
+        }
+        double t_simd = now() - t0;
+        if (sink == 12345.0)
+            printf("  unreachable\n");
+        const double elems = (double)N * REPS;
+        printf("%-19s: %s\n", "exp2", bad > bad0 ? "FAIL" : "pass");
+        printf("  %-19s   worst %.1e relative against a double reference over [-14,14], tail"
+               " %.1e, exp2(0) exact, monotonic\n",
+               "", worst, worst_tail);
+        printf("  %-19s   expf %.2f ns/element against %.2f for the eight-wide form (%.1fx);"
+               " a token asks for 27,648 decays and 86,400 to 295,344 weights\n",
+               "", t_libm * 1e9 / elems, t_simd * 1e9 / elems,
+               t_simd > 0 ? t_libm / t_simd : 0.0);
+    }
     return bad;
 }
 

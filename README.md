@@ -23,10 +23,11 @@ Measured on this host, default settings, 19 of 20 cores, one sequence:
 
 | | qe | llama.cpp | |
 |---|---|---|---|
-| **Prompt ingestion**, 512-token batch | **61.3 - 62.9 tok/s** | 51.33 tok/s | **1.19 - 1.22x** |
+| **Prompt ingestion**, 512-token batch | **61.3 - 63.7 tok/s** | 51.33 tok/s | **1.19 - 1.24x** |
 | **Prompt ingestion**, 64-token batch | 48 - 49 tok/s | 38.8 tok/s | **1.25x** |
 | **Generation**, greedy | **10.9 tok/s** (91.4 ms/token) | 7.65 tok/s (130.7 ms) | **1.43x** |
-| **Generation**, greedy + draft head | **11.5 tok/s** (86.7 ms/token) | — | **1.51x** |
+| **Generation**, greedy + draft head | **11.5 tok/s** (86.7 ms/token) | none | **1.51x** |
+| **Throughput**, eight sequences in one step (`--batch 8`) | **18.0 tok/s** across a wave of eight, 10.06 each alone | none | **1.79x** |
 
 llama.cpp is the same checkpoint and the same host: b12359 for ingestion
 (`-ngl 0 -t 20 -fa on`), b12110 for generation on the same corpus. The two engines
@@ -35,9 +36,12 @@ holding 90 GB of weights.
 
 Instruments, so that none of the above is a claim: `make forward` (the ingestion
 sweep and one A/B leg per arithmetic switch), `make head` (a step, a draft row and
-a verified window, with the nextn head resident), `make score` (teacher-forced loss
-and ms/token over 1,200 real positions), `make alu` (what this machine can actually
-read). [MANUAL.md](MANUAL.md) is the running log, [docs/DESIGN.md](docs/DESIGN.md)
+a verified window, with the nextn head resident), `make batch` (B sequences through
+one step, three arithmetic arms, and a row of a partly full step asserted byte for
+byte against that sequence walked alone), `make lane` (the same multiplier through
+the engine's request entry), `make score` (teacher-forced loss and ms/token over
+1,200 real positions), `make alu` (what this machine can actually read).
+[MANUAL.md](MANUAL.md) is the running log, [docs/DESIGN.md](docs/DESIGN.md)
 is the kernel-by-kernel account, and `--report` prints the budget from the file's headers
 alone.
 
@@ -95,7 +99,8 @@ model of a CPU.
 
 - Linux on one NUMA node, x86-64 with AVX2 + AVX-VNNI (this build was tuned on a
   Core Ultra 7 265: 20 logical CPUs - 8 performance, 12 efficient, no SMT - 30 MiB
-  L3, max 5.3 GHz, 125.3 GiB addressable of the 128 GB fitted).
+  L3, max 5.3 GHz, 125.3 GiB addressable of the 128 GB fitted in two DDR5-5600 slots,
+  both running at their rated speed).
 - A C17 compiler and GNU make. No other dependency: no cmake, no curl, no
   OpenBLAS, no Python at runtime.
 - **About 95 GiB of RAM free** for the checkpoint used here (87.25 GiB of weights
@@ -184,6 +189,10 @@ ones worth knowing:
 | `QE_I8_FLAT` | `1` | the flat one-scale-per-row dense copy a chunked prefill walks three rows against |
 | `QE_I8_MOE`, `QE_I8_RS`, `QE_I8_PROJ` | on | the int8 activation panel in front of the experts, the row scale, and the dense projections |
 | `--spec-k N` | auto | draft length; `0` turns speculation off, a head resolves to 1, the n-gram drafter to 2 |
+| `--batch N` | `1` | drive N sequences through one walk of the weights: 2.15-2.20x the step they share and 1.79x a wave of eight short requests, for 0.060 nats and a per-client tok/s that gets worse (`make lane`) |
+| `--walk-threads N`, `QE_WALK_THREADS` | every thread `--threads` has | threads a lone token's weight walk asks for. One kernel walking those bytes prefers 16 of 19 by 6.2 %; a step of them is 1.07x slower there, so the default is the whole pass and the knob is for a host whose bus is shaped differently (`make forward`'s width leg) |
+| `QE_SMALL_PROJ_BATCH` | `1` | whether a projection under `--proj-chunk`'s 1 MiB threshold is asked of the pool once for the chunk or once for every token of it. 180 of this checkpoint's projections are under it, and the loop barriered a nineteen-thread pool 92,160 times a width-512 chunk for them, so the batch is 1.037x of an ingested token and byte for byte the same logits; `0` is the loop back (`make forward`'s small-projection leg) |
+| `QE_EXP2_SIMD` | `0` | whether a gated-delta block's decay and one cell's attention weights use the eight-wide `exp2` the gates have always used rather than libm `expf`. It is 7.1-7.4x the element rate at 3.5e-06 relative, and a token asks for 114,048 to 322,992 exponentials, which at nineteen threads is 7 to 20 microseconds of an 88 ms step: measured 1.000x of ingestion and 1.00x of a step for 0.67 nats, so the dial ships off and the sixteenfold redundancy the table beside it removed ships unconditionally (`make forward`'s exponential leg) |
 
 `make walk`, `make alu`, `make pool` and `make moe` need no checkpoint at all, so
 the interesting arguments about this machine can be settled on yours.
@@ -191,8 +200,9 @@ the interesting arguments about this machine can be settled on yours.
 ## What this is not
 
 - Not a GPU engine, and not a port layer for one.
-- Not a throughput server: one sequence at a time. Continuous batching is
-  scheduled work, and `make serve` measures the wall a second client waits for.
+- Not a throughput server, even with `--batch N`: that flag multiplies decode and
+  nothing else, so two clients on 512-token prompts still cost 1.00-1.02x of the same
+  two one at a time, and `make serve` still measures the wall a second client waits for.
 - Not a general model runner: it runs `qwen4exp` checkpoints (48 layers, 2560 wide,
   512 routed experts with 10 active, the n-gram PLE table, hyper-connections, the
   block indexer), an OpenAI-compatible surface, and a chat template read from the

@@ -41,9 +41,24 @@ static void usage(const char *argv0) {
            "  --id NAME           model id reported to clients (default: qe-selftest)\n"
            "  --port N            listen port (default 8080)\n"
            "  --threads N          pool threads (default: every core but one)\n"
+           "  --walk-threads N     threads a lone token's weight walk asks for, fewer\n"
+           "                      than --threads being the way to price a different\n"
+           "                      machine's bus (default, 0, and full: every thread\n"
+           "                      --threads has, which is the measured fastest here; a\n"
+           "                      chunk and an expert stage always have all of them)\n"
            "  --ctx N              sequence capacity: KV cache, indexer keys and\n"
            "                      recurrent state per request (default: the length\n"
            "                      the checkpoint was trained for, 262144 here)\n"
+           "  --batch N            drive N sequences through one walk of the weights at\n"
+           "                      once. Default 1: a request holds the engine and the\n"
+           "                      next one waits for it. Above 1, N rows of decode read\n"
+           "                      the 5568 MiB a token reads once instead of N times -\n"
+           "                      2.22x of a lone request at N=8 for 0.060 nats a token\n"
+           "                      (`make lane`) - and the caches are divided, so each\n"
+           "                      sequence gets --ctx/N of the window and its own copy of\n"
+           "                      the 216 MiB of recurrent state. Speculation and\n"
+           "                      --turn-cache are off: a draft window and a rewind point\n"
+           "                      are one sequence's state. Refused with --mtp.\n"
            "  --sse-keepalive-ms N\n"
            "                      how often a stream that has nothing to send writes an\n"
            "                      SSE comment instead, so that a reader which went away\n"
@@ -118,12 +133,14 @@ static void usage(const char *argv0) {
 }
 
 static const char *BUDGET[] = {
-    "measured on this host (Core Ultra 7 265, 20 cores, no AVX-512, DDR5):",
+    "measured on this host (Core Ultra 7 265, 20 cores, no AVX-512, DDR5-5600 on 2 slots):",
     "  DRAM read, same bytes three ways (make alu): the shipped Q8_0 GEMV 75.9, an",
     "    identical walk with the arithmetic deleted 78.9, a flat 64B-aligned read 76.2",
     "    - at 512 MiB and 19 threads. One P core alone: 17.1 / 23.4 / 31.1. Eight P",
-    "    cores stream 85.5, which a GEMV does not reach (59.3). The 113.8 GB/s this",
-    "    file used to quote as peak is reproduced by nothing here (DESIGN.md 1.2)",
+    "    cores stream 85.5, which a GEMV does not reach (59.3). Two 64-bit channels at",
+    "    the 5600 MT/s both slots report configured peak at 89.6, so the 113.8 GB/s this",
+    "    file used to quote is above the hardware, and is reproduced by nothing here",
+    "    (DESIGN.md 1.2, ideas.md 3.5)",
     "  so the step is memory-bound, not ALU-bound: the kernel is 96-99% of the read,",
     "    and the arithmetic only binds once data is cache-resident (68% at 32 MiB,",
     "    23% at 8 MiB), which 5568 MiB into a 30 MiB L3 never is",
@@ -197,8 +214,12 @@ int main(int argc, char **argv) {
             as_int = &o.port;
         else if (!strcmp(a, "--threads"))
             as_int = &o.engine.n_threads;
+        else if (!strcmp(a, "--walk-threads"))
+            as_int = &o.engine.walk_threads;
         else if (!strcmp(a, "--ctx"))
             as_int = &o.engine.n_ctx;
+        else if (!strcmp(a, "--batch"))
+            as_int = &o.engine.n_batch;
         else if (!strcmp(a, "--sse-keepalive-ms"))
             as_int = &o.sse_keepalive_ms;
         else if (!strcmp(a, "--empty-thinking-blocks"))

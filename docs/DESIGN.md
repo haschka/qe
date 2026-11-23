@@ -11,10 +11,11 @@ the numbers here are a budget for - see [ARCH.md](ARCH.md).
 | | |
 |---|---|
 | CPU | Intel Core Ultra 7 265 (Arrow Lake-S), 20 cores, no SMT |
+| Board | ASRock Z890 Pro RS WiFi White, BIOS 3.24 - a desktop platform, so the DRAM data rate is a firmware negotiation, and it reads `Speed: 5600 MT/s` / `Configured Memory Speed: 5600 MT/s` on both populated slots (`dmidecode -t 17`, root): the modules are running at their rated speed and there is nothing to enable. It is also the only platform quantity a token can see: one NUMA node, no device in the request path, no AVX-512 to gain (ideas.md §3.5) |
 | ISA | AVX2 + FMA + F16C + **AVX-VNNI** + BMI2. **No AVX-512** - fused off in silicon (`-march=native` resolves to `arrowlake-s`, `-mavx512f` disabled) |
-| RAM | 128 GiB DDR5, single NUMA node |
+| RAM | 128 GiB DDR5-5600 (2 slots, rated and configured both at 5600 MT/s), single NUMA node. Two 64-bit channels at 5600 MT/s is **89.6 GB/s** of theoretical read, and the measured rates below are 85-95 % of it |
 | L3 | 30 MiB |
-| **DRAM read bandwidth** | **76-79 GB/s** for the shape a decode step has (Q8_0 rows, 19 threads, 512 MiB span, `make alu`); **85.5 GB/s** for a flat 64 B-aligned read on the eight performance cores. An older figure of **113.8 GB/s** is quoted below and in `--report`; no instrument in this repository reproduces it, and §1.2 is where that is settled |
+| **DRAM read bandwidth** | **76-79 GB/s** for the shape a decode step has (Q8_0 rows, 19 threads, 512 MiB span, `make alu`); **85.5 GB/s** for a flat 64 B-aligned read on the eight performance cores. Those are 85-88 % and 95 % of the 89.6 GB/s this host's two channels at 5600 MT/s can carry. An older figure of **113.8 GB/s** is quoted below and in `--report`: it is 27 % above that physical peak, so it was never a rate this platform could produce at any access pattern, and §1.2 is where that is settled |
 | **Model placement** | **all 87.2 GiB resident in RAM from the moment the engine starts** (§1.1). The storage device takes no part in serving a token, so its bandwidth is not a quantity this design measures or optimises |
 | **CPU governor** | **`powersave`** (`min_perf_pct=15`) - see §6 |
 
@@ -152,15 +153,18 @@ efficiency (§14), in that order.
 | Pinning workers to cores by `cpu_capacity` | 2-3x the dispatch handshake (§12) | `QE_PIN=1 ./bin/bench_pool auto 120` |
 | Non-temporal (streaming) store for the recurrent state | 72.2 GB/s against the ordinary store's 74.0 at 512 MiB, 75.2 against 77.8 at 128 MiB - and there is no fetch to skip, because the same task reads the row first (§14) | `./bin/bench_alu --span 512 --kernels read,state,statent` |
 | Software prefetch | 6-67% regression; the code was deleted | §12 |
+| A narrower weight walk for a decode step: 16 of the 19 threads, where one kernel's walk of the same staged bytes reads 78.3 GB/s against 73.7 at 19 | 1.07x **slower** a step at 16 threads, 1.10x at 15, 1.17x at 13, logits byte for byte identical at every one of them, and 10.66 against 11.27 tok/s of generation in the load that shipped the knob. The kernel's number is real and is the kernel's; a step pays ~800 dispatches of it (§12 is the other half of why) | `make forward`'s width leg, `./bin/bench_gemv <model> 16 360`, ideas.md 7.26 |
 
 One number in §1 does not survive this section: the **113.8 GB/s** DRAM peak is older
-than `bench_alu` and no instrument in this repository reproduces it. The highest
+than `bench_alu` and no instrument in this repository reproduces it - and it cannot, because
+the modules read `Configured Memory Speed: 5600 MT/s` on both slots, two 64-bit channels at
+5600 MT/s is 89.6 GB/s, and the retired figure is 27 % above the hardware's ceiling. The highest
 linear read rate measured here is 85.5 GB/s (eight P cores, 512 MiB, flat 64 B-aligned
-walk), and the rate a decode step actually runs into is 76-79 GB/s at the engine's
-width - which is the same wall `make gemv` finds from the other direction at 80.0
-GB/s on this checkpoint's real rows at 16 threads. Every ceiling in this file is now
+walk), 95 % of that ceiling, and the rate a decode step actually runs into is 76-79 GB/s at the
+engine's width, 85-88 % of it - which is the same wall `make gemv` finds from the other direction
+at 80.0 GB/s on this checkpoint's real rows at 16 threads. Every ceiling in this file is now
 stated as "which pattern, how many threads", because the pattern is worth 10 GB/s and
-the thread count 9.
+the thread count 9, and neither of those two is a firmware setting (ideas.md §3.5).
 
 `general.architecture = qwen4exp`, `general.size_label = 512x56B`.
 
@@ -398,8 +402,9 @@ reports the resolved one and says which drafter it belongs to.
 What would change the answer is priced and unwired: logits computed lazily for only the rows
 a window keeps (~50 ms of a 460 ms pass) and boundary copies made cheaper (~80 ms of it) are
 together ~1.1x on a path that is 4.14x away from breaking even. The honest reading is that a
-verify window pays when a batch is sitting in it, which is §8's continuous-batching item
-rather than anything in this section.
+verify window pays when a batch is sitting in it - except that the batch which arrived is a
+batch of *sequences*, and a window is nine rows of one of them, which a row map cannot express,
+so `--batch N` refuses `--mtp` at startup rather than promising it (ideas.md §7.25).
 
 ## 5. Design decisions this forces
 
@@ -759,11 +764,15 @@ a hit is decided before any byte is read. `make prefix` prints the copy it actua
 took, because arithmetic at a measured ceiling is an estimate and this repository
 reports the difference. What makes a copy that
 small exact is that six of the seven per-position arrays are append-only: truncating
-the single cursor `pos` *is* the rewind for them, and the pool's valid count is
+the sequence's own cursor `spos[s]` *is* the rewind for them, and the pool's valid count is
 `pos / kpool_ratio` by construction (`src/forward.c`, `cur = pos / ratio`). Only the
 state that is accumulated in place has to be copied, and the PLE n-gram FIFO is
 drained rather than restored, because a pending row belongs to a token that is no
-longer the last one.
+longer the last one. That cursor is part of the state and not of the bookkeeping: a rewind
+which put the recurrences back and left `spos` where the abandoned rows had reached kept
+passing a greedy check, because every row it then produced still reads perfectly - which is why
+`make batch` asserts the pair at byte level on the arm where identity is the contract
+(ideas.md §7.25).
 
 Matched by content, not by position: the boundary that wins is the longest one whose
 own ids are a token-for-token prefix of the new prompt. That is what lets a snapshot
@@ -970,7 +979,7 @@ source to find out what is missing.
 
 | gap | what it would take |
 |---|---|
-| One sequence per engine: no batching, no continuous batching | the forward pass exists (`src/forward.c`) and owns one sequence's state, so this is now a scheduling problem rather than a missing subsystem. The budget is per sequence: 270 MiB at 8k context on the q8_0 cache (557 MiB with f32 keys and values), 113 MiB of it the GDN state (`docs/ARCH.md` §5), and bandwidth is not the constraint, so a policy has to decide how many of those fit before it decides how to interleave them |
+| Batching exists for decode and stops there | `--batch N` drives N sequences through one walk of the weights (`qe_forward_step_batch_rows`, asserted by `make batch` and measured through the request entry by `make lane`): **2.15-2.20x** the step eight rows share, **1.79x** a wave of eight short requests, and **1.00-1.02x** a wave of two 512-token ones, because a prompt is still read one at a time. What is left is named by that gap and by `QE_MAX_SEQ`: eight rows is where the row map stops, a row costs its share of the vocabulary-wide logits and one replicated copy of the 113 MiB GDN state (`docs/ARCH.md` §5), and packing several prompts into one chunked row map is measured rather than believed not to be the answer (ideas.md §8.1) |
 | Chat templates are rendered by hard-coded ChatML, not evaluated | the file carries 9993 characters of Jinja with image/video count handling. An evaluator is a project of its own; today `render_messages` reproduces the ChatML shape the template produces for text-only transcripts, and that is the honest description of it |
 | No vision | a ViT encoder for `mmproj-Qwen3.8-Flash-Next-BF16.gguf`; today its bytes are mapped and its metadata reported |
 | Speculation pays only at the shortest draft, and only just | the drafter is not the gap: `mtp-...-Q4_K_M.gguf` is resident, drafts, and never changes what greedy says. A verified window is the gap - **4.45x** a step at nine rows, ~97 ms of it head and lm_head logits paid for rejected rows as well as kept ones - so acceptance of 1.85 ids a pass closes the arithmetic at k = 1 and nowhere above it: 1.19x at k = 1 with a head and 0.75x at k = 8, 1.05x at k = 2 with the n-gram hash and 0.91x at k = 8 (`/tmp/f40_head.log`). The length is therefore resolved from the drafter at open instead of being a constant (§4); what would widen it - logits for only the rows a window keeps, boundary copies made cheaper - is priced at together ~1.1x |
@@ -2102,7 +2111,14 @@ answering: ten and sixteen accumulators on a machine with AVX-512 fused off is n
 left for the dequantised block, so the remaining structure is a tiled integer gemm and not a
 fifth form - and that form is now measured at 1.84x of the walk that ships, three output rows
 sharing one activation load, needing a requantised copy of the dense matrices to reach an engine
-(ideas.md §7.18). ideas.md §7.11 has the
+(ideas.md §7.18). That is also the end of that family rather than its beginning: five row counts
+are instantiated now, raced twice, three-by-four ties the one other tile that fits the
+`R*T + R + 1 <= 16` accumulator budget exactly (1.4 % ahead of it at the width a chunk ingests at in
+one run, dead level with it in the next), the two forms the budget excludes are 48-63 % and 37-78 %
+off, and the winning tile with its weights held resident in the L3 is **1.00x** of the same walk
+reading DRAM at 512 tokens in both runs - 3.4 GB/s of a 76-79 GB/s bus - which is a walk sitting at
+an issue-rate ceiling, where neither a layout nor a faster memory has anything left to sell
+(ideas.md §7.28, `/tmp/walk_diag.log`, `/tmp/wide_tile5g.log`). ideas.md §7.11 has the
 cap curve; §7.8 has the arithmetic for each gap.
 
 ### Two output rows per activation load, on both walks
@@ -2132,7 +2148,8 @@ What the pairs are worth, in the harness that owns them and then in the engine:
 |---|---|---|
 | Q8_0 dense walk, T=8/16/32 | 1.37 / 1.39 / 1.36x | `/tmp/walk_pairs3.log` |
 | Q8_0 dense walk, T=512 | 1.19x (536 → 637 GMAC/s) | same |
-| IQ4_NL / IQ3_S expert walks, T=16/32 | 1.13-1.15x | same |
+| IQ3_S expert walk, T=8/16/32 | 1.11 / 1.13 / 1.14x | `/tmp/walk_diag.log` |
+| IQ4_NL expert walk, T=8/11/16/32 | **0.92 / 0.95 / 0.97 / 0.98x**, and now gated off | same |
 | `block_proj` | 7.36 → 5.77 ms (1.275x) | `/tmp/f19_wide.log` |
 | `hc_attn` / `hc_ffn` | 1.62 → 1.37, 1.61 → 1.40 | same |
 | `moe_ffn` | 16.48 → 15.28 ms | `/tmp/f18_wide.log` |
@@ -2149,6 +2166,50 @@ the panel is what was being re-walked from L2 once per output row. `QE_IQ_2ROW_D
 both families and stays on; the integer tile still owns the shared scale exit and still has to
 beat this.
 
+The two codebook families no longer share that verdict, and the reason is the register file again.
+`QE_IQ4_NL_MULTI2R_FORM` spends the same sixteen accumulators IQ3_S does, and an IQ4_NL block is
+only a shuffle and a lookup, so what a second row saves there does not cover the spill; an IQ3_S
+block is eight 256-entry grid lookups and a sign spread per 32 weights, and it comes out 1.11-1.14x
+ahead after the same spill. Five loads of `make walk` in one process read IQ4_NL at 0.92-0.98x
+from eight to thirty-two tokens with the Q8_0 column of the same table still at 1.19-1.40x, and the
+HEAD binary reproduces the row, so the gate became per format: `QE_IQ4_NL_PAIR_MIN_T` 0 (never),
+`QE_IQ3_S_PAIR_MIN_T` 8, both behind `QE_IQ_2ROW`. Nothing is deleted - the form is still compiled,
+is still raced with the gate forced open, and is still 0 of 2,100,736 outputs moved - and
+`make moe`'s shared-dequant table carries the mixed bucket (IQ3_S gate/up with IQ4_NL down in one
+pass) as its own leg, where forcing the IQ4 pairing reads 1.008x against a 1.1 % control
+(ideas.md §7.29, `/tmp/walk_diag.log`, `/tmp/moe_pair.log`).
+
+### Under the threshold, one dispatch per chunk instead of one per token
+
+The chunk walk exists to read a matrix's bytes once for T tokens, so a projection smaller than
+`QE_PROJ_MB` (1 MiB) is excluded from it: at that size the bytes are already resident, and the
+walk's reassociation is not being paid for. What nobody priced was the other half of that
+decision. `proj` sent the excluded tensors to `gemv` **once a token**, and counting the
+checkpoint's header finds 180 such projections walked per token: 96 hyper-connection injection
+matrices (4 x 10240 f32, 160 KiB), 72 gated-delta alpha and beta (48 x 2560 f32, 480 KiB) and
+12 indexer key projections (128 x 2560 bf16, 640 KiB). A width-512 chunk therefore took 92,160
+pool barriers where the same chunk's walkable projections take 180, and `make pool` prices a hot
+19-thread dispatch at 2.6 us - 0.47 ms of an ingested token, in the two stages the profiler had
+been calling slow-for-the-shape for a dozen loads.
+
+Asking once is `proj_small`: the job carries the chunk width and the strides, `gemv_task` slices
+the flattened `(token, row)` space instead of the rows alone, and every kernel call is the same
+call it always made on the same row. `QE_SMALL_PROJ_BATCH=0` is the loop back.
+
+| | per token | `block_proj` | `hc_attn` | `hc_ffn` | one step |
+|---|---|---|---|---|---|
+| one ask per token | 16.44 ms | 1.81 | 0.86 | 0.83 | 88.4 ms |
+| one ask for the chunk | **15.86 ms** | 1.60 | 0.74 | 0.70 | 88.1 ms |
+| | **1.037x** | 1.13x | 1.16x | 1.19x | 1.00x |
+
+`/tmp/f39_wide.log`, arms interleaved best-of-three inside one load; the confirming load reads
+16.28 against 15.89 ms/token (1.025x) and a 87.9 ms step against a 88.4 ms one
+(`/tmp/f40_wide.log`). The saving is 0.46 ms
+attributable in the stages named against 0.47 predicted, the step is 1.00x because a token is one
+dispatch either way, and the outputs are not a measurement away from the old ones: a row is
+handed to one kernel call, so the token grouping is not part of what it sums to, and
+`make forward` asserts a chunk's logits byte for byte at both settings. Ideas.md §7.27 is the
+account, including the two theories it killed.
 
 ## 13. The elementwise half of a step
 
@@ -2199,6 +2260,37 @@ Three things in the design were not assumptions after this:
   benchmark: it is that zero injection has to be an ordinary residual add
   (`2*sigmoid(0) == 1` exactly), and the test compares the result with `res + y`
   bit for bit.
+
+### The other exponentials, and why 7.1-7.4x of them is not a dial worth turning
+
+The same degree-5 `exp2` reaches the two places that exponentiate for reasons other
+than a gate: a gated-delta block's per-head decay, and one cell's `per` attention
+weights inside the fused walk `qe_attn_walk`. `make fast` carries both halves of that
+claim on every run, the error against a double reference and the rate against libm:
+
+```
+exp2               : pass
+                       worst 3.5e-06 relative against a double reference over [-14,14], tail 3.1e-06, exp2(0) exact, monotonic
+                       expf 1.17 ns/element against 0.16 for the eight-wide form (7.4x); a token asks for 27,648 decays and 86,400 to 295,344 weights
+```
+
+The rate is real and the count is not: 114,048 exponentials a token at the selection a
+600-cell context reaches, 322,992 at the 2051-cell ceiling, 0.14 to 0.39 ms of CPU - 7
+to 20 microseconds of an 88 ms step once nineteen threads share it. Inside the engine
+the two forms measured **1.000x** of ingestion and **1.00x** of a step for **0.67
+nats** on the token the engine goes on to say (`/tmp/f41_wide.log`), so the
+approximation is a dial, `QE_EXP2_SIMD=1`, and not a default - and it is a dial whose
+scalar fallback this host no longer has anyway, since glibc's `expf` at these flags is
+1.12 to 1.17 ns and the same polynomial written scalar is slower at 1.49
+(`/tmp/exp_probe` for the scalar figure).
+
+The item beside it was free all along and ships unconditionally: sixteen value heads of
+one key head each computed `exp` of the same float for the same token, 27,648 calls a
+token where 1,728 of them are that number, so the decay is now one row of scratch per
+token and layer, filled once by `gdn_core_chunk` and read by `delta_task` - same
+`expf`, same input, same bits. `qe_softplus`'s 1,728 `expf`-and-`log1pf` pairs a token
+stay scalar for the same reason: 4.14 ns an element against 7 us of CPU, on a step that
+takes 88 ms to walk 5.5 GiB of weights.
 
 ### A norm with an epsilon is not scale-invariant, and that was worth 4.25 nats
 

@@ -1803,6 +1803,26 @@ int qe_iq_two_row(void) {
 
 void qe_iq_set_two_row(int on) { iq_two_row = on ? 1 : 0; }
 
+/* Where each format's dispatcher takes that form, per format, because the two formats do not
+ * agree about whether it pays and the register file is the reason (`QE_IQ4_NL_PAIR_MIN_T` in
+ * kern.h has the two rows of numbers). `qe_iq_two_row` stays the master switch this is under, so
+ * one environment variable still turns the whole idea off. */
+static int iq_pair_min_t[2] = { QE_IQ4_NL_PAIR_MIN_T, QE_IQ3_S_PAIR_MIN_T };
+
+int qe_iq_pair_min_t(qe_type t) {
+    if (t == QE_IQ4_NL)
+        return iq_pair_min_t[0];
+    if (t == QE_IQ3_S)
+        return iq_pair_min_t[1];
+    return 0;
+}
+
+void qe_iq_set_pair_min_t(qe_type t, int min_T) {
+    if (t == QE_IQ4_NL)
+        iq_pair_min_t[0] = min_T;
+    else if (t == QE_IQ3_S)
+        iq_pair_min_t[1] = min_T;
+}
 
 long qe_type_block_ne(qe_type t) {
     const qe_type_info *i = qe_type_info_of(t);
@@ -1988,8 +2008,14 @@ void qe_gemv_iq4_nl_multi(const void *restrict W, const float *const *restrict x
      * chain per token, so a paired form for those groups would be a different number as
      * well as a different schedule. With the pairing on the eight-groups the two walks
      * leave bit-identical outputs at every width and every row count, which is what
-     * section 3 of `make walk` holds it to. */
-    if (qe_iq_two_row() && T >= 8 && n_rows >= 2 && iq_park_take(T) == 0) {
+     * section 3 of `make walk` holds it to.
+     *
+     * The gate is 0 for this format on this host - 0.91x at eight tokens through 0.92x at
+     * thirty-two - so the form stays compiled and raced and is not taken: kern.h has the two rows
+     * of numbers and the register budget behind them, and `make moe`'s shared-dequant table races
+     * the mixed bucket this format shares with iq3_s as its own leg. */
+    if (qe_iq_two_row() && qe_iq_pair_min_t(QE_IQ4_NL) > 0 &&
+        T >= qe_iq_pair_min_t(QE_IQ4_NL) && n_rows >= 2 && iq_park_take(T) == 0) {
         for (; r + 1 < n_rows; r += 2) {
             const qe_block_iq4_nl *w0 = ROWPTR(qe_block_iq4_nl, W, r, ldd_blocks);
             const qe_block_iq4_nl *w1 = ROWPTR(qe_block_iq4_nl, W, r + 1, ldd_blocks);
@@ -2047,11 +2073,14 @@ void qe_gemv_iq3_s_multi(const void *restrict W, const float *const *restrict xs
 #if defined(__x86_64__)
     const long nb = K / 256;
     long r = 0;
-    /* Rows two at a time, on the same terms and for the same reason as iq4_nl above:
-     * the eight-groups go through the pairing form, and a group's leftover tokens go
-     * through the forms the walk below uses, once per row, so the pairing is a change of
-     * loads and not of numbers. */
-    if (qe_iq_two_row() && T >= 8 && n_rows >= 2 && iq_park_take(T) == 0) {
+    /* Rows two at a time, on the same terms and for the same reason as iq4_nl above: the
+     * eight-groups go through the pairing form, and a group's leftover tokens go through the forms
+     * the walk below uses, once per row, so the pairing is a change of loads and not of numbers.
+     * This is the format the form was worth it for: 1.11x at eight tokens, 1.14x at sixteen and
+     * thirty-two, because a second row of an iq3_s dequantise is eight grid lookups and a sign
+     * spread it does not pay twice. */
+    if (qe_iq_two_row() && qe_iq_pair_min_t(QE_IQ3_S) > 0 && T >= qe_iq_pair_min_t(QE_IQ3_S) &&
+        n_rows >= 2 && iq_park_take(T) == 0) {
         for (; r + 1 < n_rows; r += 2) {
             const qe_block_iq3_s *w0 = ROWPTR(qe_block_iq3_s, W, r, ldd_blocks);
             const qe_block_iq3_s *w1 = ROWPTR(qe_block_iq3_s, W, r + 1, ldd_blocks);

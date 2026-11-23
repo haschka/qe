@@ -1044,7 +1044,8 @@ void qe_gemv_q8_0_i8(const void *restrict W, const qe_i8panel *restrict a, int T
  * accumulator can then be the dot's own seed operand, which is what makes it one instruction
  * instead of a dot and an add, and the tile can afford more of them. `R*T + R + 1` vectors
  * is the budget (T accumulators per output row, R weight blocks, one activation block that
- * every row of the tile reads from a register), which is 16 exactly at R=3, T=4.
+ * every row of the tile reads from a register), which is 16 exactly at R=3, T=4 - and also at
+ * R=5, T=2, which is the fifth output row ideas.md 7.24 named as the budget nobody had run.
  *
  * Only the signed instruction qualifies. The unsigned one owes a bias seed per block, and a
  * seed that depends on the block is precisely the thing being removed.
@@ -1085,20 +1086,29 @@ QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r1t4, 1, 4)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r1t8, 1, 8)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r2t2, 2, 2)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r2t4, 2, 4)
+QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r2t8, 2, 8)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r3t2, 3, 2)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r3t4, 3, 4)
 QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r4t2, 4, 2)
+QE_I8_FLAT_FORM_Q8_0(qe_i8_flat_r5t2, 5, 2)
 
 typedef void (*qe_i8_flat_fn)(const int8_t *const *, long, const int8_t *, long, const float *,
                               long, const float *, float *const *, long);
 
 /* Indexed by output rows per tile - 1 and [T index] - then by the token tile 2, 4, 8. A cell
- * that would spill the register file is 0 and the entry point never asks for it. */
-static const qe_i8_flat_fn qe_i8_flat_forms[4][3] = {
+ * that would spill the register file is 0 and the entry point never asks for it.
+ *
+ * The two the budget only just affords are the ones ideas.md 7.24 said nobody had run: five
+ * output rows is `R*T + R + 1` = 16 vectors exactly, the widest tile that fits without reaching
+ * for the stack, and two rows against eight tokens is the widest tile that fits in
+ * *accumulators* alone. Both are raced against the three-by-four this engine runs by the fourth
+ * section of `make walk`, which is the only way the register-budget argument becomes a number. */
+static const qe_i8_flat_fn qe_i8_flat_forms[5][3] = {
     { qe_i8_flat_r1t2, qe_i8_flat_r1t4, qe_i8_flat_r1t8 },
-    { qe_i8_flat_r2t2, qe_i8_flat_r2t4, 0 },
+    { qe_i8_flat_r2t2, qe_i8_flat_r2t4, qe_i8_flat_r2t8 },
     { qe_i8_flat_r3t2, qe_i8_flat_r3t4, 0 },
     { qe_i8_flat_r4t2, 0, 0 },
+    { qe_i8_flat_r5t2, 0, 0 },
 };
 
 /* Rows of the flat copy `T` tokens at a time. `ws` is one scale per output row of the whole
@@ -1110,7 +1120,7 @@ int qe_gemv_q8_0_flat_i8(const void *restrict W, const float *restrict ws,
                          const qe_i8panel *restrict a, int T, float *const *restrict ys,
                          long n_rows, long K, long ldd, int tile_r) {
     const long nb = K / 32;
-    if (tile_r < 1 || tile_r > 4)
+    if (tile_r < 1 || tile_r > (int)(sizeof qe_i8_flat_forms / sizeof *qe_i8_flat_forms))
         return 1;
     const int ri = tile_r - 1;
     /* Widest token tile the row tile has a form for. */
@@ -1130,7 +1140,7 @@ int qe_gemv_q8_0_flat_i8(const void *restrict W, const float *restrict ws,
          * scale this walk applies is the row's own. */
         const int rr_i = (n_rows - r0 >= tile_r) ? ri : 0;
         const int rr = rr_i + 1;
-        const int8_t *wp[4];
+        const int8_t *wp[6];
         for (int i = 0; i < rr; i++)
             wp[i] = w + (size_t)(r0 + i) * (size_t)stride;
         for (int t = 0; t < T; t += tstep) {

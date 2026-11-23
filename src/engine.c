@@ -65,6 +65,51 @@ typedef struct spec_target spec_target;
 
 static void spec_drop(spec_target **sp);
 
+/* A request waiting for the batched lane, on its own thread. The driver writes the
+ * three fields below and sets `done` last, all of them under the engine's lock, which
+ * is the lock the waiter is asleep on - so a waiter that wakes up cannot be looking at
+ * a half-written result, and the driver never touches this again after `done`. */
+typedef struct {
+    int done;
+    long rc;
+    int err;
+} lane_wait;
+
+/* One request on the batched lane: one sequence of the forward pass, one sampler, one
+ * client. The sequence is the lane's index in the engine's array, which is why nothing
+ * here names it and why a lane can finish without any state moving: the row map handed
+ * to qe_forward_step_batch_rows is the lane table read as it stands.
+ *
+ * Every field belongs to the engine's lock. The prompt ids are the exception and only
+ * in the sense that matters - written by the requester before the lane is armed and
+ * read only by the driver afterwards, so a request queued behind a full batch is never
+ * holding a buffer the driver has to wait for. */
+typedef struct {
+    int used;        /* a request owns this sequence */
+    int admitted;    /* its prompt is through the network; it takes part in steps */
+    int have_logits; /* the row at `row` answers its next token and is unemitted */
+    int stop;        /* nothing more to generate: eos, or a client that went away */
+    int err;         /* errno for the caller, 0 = no failure */
+    int row;         /* whose row of the engine's row buffer its logits are in */
+    int *ids;
+    long n_ids;
+    long fed;     /* prompt ids fed so far, up to n_ids */
+    long mt;      /* answer budget, already trimmed to what the window leaves */
+    long emitted;
+    int pending;  /* the token sampled and waiting for its step */
+    int eos;
+    int dropped;  /* the prompt had to lose its front to fit the window */
+    qe_sampler_opts so;
+    uint64_t rng;
+    qe_token_cb cb;
+    void *user;
+    qe_gen_stats *st;
+    qe_progress_cb pcb;  /* this request's ingestion hook, and nobody else's */
+    void *pcb_user;
+    lane_wait *w;
+    double t0;
+} lane;
+
 struct qe_engine {
     qe_engine_info info;
     qe_engine_opts o;
@@ -115,6 +160,23 @@ struct qe_engine {
     void *user_progress_user;
     long ingest_base;
     long ingest_total;
+    /* The batched lane, which exists exactly when n_batch > 1 and is the only thing
+     * that ever runs the forward pass when it does. `lock` guards these and every lane,
+     * as it guards the transcript; the thread driving the batch is the only one that
+     * touches the pass while a lane is live, and it holds no lock while walking.
+     *
+     * `rows` is the batch's logits: n_batch + 1 vocabulary-wide rows, one per lane plus
+     * one more that a prompt being ingested answers out of. A step writes row t, and a
+     * lane emits from the row it was given, so nothing is copied per token; the extra
+     * row is safe to share because a lane is emitted in the iteration after it is
+     * admitted and before any other prompt is fed. */
+    int n_batch;
+    long lane_ctx; /* tokens one sequence may use: the cache divided by n_batch */
+    lane *lanes;
+    float *rows;
+    int lane_driving;
+    int lane_live;
+    pthread_cond_t lane_cv;
     pthread_mutex_t lock;
 };
 
@@ -527,6 +589,57 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
     e->prefix_cache = 1;
     snprintf(e->info.kv_cache, sizeof e->info.kv_cache, "none");
     pthread_mutex_init(&e->lock, NULL);
+    /* A batched pass needs a slot per sequence, and the pass says how many it can
+     * have. Refused rather than clamped: an operator who asked for sixteen and got
+     * eight is reading a startup line that contradicts a command line. */
+    if (o->n_batch > QE_MAX_SEQ) {
+        if (err && errn)
+            snprintf(err, errn,
+                     "--batch %d is more sequences than a pass drives (%d): the row map of "
+                     "one step is that wide, and every sequence is a share of the cache and"
+                     " a copy of the recurrent state",
+                     o->n_batch, QE_MAX_SEQ);
+        pthread_mutex_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
+    e->n_batch = o->n_batch > 0 ? o->n_batch : 1;
+    e->info.n_batch = e->n_batch;
+    if (e->n_batch > 1 && (!o->model_path || !*o->model_path)) {
+        /* The synthetic target has no forward pass and no sequence cache, so there is
+         * nothing for eight requests to share, and a server that took the flag here would
+         * answer with one queue while reporting a batch. */
+        if (err && errn)
+            snprintf(err, errn,
+                     "--batch %d needs a checkpoint: the synthetic target has no pass and"
+                     " no sequence cache to divide, so there is nothing for a second"
+                     " request to share",
+                     e->n_batch);
+        pthread_mutex_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
+    if (e->n_batch > 1 && o->mtp_path && *o->mtp_path) {
+        if (err && errn)
+            snprintf(err, errn,
+                     "--batch %d cannot draft: a draft window is one sequence's state and"
+                     " the pass cannot walk nine rows of one conversation, so the head"
+                     " would be resident bytes that nothing reads (--mtp without --batch)",
+                     e->n_batch);
+        pthread_mutex_destroy(&e->lock);
+        free(e);
+        return NULL;
+    }
+    if (e->n_batch > 1) {
+        /* Speculation and the turn cache are both one sequence's business: a window is
+         * verified against the state a row was drafted from, and a rewind point is one
+         * sequence's whole state. Neither is a thing eight sequences can each have, so
+         * the lane says so at startup instead of running a request without what it asked
+         * for. */
+        e->o.spec_k = 0;
+        e->prefix_cache = 0;
+    }
+    pthread_cond_init(&e->lane_cv, NULL);
     /* No number here: what a draft is worth depends on which drafter this engine
      * ends up with, and that is not known until a head has been opened or refused.
      * The selftest engine has no head to open, so it is decided now; a checkpoint
@@ -564,6 +677,11 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
             free(e);
             return NULL;
         }
+        if (e->n_batch > 1)
+            strncat(e->info.why,
+                    " --batch is a checkpoint thing: there is no forward pass here to"
+                    " share one weight walk across, so it is reported and not run.",
+                    sizeof e->info.why - strlen(e->info.why) - 1);
         return e;
     }
 
@@ -580,6 +698,7 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
                      "a checkpoint engine cannot serve from a demand-paged mapping: the"
                      " checkpoint has to be resident in RAM at startup (stage auto or ram)."
                      " Metadata-only readers say so with QE_STAGE_DESCRIBE");
+        pthread_cond_destroy(&e->lane_cv);
         pthread_mutex_destroy(&e->lock);
         free(e);
         return NULL;
@@ -590,6 +709,7 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
     if (!e->mm) {
         if (err && errn)
             snprintf(err, errn, "%s", qe_strerror());
+        pthread_cond_destroy(&e->lane_cv);
         pthread_mutex_destroy(&e->lock);
         free(e);
         return NULL;
@@ -747,14 +867,57 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
          * window on a host with this much RAM. `make score` prints both numbers
          * for whatever capacity was chosen. */
         int dflt_ctx = e->info.n_ctx_train > 0 ? e->info.n_ctx_train : 4096;
+        /* The lane's own memory, asked for before the pass it belongs to: a slot per
+         * sequence and the batch's logits, which is one vocabulary per sequence plus
+         * the extra row a prompt being ingested answers out of. Nine vocabularies at
+         * this checkpoint's 248320 is 8.5 MiB, and an engine that cannot have it
+         * cannot have anything, so it is a startup failure here rather than a server
+         * that silently serves one request at a time behind a `--batch 8`. */
+        if (e->n_batch > 1) {
+            e->lanes = calloc((size_t)e->n_batch, sizeof *e->lanes);
+            e->rows = malloc((size_t)(e->n_batch + 1) * (size_t)e->info.n_vocab *
+                             sizeof *e->rows);
+            if (!e->lanes || !e->rows) {
+                if (err && errn)
+                    snprintf(err, errn,
+                             "out of memory for the batch of %d sequences (%d vocabularies"
+                             " of logits): --batch without them is a queue, not a batch",
+                             e->n_batch, e->n_batch + 1);
+                free(e->lanes);
+                free(e->rows);
+                e->lanes = NULL;
+                e->rows = NULL;
+                if (e->mtp)
+                    qe_close(e->mtp);
+                if (e->mmproj)
+                    qe_close(e->mmproj);
+                if (e->tok)
+                    qe_tok_close(e->tok);
+                qe_close(e->mm);
+                pthread_cond_destroy(&e->lane_cv);
+                pthread_mutex_destroy(&e->lock);
+                free(e);
+                return NULL;
+            }
+        }
         qe_forward_opts fo = { .n_ctx = o->n_ctx > 0 ? o->n_ctx : dflt_ctx,
+                               .n_seq = e->n_batch,
                                .n_threads = e->info.n_threads,
+                               .walk_threads = o->walk_threads,
                                .kv_f32 = o->kv_f32,
                                .attn_head_walk = o->attn_head_walk,
                                .mtp_model = e->mtp };
         char ferr[512] = { 0 };
         e->fw = qe_forward_open(e->mm, &fo, ferr, sizeof ferr);
-        e->info.n_ctx = e->fw ? fo.n_ctx : 0;
+        /* What one request may use. The caches are shared and not copied, so a batched
+         * pass gives each sequence its slice of them, and this is that slice - the
+         * number a client budgets an answer against, and the number that makes
+         * `--batch 8` a trade and not a free multiplier: eight sequences out of a
+         * 262144-token window is 32768 tokens each. Reported as the context, because it
+         * is the window a request on this server really has. */
+        e->lane_ctx = e->fw ? fo.n_ctx / e->n_batch : 0;
+        e->info.n_ctx = e->fw ? (int)e->lane_ctx : 0;
+        e->info.n_batch = e->n_batch;
         if (!e->fw && err && errn)
             snprintf(err, errn, "warning: not generating: %s", ferr);
     }
@@ -764,7 +927,22 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
          * every connection, and a request installs a pointer to itself in the
          * engine's copy of it. */
         qe_forward_set_progress(e->fw, fwd_progress, e);
-        turns_init(e);
+        if (e->n_batch > 1) {
+            /* Every sequence at zero, once, which is what lets a lane be retired by
+             * resetting its own sequence and nothing else: the first request to a slot
+             * finds the same emptiness the tenth one does.
+             *
+             * The turn cache is not built, because a rewind point is one sequence's
+             * state and eight of them is a budget nobody has. It is reported in the
+             * same field that says "off" for a host that cannot afford a point. */
+            qe_forward_reset(e->fw);
+            snprintf(e->info.turn_cache_err, sizeof e->info.turn_cache_err,
+                     "off (--batch %d: a rewind point is one sequence's state, and a"
+                     " batched request reads its whole prompt every turn)",
+                     e->n_batch);
+        } else {
+            turns_init(e);
+        }
         /* The walk threshold the operator asked for, which outranks the environment
          * the pass read at open: positive blocks every projection of that size in
          * MiB and above, negative gives the ordered walk, 0 leaves the pass's own
@@ -793,7 +971,7 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
     if (e->o.spec_k == QE_SPEC_K_AUTO)
         e->o.spec_k = head_drafts ? QE_SPEC_K_HEAD : QE_SPEC_K_NGRAM;
     e->info.spec_k = e->o.spec_k;
-    char specnote[384];
+    char specnote[640];
     if (e->o.spec_k > 0)
         snprintf(specnote, sizeof specnote,
                  "Greedy generation speculates %d tokens a window off the %s and "
@@ -811,13 +989,32 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
                 " The draft head is resident but the pass could not open it, so the "
                 "n-gram drafter answers instead; what was missing was printed at open.",
                 sizeof specnote - strlen(specnote) - 1);
+    if (e->n_batch > 1)
+        strncat(specnote,
+                " A batched lane runs neither: a draft window and a rewind point are one"
+                " sequence's state, so --spec-k and --turn-cache ask for nothing here and"
+                " every request reads its whole prompt.",
+                sizeof specnote - strlen(specnote) - 1);
     if (e->fw) {
         size_t st_total = 0, st_token = 0;
         qe_forward_state_bytes(e->fw, &st_total, &st_token);
+        /* What sharing a weight walk costs a sequence, said in the same sentence that
+         * says it is sharing one: the window each of them gets and the state each of
+         * them needs, because those are the two things a batch trades away and an
+         * operator reading /v1/models cannot see them from a count of sequences. */
+        char lanenote[224];
+        if (e->n_batch > 1)
+            snprintf(lanenote, sizeof lanenote,
+                     "%d sequences through one walk of the weights, %d tokens of window "
+                     "each (the caches are divided and the recurrent state copied, so a "
+                     "batch is a share of the machine and not a machine per request)",
+                     e->n_batch, e->info.n_ctx);
+        else
+            snprintf(lanenote, sizeof lanenote, "One sequence at a time");
         used = snprintf(e->info.why, sizeof e->info.why,
              "generating. %d layers (%d gated-delta-net, %d sparse attention with the "
              "indexer, hyper-connections and %d-of-%d routed experts) executed from %s "
-             "(%s, %lld tensors, %.1f GiB, %d volumes), %s. One sequence at a time, "
+             "(%s, %lld tensors, %.1f GiB, %d volumes), %s. %s, "
              "%d tokens of state, key and value cache %s (%.0f MiB of state, %.1f KiB "
              "per token of context); sampler starts at the file's own "
              "top_k %d, top_p %.2f, min_p %.3f, "
@@ -825,7 +1022,7 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
              "resident but no encoder drives it. %s",
              e->info.n_blocks, n_gdn, n_qsa, e->info.n_experts_active, e->info.n_experts,
              o->model_path, e->info.arch, e->info.n_tensors, (double)bytes / 1073741824.0,
-             e->info.n_volumes, place, e->info.n_ctx, e->info.kv_cache,
+             e->info.n_volumes, place, lanenote, e->info.n_ctx, e->info.kv_cache,
              (double)st_total / 1048576.0, (double)st_token / 1024.0,
              e->samp.top_k, (double)e->samp.top_p, (double)e->samp.min_p,
              (double)e->samp.temp, specnote);
@@ -857,6 +1054,16 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
 void qe_engine_close(qe_engine *e) {
     if (!e)
         return;
+    /* A batched lane is driven by whichever request arrived to an empty lane table, and
+     * that thread owns the forward pass until the last sequence retires. Freeing the pass
+     * under it would be a step through freed weights, so close waits for the lane to
+     * empty - and it does empty, because every lane either answered, errored, or had its
+     * client stop reading, and the driver keeps walking while any of them is standing.
+     * A serial engine has no lane and goes straight through. */
+    pthread_mutex_lock(&e->lock);
+    while (e->lane_live > 0)
+        pthread_cond_wait(&e->lane_cv, &e->lock);
+    pthread_mutex_unlock(&e->lock);
     turns_discard(e);
     free(e->turns);
     free(e->turn_views);
@@ -872,8 +1079,11 @@ void qe_engine_close(qe_engine *e) {
     if (e->mm)
         qe_close(e->mm);
     pthread_mutex_destroy(&e->lock);
+    pthread_cond_destroy(&e->lane_cv);
     free(e->fed);
     free(e->tail);
+    free(e->lanes);
+    free(e->rows);
     free(e);
 }
 
@@ -1318,6 +1528,29 @@ static int spec_emit(void *vp, int tok, int is_eos) {
 }
 
 
+/* What this request samples with: the file's defaults, moved by the engine's flags,
+ * moved by what the request itself sent. The same rules on both lanes, because a
+ * request must not get a different distribution by arriving at a busy moment.
+ *
+ * 0 means "not sent", and for top_k and min_p a negative is the only way to ask for
+ * off when the checkpoint ships a non-zero default. */
+static qe_sampler_opts samp_for(const qe_engine *e, const qe_gen_opts *o) {
+    qe_sampler_opts so = e->samp;
+    if (o->temp >= 0.0f)
+        so.temp = o->temp;
+    if (o->top_k > 0)
+        so.top_k = o->top_k;
+    else if (o->top_k < 0)
+        so.top_k = 0;
+    if (o->top_p > 0.0f)
+        so.top_p = o->top_p;
+    else if (o->min_p > 0.0f)
+        so.min_p = o->min_p;
+    else if (o->min_p < 0.0f)
+        so.min_p = 0.0f;
+    return so;
+}
+
 static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
                            qe_token_cb cb, void *user, qe_gen_stats *st) {
     long rc = -1;
@@ -1334,6 +1567,13 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
 
     pthread_mutex_lock(&e->lock);
     double t0 = now();
+    /* The request's own ingestion hook, for the length of this call: the forward pass
+     * has one hook and it is the engine's, so a serial generation is the one case where
+     * "the request in hand" and "the engine" are the same thing. Cleared on the way out,
+     * which is also the failure path - a pointer to a connection that outlives the
+     * request is a pointer to a closed socket. */
+    e->user_progress = o->progress;
+    e->user_progress_user = o->progress_user;
 
     long vocab = qe_forward_vocab(e->fw);
     int ctx = qe_forward_ctx(e->fw);
@@ -1374,22 +1614,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         dropped = 1;
     }
 
-    qe_sampler_opts so = e->samp;
-    if (o->temp >= 0.0f)
-        so.temp = o->temp;
-    /* A request overrides the engine the same way the engine overrides the
-     * file: 0 means "not sent", and for top_k and min_p a negative is the only
-     * way to ask for off when the checkpoint ships a non-zero default. */
-    if (o->top_k > 0)
-        so.top_k = o->top_k;
-    else if (o->top_k < 0)
-        so.top_k = 0;
-    if (o->top_p > 0.0f)
-        so.top_p = o->top_p;
-    if (o->min_p > 0.0f)
-        so.min_p = o->min_p;
-    else if (o->min_p < 0.0f)
-        so.min_p = 0.0f;
+    qe_sampler_opts so = samp_for(e, o);
     uint64_t rng =
         o->seed ? (uint64_t)o->seed : (uint64_t)(t0 * 1e9) ^ 0x853c49e6748fea9bull;
 
@@ -1671,6 +1896,8 @@ done:
     /* Also on the way out of a failure: a panel left saying "ingesting" because a
      * request died is a panel that teaches people to ignore it. */
     qe_ui_gen_end();
+    e->user_progress = NULL;
+    e->user_progress_user = NULL;
     pthread_mutex_unlock(&e->lock);
     free(ids);
     free(logits);
@@ -1679,18 +1906,377 @@ done:
 
 /* --------------------------------------------------------------- generation */
 
-/* Point the ingestion hook at whoever is holding the client. The engine adds no
- * policy of its own: it is where a server that has a connection can reach the
- * forward pass that has the chunks. The engine's own hook stays installed, so a
- * request that installs one does not switch the counters off, and clearing it back
- * to NULL is what makes it safe for the pointer to be a connection. */
-void qe_engine_set_progress(qe_engine *e, qe_progress_cb cb, void *user) {
-    if (!e)
+/* ------------------------------------------------------------ batched lane */
+
+/* How much of one prompt the lane feeds before it lets the batch have another token.
+ *
+ * One slice is the whole of what a sibling stalls for: the driver is one thread, and while
+ * it is walking a prompt nobody else's row moves. At the full chunk that stall is the
+ * ingestion of a whole prompt - `make lane` measured 8.4 s for a 512-token one and 34.3 s
+ * for a 2048-token one, which is a client watching one token appear every eight seconds -
+ * so the lane feeds less than a chunk and buys the batch a heartbeat.
+ *
+ * What it pays is nothing measurable, because on this host a prompt row costs the same
+ * whatever the chunk is cut into: 16.1 ms a token at 48 rows, 15.7 at 512, 16.8 at 2048
+ * (`make lane`, and the bar's 61.3-62.9 tok/s is the 512-row figure again - 15.9 to
+ * 16.3 ms). A 128-row slice therefore costs the same per token as a 512-row one and bounds
+ * a sibling's wait at about two seconds. Feeding more than a chunk is not possible, a chunk
+ * being the widest the pass runs. */
+#define QE_LANE_SLICE 128
+
+static long lane_slice(const qe_engine *e) {
+    const int w = qe_forward_get_chunk(e->fw);
+    const long cap = (w < 1 || w > QE_CHUNK_MAX) ? QE_CHUNK_MAX : (long)w;
+    return cap < QE_LANE_SLICE ? cap : QE_LANE_SLICE;
+}
+
+/* The arithmetic a multi-row step runs, kept next to the numbers that chose it. A step
+ * with more than one row goes through the same chunk walks a wide prompt does, and those
+ * read the int8 and IQ4 copies made at load time. `make batch` raced the two at eight
+ * rows: the copies are worth 1.11x of the step - 38.9 against 43.34 ms a token - and cost
+ * 0.604 nats where the shared weight read alone costs 0.060 (ideas.md 7.25,
+ * /tmp/batch3.log). Eleven percent of a step is not worth half a nat, so a multi-row step
+ * declines the copies. A step of one row is left exactly as the serial engine runs it,
+ * which is what makes a lone request on a batched engine the same bits it gets today, and
+ * a prompt being ingested keeps them and the bar they buy.
+ *
+ * The walk of the projections and the bucketed expert pass are not touched: they are what
+ * makes B rows cost one weight read instead of B, and their reassociation across rows is
+ * the 0.060 nats that batching costs. */
+typedef struct {
+    size_t walk;
+    int i8, flat, grouped, i4, head, head_win;
+} pins;
+
+static void pins_capture(pins *p, const qe_forward *f) {
+    p->walk = qe_forward_get_proj_chunk(f);
+    p->i8 = qe_forward_get_proj_i8(f);
+    p->flat = qe_forward_get_flat_i8(f);
+    p->grouped = qe_forward_get_moe_grouped(f);
+    p->i4 = qe_forward_get_decode_i4(f);
+    p->head = qe_forward_get_head_copy(f);
+    p->head_win = qe_forward_get_head_window(f);
+}
+
+static void pins_apply(qe_forward *f, const pins *p) {
+    qe_forward_set_proj_chunk(f, p->walk);
+    qe_forward_set_proj_i8(f, p->i8);
+    qe_forward_set_flat_i8(f, p->flat);
+    qe_forward_set_moe_grouped(f, p->grouped);
+    qe_forward_set_decode_i4(f, p->i4);
+    qe_forward_set_head_copy(f, p->head);
+    qe_forward_set_head_window(f, p->head_win);
+}
+
+static void pins_decline_copies(qe_forward *f) {
+    pins p;
+    pins_capture(&p, f);
+    p.i8 = 0;
+    p.flat = 0;
+    p.i4 = 0;
+    p.head = QE_HEAD_STORED;
+    p.head_win = 0;
+    pins_apply(f, &p);
+}
+
+/* Nothing left for this lane to do: it answered, the client went away, its budget ran
+ * out, or the network produced a step that failed. */
+static int lane_over(const lane *L) {
+    return L->err || L->stop || L->emitted >= L->mt;
+}
+
+/* Hand the sequence back. The reset is what makes a batch a set of independent
+ * sequences and not one sequence with a wider name: the next conversation handed this
+ * slot starts at position 0 of a zeroed slice, and a delta-net state left over from the
+ * last one answers its first token. It happens here, on the driver, because that is the
+ * thread allowed to touch the pass; arming a lane on a request thread does not. */
+static void lane_retire(qe_engine *e, int i) {
+    lane *L = &e->lanes[i];
+    lane_wait *w = L->w;
+    const long rc = L->err ? -1 : L->emitted;
+    const int err = L->err;
+    if (L->st) {
+        qe_gen_stats *st = L->st;
+        st->tokens = L->emitted;
+        /* Prompt tokens fed plus tokens chosen, which is the serial lane's count with
+         * nothing reused: the token that ended a turn was chosen and never fed, and a
+         * batched step is still one token of network for the one sequence it advanced.
+         * What a batch shares is invisible per request by design - the aggregate is what
+         * `make lane` prints, because that is the only place a shared step exists. */
+        st->steps = L->fed + L->emitted;
+        st->cached = 0;
+        st->drafted = 0;
+        st->accepted = 0;
+        st->tok_per_step = 1.0;
+        st->truncated = L->emitted >= L->mt;
+        st->budget = L->mt;
+        st->dropped = L->dropped;
+        st->rewound = 0;
+        st->rewind_lcp = 0;
+        st->snapshot_us = 0;
+        st->seconds = now() - L->t0;
+    }
+    qe_forward_reset_seq(e->fw, i);
+    free(L->ids);
+    memset(L, 0, sizeof *L);
+    e->lane_live--;
+    qe_ui_gen_end();
+    if (w) {
+        w->rc = rc;
+        w->err = err;
+        w->done = 1; /* last, and under the lock the waiter sleeps on */
+    }
+    pthread_cond_broadcast(&e->lane_cv);
+}
+
+/* One token of one lane's answer, sampled from the row the last walk left for it. The
+ * caller's callback runs on the driver's thread, which is where the serial lane runs it
+ * too: a sink writes one connection's bytes and only ever one thread is doing that. */
+static void lane_say(qe_engine *e, lane *L, const float *lg) {
+    const long vocab = qe_forward_vocab(e->fw);
+    int id = qe_sample(lg, vocab, &L->so, &L->rng);
+    if (id < 0) {
+        L->stop = 1; /* the sampler had nothing to choose from */
         return;
+    }
+    char piece[128];
+    long n = qe_tok_decode(e->tok, &id, 1, piece, sizeof piece);
+    int special = qe_tok_is_special(e->tok, id);
+    qe_token_out out = { .id = id, .special = special };
+    out.utf8 = (!special && n > 0) ? piece : "";
+    out.nbytes = (!special && n > 0) ? (int)n : 0;
+    if (L->cb(L->user, &out))
+        L->stop = 1; /* the client stopped reading; the rest of its answer is nobody's */
+    else if (L->eos >= 0 && id == L->eos)
+        L->stop = 1;
+    else {
+        L->emitted++;
+        qe_ui_emit();
+        L->pending = id;
+        L->have_logits = 0;
+    }
+}
+
+/* Feed one slice of a lane's prompt. Called with the lock held, by the driver only.
+ * The ingestion hook is per engine and per request, so it is this lane's for the length
+ * of one slice - which is the whole reason a batched request hands its keepalive in
+ * qe_gen_opts instead: there is one hook, and there are B prompts. */
+static void lane_ingest(qe_engine *e, int i) {
+    lane *L = &e->lanes[i];
+    const long vocab = qe_forward_vocab(e->fw);
+    long n = L->n_ids - L->fed;
+    const long cap = lane_slice(e);
+    if (n > cap)
+        n = cap;
+    e->ingest_base = L->fed;
+    e->ingest_total = L->n_ids;
+    e->user_progress = L->pcb;
+    e->user_progress_user = L->pcb_user;
+    const int rc = qe_forward_prefill_seq(e->fw, i, L->ids + L->fed, n,
+                                         e->rows + (size_t)L->row * (size_t)vocab);
+    e->user_progress = NULL;
+    e->user_progress_user = NULL;
+    if (rc) {
+        L->err = EIO;
+        return;
+    }
+    L->fed += n;
+    if (L->fed >= L->n_ids) {
+        L->admitted = 1;
+        L->have_logits = 1;
+    }
+}
+
+/* Drive the batch until no lane is left. Whichever request found the lane table empty
+ * when it arrived is the driver, and the last one out turns the role off; there is never
+ * a second one, because the role is taken under the same lock as the table.
+ *
+ * One iteration is: speak for every lane that has a token to speak, feed one slice of one
+ * prompt, then walk one row per sequence that has a token waiting. That order is a
+ * correctness fact and not a preference - a lane speaks in the iteration after it is
+ * admitted, so the row a prompt answered out of is free by the time the next prompt is
+ * fed into it. */
+static void lane_drive(qe_engine *e) {
+    const long vocab = qe_forward_vocab(e->fw);
+    pins base;
+    pins_capture(&base, e->fw);
+    for (;;) {
+        lane *ingest = NULL;
+        lane *say[QE_MAX_SEQ];
+        int nsay = 0;
+        pthread_mutex_lock(&e->lock);
+        for (int i = 0; i < e->n_batch; i++) {
+            lane *L = &e->lanes[i];
+            if (!L->used)
+                continue;
+            if (!L->admitted) {
+                if (!ingest)
+                    ingest = L;
+                continue;
+            }
+            if (L->have_logits && nsay < QE_MAX_SEQ)
+                say[nsay++] = L;
+        }
+        pthread_mutex_unlock(&e->lock);
+
+        for (int k = 0; k < nsay; k++) {
+            lane *L = say[k];
+            lane_say(e, L, e->rows + (size_t)L->row * (size_t)vocab);
+        }
+        if (ingest) {
+            const int i = (int)(ingest - e->lanes);
+            pthread_mutex_lock(&e->lock);
+            if (ingest->used && !ingest->admitted && !ingest->err)
+                lane_ingest(e, i);
+            pthread_mutex_unlock(&e->lock);
+        }
+
+        /* What the walk owes now: one row for every sequence holding a sampled token. */
+        int tok[QE_MAX_SEQ], rseq[QE_MAX_SEQ];
+        lane *rows[QE_MAX_SEQ];
+        int nrow = 0, alive = 0;
+        pthread_mutex_lock(&e->lock);
+        for (int i = 0; i < e->n_batch; i++) {
+            lane *L = &e->lanes[i];
+            if (!L->used)
+                continue;
+            if (lane_over(L)) {
+                lane_retire(e, i);
+                continue;
+            }
+            alive = 1;
+            if (L->admitted && !L->have_logits) {
+                rseq[nrow] = i;
+                tok[nrow] = L->pending;
+                rows[nrow] = L;
+                L->row = nrow;
+                nrow++;
+            }
+        }
+        if (!alive) {
+            e->lane_driving = 0;
+            pthread_cond_broadcast(&e->lane_cv);
+            pthread_mutex_unlock(&e->lock);
+            break;
+        }
+        pthread_mutex_unlock(&e->lock);
+        if (!nrow)
+            continue;
+
+        if (nrow > 1)
+            pins_decline_copies(e->fw);
+        const int rc = qe_forward_step_batch_rows(e->fw, tok, rseq, nrow, e->rows);
+        if (nrow > 1)
+            pins_apply(e->fw, &base);
+
+        pthread_mutex_lock(&e->lock);
+        for (int k = 0; k < nrow; k++) {
+            if (rc)
+                rows[k]->err = EIO;
+            else
+                rows[k]->have_logits = 1;
+        }
+        pthread_mutex_unlock(&e->lock);
+    }
+    pins_apply(e->fw, &base);
+}
+
+/* One request on the batched lane: encode, claim a sequence, and either drive the batch
+ * or wait for whoever is. Everything the serial lane decides before it touches the
+ * network - the answer budget, what has to be thrown away to fit the window, the sampler,
+ * the seed - is decided here the same way, because a request must not get a different
+ * answer by arriving at a busy moment. */
+static long gen_batched(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
+                        qe_token_cb cb, void *user, qe_gen_stats *st) {
+    if (!e->tok) {
+        errno = ENOSYS;
+        return -1;
+    }
+    const long need = qe_tok_count(e->tok, p->text);
+    int *ids = malloc(((size_t)need + 8) * sizeof *ids);
+    if (!ids) {
+        errno = ENOMEM;
+        return -1;
+    }
+    long np = qe_tok_encode(e->tok, p->text, ids, need + 8);
+    if (np <= 0) {
+        free(ids);
+        errno = EINVAL;
+        return -1;
+    }
+    const long ctx = e->lane_ctx;
+    long mt = o->max_tokens > 0 ? o->max_tokens : 64;
+    if (ctx > 0 && mt > ctx - np - 1)
+        mt = ctx - np - 1;
+    if (mt < 0)
+        mt = 0;
+    int dropped = 0;
+    if (np + mt + 1 > ctx) {
+        long keep = (long)ctx - mt - 1;
+        if (keep <= 0) {
+            free(ids);
+            errno = ENOSPC;
+            return -1;
+        }
+        memmove(ids, ids + (np - keep), (size_t)keep * sizeof *ids);
+        np = keep;
+        dropped = 1;
+    }
+
+    lane_wait w = { 0, 0, 0 };
     pthread_mutex_lock(&e->lock);
-    e->user_progress = cb;
-    e->user_progress_user = user;
+    lane *L = NULL;
+    while (!L) {
+        for (int i = 0; i < e->n_batch; i++)
+            if (!e->lanes[i].used) {
+                L = &e->lanes[i];
+                break;
+            }
+        if (!L)
+            pthread_cond_wait(&e->lane_cv, &e->lock);
+    }
+    L->used = 1;
+    L->ids = ids;
+    L->n_ids = np;
+    L->mt = mt;
+    L->eos = o->eos >= 0 ? o->eos : qe_tok_eos(e->tok);
+    L->dropped = dropped;
+    L->so = samp_for(e, o);
+    L->rng = o->seed ? (uint64_t)o->seed
+                     : ((uint64_t)(now() * 1e9) ^ 0x853c49e6748fea9bull);
+    L->cb = cb;
+    L->user = user;
+    L->st = st;
+    L->pcb = o->progress;
+    L->pcb_user = o->progress_user;
+    L->w = &w;
+    L->t0 = now();
+    L->row = e->n_batch; /* the row a prompt answers out of */
+    e->lane_live++;
+    qe_ui_gen_begin(np, 0);
+    if (!e->lane_driving) {
+        e->lane_driving = 1;
+        pthread_mutex_unlock(&e->lock);
+        lane_drive(e); /* returns with this lane retired and `w` written */
+    } else {
+        while (!w.done)
+            pthread_cond_wait(&e->lane_cv, &e->lock);
+        pthread_mutex_unlock(&e->lock);
+    }
+    if (w.err) {
+        errno = w.err;
+        return -1;
+    }
+    return w.rc;
+}
+
+int qe_engine_batch_active(qe_engine *e) {
+    if (!e)
+        return 0;
+    pthread_mutex_lock(&e->lock);
+    int n = e->lane_live;
     pthread_mutex_unlock(&e->lock);
+    return n > 0 ? n : 0;
 }
 
 void qe_engine_turn_stats(qe_engine *e, long *slots, long *held, long long *bytes,
@@ -1730,6 +2316,15 @@ int qe_engine_prefix_cache(qe_engine *e, int on) {
     if (!e)
         return 0;
     pthread_mutex_lock(&e->lock);
+    /* A batched lane has no transcript to reuse and no rewind point to reuse it from,
+     * so there is nothing here to switch - and "off" means "throw away what the pass is
+     * holding", which on a lane is everybody else's answer standing in it. Say what it
+     * was and touch nothing. */
+    if (e->n_batch > 1) {
+        const int was = e->prefix_cache;
+        pthread_mutex_unlock(&e->lock);
+        return was;
+    }
     int was = e->prefix_cache;
     e->prefix_cache = on ? 1 : 0;
     if (!on) {
@@ -1793,8 +2388,11 @@ long qe_engine_generate_tokens(qe_engine *e, const qe_prompt *p, const qe_gen_op
         errno = ENOSYS;
         return -1;
     }
-    if (e->fw)
+    if (e->fw) {
+        if (e->n_batch > 1)
+            return gen_batched(e, p, o, cb, user, st);
         return gen_checkpoint(e, p, o, cb, user, st);
+    }
 
     static const char *FILLER[] = { "quantized", "streaming", "verified",  "bandwidth",
                                     "resident",  "speculative", "accepted", "drafted",

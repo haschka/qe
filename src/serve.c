@@ -565,6 +565,12 @@ static void qe_block(qe_str *s, server *st, const char *extra) {
     qe_str_appendf(s, ",\"weight_bytes\":%lld", (long long)st->info.bytes);
     qe_str_appendf(s, ",\"threads\":%d", st->info.n_threads);
     qe_str_appendf(s, ",\"spec_k\":%d", st->info.spec_k);
+    /* Sequences this engine drives through one walk of the weights, and how many are in
+     * it at the moment the status was read. A server configured for eight and serving an
+     * idle afternoon is both things at once, and the difference is the whole point of
+     * asking. */
+    qe_str_appendf(s, ",\"batch\":%d", st->info.n_batch);
+    qe_str_appendf(s, ",\"batch_active\":%d", qe_engine_batch_active(st->eng));
     qe_str_appendf(s, ",\"tokenizer\":%s", st->info.has_tokenizer ? "true" : "false");
     /* What the attention cache holds per token of context. It is the number that
      * decides how many sequences fit next to each other, so a client planning
@@ -931,12 +937,18 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
     if (stream && st->o.sse_keepalive_ms > 0) {
         k.ka_ms = st->o.sse_keepalive_ms;
         k.written_ms = now_ms();
-        qe_engine_set_progress(st->eng, sink_progress, &k);
+        /* The keepalive rides this request's ingestion hook and not an engine-wide
+         * one: on a batched engine several prompts are being fed at once, and a comment
+         * about one connection's prompt arriving on another's stream is a corrupt
+         * stream. `go` is this request's copy of the options. */
+        go.progress = sink_progress;
+        go.progress_user = &k;
     }
 
     qe_gen_stats gs = { 0 };
     long n = qe_engine_generate_tokens(st->eng, &p, &go, chat_token, &k, &gs);
-    qe_engine_set_progress(st->eng, NULL, NULL);
+    go.progress = NULL;
+    go.progress_user = NULL;
     qe_turn_end(k.turn);
     long prompt_tokens = count_prompt_tokens(st->eng, p.text);
     long reasoning_tokens = k.reasoning.len ? count_prompt_tokens(st->eng, k.reasoning.p) : 0;
@@ -1171,7 +1183,8 @@ static int handle_completions(qe_http_conn *c, const qe_http_req *req, server *s
     if (stream && st->o.sse_keepalive_ms > 0) {
         k.ka_ms = st->o.sse_keepalive_ms;
         k.written_ms = now_ms();
-        qe_engine_set_progress(st->eng, sink_progress, &k);
+        go.progress = sink_progress;
+        go.progress_user = &k;
     }
     for (int i = 0; i < nprompt; i++, el = el->next) {
         qe_str prompt = { 0 };
@@ -1220,7 +1233,8 @@ static int handle_completions(qe_http_conn *c, const qe_http_req *req, server *s
         qe_str_free(&k.text);
         qe_str_free(&prompt);
     }
-    qe_engine_set_progress(st->eng, NULL, NULL);
+    go.progress = NULL;
+    go.progress_user = NULL;
 
     if (stream) {
         sink_chunk(&k, "{}", last_finish);

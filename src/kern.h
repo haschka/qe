@@ -80,6 +80,33 @@ void qe_iq3s_set_reg_block(int on);
 int qe_iq_two_row(void);
 void qe_iq_set_two_row(int on);
 
+/* The smallest token group at which each codebook format takes that pair form; 0 means never.
+ *
+ * They are not the same number, and the reason is the register file. The pair form holds two rows'
+ * dequantised blocks beside eight accumulators apiece - twenty-four vectors in a sixteen-vector
+ * file - so what it buys on activation loads it pays for in stack traffic, and only a format whose
+ * dequantise is dear enough to still come out ahead after that keeps the form. Measured at
+ * K=2560 over 400000 rows, one activation scale per row, min of three reps, in the third section
+ * of `make walk` (`/tmp/walk_diag.log`):
+ *
+ *   IQ3_S   1.11x at eight tokens, 1.07x at eleven, 1.02x at thirteen, 1.14x at sixteen,
+ *           1.14x at thirty-two
+ *   IQ4_NL  0.91x at eight, 0.95x at eleven, 0.96x at thirteen, 0.94x at sixteen,
+ *           0.92x at thirty-two
+ *
+ * An iq3_s block is eight 256-entry grid lookups and a sign spread per 32 weights, so a second row
+ * of the same activations is worth more than the spill; an iq4_nl block is a shuffle and a lookup,
+ * and its pair form is 4-9 % off the walk it replaced at every width a bucket or a grouped expert
+ * pass arrives at. Nothing is deleted and nothing is hidden: the form stays compiled, the two legs
+ * of both benches still race it (`make walk` forces it on through this gate so its identity check
+ * stays a check of the form and not of the default), and `make moe`'s shared-dequant table now
+ * carries the mixed case as its own column, because a bucket walks both formats at once and the
+ * two answers are not the same size. */
+#define QE_IQ4_NL_PAIR_MIN_T 0
+#define QE_IQ3_S_PAIR_MIN_T 8
+int qe_iq_pair_min_t(qe_type t);
+void qe_iq_set_pair_min_t(qe_type t, int min_T);
+
 /* fp16 -> fp32.
  *
  * This function used to be `(uint32_t)h.d << 16`, which is a bf16 widening, not
@@ -284,6 +311,87 @@ void qe_i8_set_rowscale(int v);
 int qe_i8_hoist(void);
 void qe_i8_set_hoist(int v);
 
+/* The engine's one exponential approximation: a degree-5 minimax for exp2 over
+ * [-0.5, 0.5] with the integer part rebuilt through the exponent field. src/layer.c
+ * has carried the eight-wide form of it since the sigmoid became SIMD, and §13's
+ * `make fast` row holds it to 8.5e-08 absolute against a double reference over the
+ * whole gate range, checked for monotonicity because a non-monotone gate is legal
+ * under every error bound and turns a sigmoid into a generator of ties.
+ *
+ * Against libm it is 3.5e-06 relative worst over [-14, 14], the range an exponent
+ * of either of them is in, where `expf` is 1e-7, so anything that switches to it is
+ * a change of arithmetic and not of scheduling: `make fast` prices the error, `make forward` prices the nats.
+ *
+ * The scalar form exists so a run's tail is approximated the same way its body is,
+ * and so a host without AVX2 gets one answer rather than two. */
+#define QE_LOG2E 1.4426950408889634f
+
+#include <math.h>
+#include <string.h>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+static inline float qe_exp2_f32(float x) {
+    x = fminf(fmaxf(x, -100.0f), 100.0f);
+    /* Round to nearest by the 2^23+2^22 magic rather than `rintf`, whose rounding
+     * mode handshake is slower than the five FMAs it rounds. The clamp above is
+     * what keeps the shift below inside the exponent field. */
+    const float n = (x + 12582912.0f) - 12582912.0f;
+    const float f = x - n;
+    float p = 1.3333558146428443e-3f;
+    p = fmaf(p, f, 9.6181291076284778e-3f);
+    p = fmaf(p, f, 5.5504108664815974e-2f);
+    p = fmaf(p, f, 2.4022650695910071e-1f);
+    p = fmaf(p, f, 6.9314718055994531e-1f);
+    p = fmaf(p, f, 1.0f);
+    int i;
+    memcpy(&i, &p, sizeof i);
+    i += ((int)n) << 23;
+    memcpy(&p, &i, sizeof p);
+    return p;
+}
+
+#if defined(__x86_64__)
+
+/* exp2 for eight floats. Clamped first because the exponent trick has no meaning
+ * outside the float range, and p lands in [0.707, 1.414] so adding the exponent
+ * cannot carry into the sign bit or denormalise - which is why the reduction to
+ * [-0.5, 0.5] comes first rather than after. */
+static inline __m256 qe_exp2_avx2(__m256 x) {
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-100.0f)), _mm256_set1_ps(100.0f));
+    __m256i n = _mm256_cvtps_epi32(x);
+    __m256 f = _mm256_sub_ps(x, _mm256_cvtepi32_ps(n));
+    __m256 p = _mm256_set1_ps(1.3333558146428443e-3f);
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(9.6181291076284778e-3f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(5.5504108664815974e-2f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(2.4022650695910071e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(6.9314718055994531e-1f));
+    p = _mm256_fmadd_ps(p, f, _mm256_set1_ps(1.0f));
+    return _mm256_castsi256_ps(_mm256_add_epi32(_mm256_castps_si256(p),
+                                                _mm256_slli_epi32(n, 23)));
+}
+
+#endif /* x86 for exp2 */
+
+/* exp() of one contiguous run into another, eight at a time where the eight exist
+ * and the same polynomial on the remainder. The runs this is for are one token's
+ * heads (48 floats of gated-delta decay) and one cell's query heads (twelve floats
+ * of attention weight), so the vectors are few and the call is not: 36 gated-delta
+ * layers and 12 attention layers per token. */
+static inline void qe_exp2v(const float *x, float *out, long n) {
+    long i = 0;
+#if defined(__x86_64__)
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(out + i,
+                         qe_exp2_avx2(_mm256_mul_ps(_mm256_loadu_ps(x + i),
+                                                    _mm256_set1_ps(QE_LOG2E))));
+#endif
+    for (; i < n; i++)
+        out[i] = qe_exp2_f32(x[i] * QE_LOG2E);
+}
+
 #if defined(__x86_64__)
 
 #include <immintrin.h>
@@ -326,8 +434,8 @@ void qe_gemv_q8_0_i8(const void *restrict W, const qe_i8panel *restrict a, int T
  * per 32 weights, which is what leaves it with no exit at all: the block loop is one load and
  * one `vpdpbssd` per token, and the two scales are paid once after the loop. `ws` is one float
  * per row of the whole matrix, `ldd` the byte stride between the copy's rows, and `tile_r` how
- * many output rows share one activation load (1, 2, 3 or 4; 3 by 4 tokens is the widest tile the
- * register file holds). The panel has to be a row-scaled one, and a token group the tile does not
+ * many output rows share one activation load (1 to 5; 3 rows by 4 tokens and 5 rows by 2 tokens
+ * are the two tiles that fill the register file exactly). The panel has to be a row-scaled one, and a token group the tile does not
  * divide returns nonzero rather than walking part of it at the wrong scale. Compiled for the
  * signed instruction only - `ideas.md` 7.17. */
 int qe_gemv_q8_0_flat_i8(const void *restrict W, const float *restrict ws,

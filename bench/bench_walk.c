@@ -401,10 +401,20 @@ static void check_pair(qe_type t, const char *label, const char *w, size_t row_b
     float *ylone = buf, *ypair = buf + (size_t)MAXT * (size_t)rows;
     walk_job a = { t, w, x, ylone, rows, K_, row_bytes, ldd_blocks, T, 1u << 20, shared };
     walk_job b = { t, w, x, ypair, rows, K_, row_bytes, ldd_blocks, T, 1u << 20, shared };
+    /* The pairing is gated per format now, and this host ships one of the two formats off
+     * (src/kern.h has the numbers), so toggling the master switch alone would compare a walk
+     * with itself and print the result as an identity. Force this format's gate open for the
+     * duration, so what is being compared is the form and not the default; a format whose
+     * dispatcher has no gate returns 0 from the getter and is left exactly as it was. */
+    const int gate = qe_iq_pair_min_t(t);
+    if (gate == 0)
+        qe_iq_set_pair_min_t(t, 1);
     qe_iq_set_two_row(0);
     qe_pool_run(walk_task, &a, qe_pool_size());
     qe_iq_set_two_row(1);
     qe_pool_run(walk_task, &b, qe_pool_size());
+    if (gate == 0)
+        qe_iq_set_pair_min_t(t, gate);
     long moved = 0;
     for (long i = 0; i < (long)((size_t)T * rows); i++)
         if (ypair[i] != ylone[i])
@@ -467,8 +477,23 @@ static void section_pairs(int nthr) {
     /* Four is the width the pairing is switched off at, eight the width it replaces, and
      * eleven and thirteen what a bucket does when its width is not a multiple of eight: a
      * group's leftover tokens are walked one row at a time beside the paired eights, so
-     * those two rows are the price of keeping the arithmetic identical. */
+     * those two rows are the price of keeping the arithmetic identical.
+     *
+     * A row is gated only where the format's own dispatcher pairs, and since this file raced
+     * the two codebook formats against each other that is no longer the same width for both:
+     * the two constants are QE_IQ4_NL_PAIR_MIN_T and QE_IQ3_S_PAIR_MIN_T, with the numbers
+     * that chose them next to them. */
     static const int TW[] = { 4, 8, 11, 13, 16, 32 };
+    /* The two formats do not agree about whether the second accumulator pays, so the gate is
+     * per format (QE_IQ4_NL_PAIR_MIN_T and QE_IQ3_S_PAIR_MIN_T in src/kern.h, with the rows of
+     * numbers that chose them beside them). Both columns still race the form - the gate is
+     * forced open for this table and put back after - but only a format that actually ships it
+     * is gated on its number, because asserting on the other one would make this leg fail for
+     * the measurement that is the reason for the gate. What is printed unshipped is printed as
+     * such, and if it ever climbs back above 1.05x the row says so. */
+    const int ship4 = qe_iq_pair_min_t(QE_IQ4_NL), ship3 = qe_iq_pair_min_t(QE_IQ3_S);
+    qe_iq_set_pair_min_t(QE_IQ4_NL, 1);
+    qe_iq_set_pair_min_t(QE_IQ3_S, 1);
     printf("%-5s %11s %11s %9s %11s %11s %9s\n", "T", "IQ4 1-row", "IQ4 2-row", "IQ4 gain",
            "IQ3 1-row", "IQ3 2-row", "IQ3 gain");
     for (int wi = 0; wi < (int)(sizeof TW / sizeof *TW); wi++) {
@@ -478,8 +503,9 @@ static void section_pairs(int nthr) {
          * one, and a narrower group never reaches it - so the two legs are the same code and
          * the row is this run's noise floor rather than a result. 13 % has been measured
          * between two identical walks of 4 ms, which is a reason to print it and not a reason
-         * to gate on it. */
-        const double floor_ = T >= 8 ? 1.0 : 0.0;
+         * to gate on it. Same for a format this host ships the pairing off for entirely. */
+        const int on4 = ship4 > 0 && T >= ship4, on3 = ship3 > 0 && T >= ship3;
+        const double floor4 = on4 ? 1.0 : 0.0, floor3 = on3 ? 1.0 : 0.0;
         int passes = 0;
         for (;;) {
             for (int rep = 0; rep < 3; rep++)
@@ -502,15 +528,19 @@ static void section_pairs(int nthr) {
                         }
                     }
             qe_iq_set_two_row(1);
-            if (++passes >= MEASURE_PASSES || (best[0][0] / best[1][0] >= floor_ &&
-                                               best[0][1] / best[1][1] >= floor_))
+            if (++passes >= MEASURE_PASSES || (best[0][0] / best[1][0] >= floor4 &&
+                                               best[0][1] / best[1][1] >= floor3))
                 break;
         }
         const double g4 = best[0][0] / best[1][0], g3 = best[0][1] / best[1][1];
         char note[112] = "";
-        if (g4 < floor_ || g3 < floor_)
+        if (g4 < floor4 || g3 < floor3)
             snprintf(note, sizeof note, "  <- the pairing is slower (load average %.2f)",
                      load_average_1m());
+        else if (T >= 8 && ((!on4 && g4 >= 1.05) || (!on3 && g3 >= 1.05)))
+            snprintf(note, sizeof note, "  <- a pairing this host ships off measured %.2fx: %s",
+                     !on4 && g4 >= 1.05 ? g4 : g3,
+                     !on4 && g4 >= 1.05 ? "iq4_nl pairing is above 1" : "iq3_s pairing is above 1");
         else if (T < 8 && (g4 < 0.95 || g4 > 1.05 || g3 < 0.95 || g3 > 1.05))
             snprintf(note, sizeof note, "  <- the same walk on both legs, so this is the noise");
         else if (passes > 1)
@@ -518,12 +548,17 @@ static void section_pairs(int nthr) {
         printf("%-5d %11.1f %11.1f %8.2fx %11.1f %11.1f %8.2fx%s\n", T, best[0][0] * 1e3,
                best[1][0] * 1e3, g4, best[0][1] * 1e3, best[1][1] * 1e3, g3, note);
         fflush(stdout);
-        if (g4 < floor_ || g3 < floor_)
+        if (g4 < floor4 || g3 < floor3)
             exit(1);
     }
+    qe_iq_set_pair_min_t(QE_IQ4_NL, ship4);
+    qe_iq_set_pair_min_t(QE_IQ3_S, ship3);
     printf("ms is a whole walk of the tensor; gain is one-row over two-row, so 1.00x means the\n"
-           "second accumulator bought nothing. The expert pass takes this through the same\n"
-           "switch, which `make moe` prices against the grouped walk it ships in.\n");
+           "second accumulator bought nothing. The gate is %d for iq4_nl and %d for iq3_s\n"
+           "(0 = never); both columns above raced the form regardless, and the expert pass takes\n"
+           "the gate through the same switch, which `make moe` prices on the mixed bucket a\n"
+           "bucket actually walks.\n",
+           ship4, ship3);
 
     /* The dense walk, on the switch the expert walk already uses. The engine's chunk width
      * is the last row because that is the width a chunk actually ingests at, and a tile of
@@ -1333,6 +1368,7 @@ static void section_tile(int nthr) {
          * question, and `make forward`'s quality legs are what answer it. */
         {
             const long frows = 4103; /* odd: the row tile's tail has no partner */
+            const long RROWS_ = 2048; /* 5 MiB of flat rows: resident, unlike the 250 MiB above */
             char *wf = qe_alloc_huge((size_t)DROWS_ * (size_t)K_);
             float *sw = qe_alloc_huge((size_t)DROWS_ * sizeof(float));
             float *bf = qe_alloc_huge((size_t)2 * MAXT * (size_t)frows * sizeof(float));
@@ -1358,8 +1394,8 @@ static void section_tile(int nthr) {
             qe_i8_set_hoist(1);
             qe_i8_set_ssd(1);
             qe_i8_set_rows(1);
-            for (int which = 0; which < 2; which++) {
-                const int tr = which ? 1 : 3;
+            for (int which = 0; which < 3; which++) {
+                const int tr = (int[]){ 3, 1, 5 }[which];
                 i8_job a = jr[2];
                 a.rows = frows;
                 a.T = 8;
@@ -1386,14 +1422,15 @@ static void section_tile(int nthr) {
                 if (worst > 1e-5 * (double)maxy) exit(1);
             }
 
-            printf("\n%-5s %11s %11s %7s %11s %7s %11s %7s %11s %7s  (%s)\n", "T", "hoist+ssd",
-                   "flat r1", "gain", "flat r2", "gain", "flat r3", "gain", "flat r4", "gain",
+            printf("\n%-5s %11s %11s %7s %11s %7s %11s %7s %11s %7s %11s %7s  (%s)\n", "T",
+                   "hoist+ssd", "flat r1", "gain", "flat r2", "gain", "flat r3", "gain", "flat r4",
+                   "gain", "flat r5", "gain",
                    "one row-scaled panel, one scale per row, 100000 rows of Q8_0");
             static const int FT[] = { 8, 16, 64, 512 };
             for (int fi = 0; fi < (int)(sizeof FT / sizeof *FT); fi++) {
                 const int T = FT[fi];
-                double rate[5]; /* [0] is the pair this engine runs, [1..4] the row tiles */
-                for (int i = 0; i < 5; i++)
+                double rate[6]; /* [0] is the pair this engine runs, [1..5] the row tiles */
+                for (int i = 0; i < 6; i++)
                     rate[i] = 1e30;
                 for (int rep = 0; rep < 3; rep++) {
                     i8_job a = jr[2];
@@ -1402,7 +1439,7 @@ static void section_tile(int nthr) {
                     qe_pool_run(i8_walk_task, &a, nthr);
                     double dt = now() - t0;
                     if (dt < rate[0]) rate[0] = dt;
-                    for (int tr = 1; tr <= 4; tr++) {
+                    for (int tr = 1; tr <= 5; tr++) {
                         flat_job b = { wf, sw, x8r, spr, y, DROWS_, K_, T, tr };
                         t0 = now();
                         qe_pool_run(flat_walk_task, &b, nthr);
@@ -1416,7 +1453,7 @@ static void section_tile(int nthr) {
                 }
                 double best = rate[0];
                 int best_r = 0;
-                for (int tr = 1; tr <= 4; tr++)
+                for (int tr = 1; tr <= 5; tr++)
                     if (rate[tr] < best) {
                         best = rate[tr];
                         best_r = tr;
@@ -1429,10 +1466,45 @@ static void section_tile(int nthr) {
                 else
                     snprintf(note, sizeof note, "  <- fastest at %d rows per tile, %.0f GMAC/s",
                              best_r, macs / best / 1e9);
-                printf("%-5d %11.1f %11.1f %6.2fx %11.1f %6.2fx %11.1f %6.2fx %11.1f %6.2fx%s\n", T,
-                       rate[0] * 1e3, rate[1] * 1e3, rate[0] / rate[1], rate[2] * 1e3,
+                printf("%-5d %11.1f %11.1f %6.2fx %11.1f %6.2fx %11.1f %6.2fx %11.1f %6.2fx "
+                       "%11.1f %6.2fx%s\n",
+                       T, rate[0] * 1e3, rate[1] * 1e3, rate[0] / rate[1], rate[2] * 1e3,
                        rate[0] / rate[2], rate[3] * 1e3, rate[0] / rate[3], rate[4] * 1e3,
-                       rate[0] / rate[4], note);
+                       rate[0] / rate[4], rate[5] * 1e3, rate[0] / rate[5], note);
+                fflush(stdout);
+
+                /* The same five tiles with the bytes resident: 2048 rows of flat weights
+                 * and the whole panel are 6 MiB, which is this machine's L3, against the
+                 * 250 MiB the row above walks out of DRAM.
+                 *
+                 * The two lines together are what ideas.md 7.22 leaves "unpiced". A wider
+                 * macro-tile changes how many accumulators a core holds; it does not change
+                 * how many weight bytes the bus is asked for. So the gap between the two
+                 * lines is the part no tile can recover, and the most the resident line ever
+                 * says is the ceiling the question is about. Times are normalised to the
+                 * 100000 rows of the row above, so a column reads against its own cell. */
+                double rrate[6];
+                for (int tr = 1; tr <= 5; tr++) {
+                    rrate[tr] = 1e30;
+                    for (int rep = 0; rep < 3; rep++) {
+                        flat_job b = { wf, sw, x8r, spr, y, RROWS_, K_, T, tr };
+                        double t0 = now();
+                        qe_pool_run(flat_walk_task, &b, nthr);
+                        double dt = now() - t0;
+                        if (dt < rrate[tr]) rrate[tr] = dt;
+                    }
+                    rrate[tr] *= (double)DROWS_ / (double)RROWS_;
+                }
+                double rbest = rrate[1];
+                for (int tr = 2; tr <= 5; tr++)
+                    if (rrate[tr] < rbest)
+                        rbest = rrate[tr];
+                printf("%-5s", "resid");
+                for (int tr = 1; tr <= 5; tr++)
+                    printf(" %11.1f %6.2fx", rrate[tr] * 1e3, rate[0] / rrate[tr]);
+                printf("        <- resident: %.0f GMAC/s at the fastest tile\n",
+                       (double)RROWS_ * (double)K_ * (double)T /
+                           (rbest * (double)RROWS_ / (double)DROWS_) / 1e9);
                 fflush(stdout);
             }
             qe_i8_unset_ssd();

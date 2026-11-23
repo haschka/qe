@@ -179,6 +179,10 @@ int main(int argc, char **argv) {
                        "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf";
     int threads = QE_THREADS_AUTO, fuse = 1500, n_ctx = 4096, tokens = 128;
     int want_probe = 0, want_profile = 0;
+    /* The width a lone token's weight walk asks for. `full` and 0 are the pass width, so
+     * a run that names one and a run that does not are the same arithmetic twice, and the
+     * nll column of the sweep below is what says so. */
+    int walk_threads = 0;
     /* Prompts prefilled twice per arithmetic, to price the ingestion path the
      * token-at-a-time sweep below cannot reach: the integer expert walk, and the
      * grouped pass it sits on, which is the yardstick. */
@@ -208,7 +212,10 @@ int main(int argc, char **argv) {
             threads = (*t == 'a' || *t == 'A') ? QE_THREADS_AUTO : atoi(t);
         } else if (!strcmp(argv[i], "--ctx") && i + 1 < argc)
             n_ctx = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--fuse") && i + 1 < argc)
+        else if (!strcmp(argv[i], "--walk-threads") && i + 1 < argc) {
+            const char *t = argv[++i];
+            walk_threads = (*t == 'f' || *t == 'F' || *t == 'a' || *t == 'A') ? 0 : atoi(t);
+        } else if (!strcmp(argv[i], "--fuse") && i + 1 < argc)
             fuse = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tokens") && i + 1 < argc)
             tokens = atoi(argv[++i]);
@@ -246,6 +253,7 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr,
                     "usage: %s [--model PATH] [--threads N] [--ctx N] [--fuse S]"
+                    " [--walk-threads N]"
                     " [--tokens N] [--corpus FILE]... [--variants 0x0,0x1,...]"
                     " [--prompt TEXT] [--gen N] [--probe] [--profile] [--ingest N]"
                     " [--logits N] [--logits-out FILE] [--hidden N] [--hidden-out FILE]\n",
@@ -354,7 +362,7 @@ int main(int argc, char **argv) {
     printf("  corpus: %d documents, %ld tokens\n", ndocs, total);
     fflush(stdout);
 
-    qe_forward_opts fo = { .n_ctx = n_ctx, .n_threads = threads };
+    qe_forward_opts fo = { .n_ctx = n_ctx, .n_threads = threads, .walk_threads = walk_threads };
     char ferr[512] = { 0 };
     qe_forward *f = qe_forward_open(m, &fo, ferr, sizeof ferr);
     if (!f) {

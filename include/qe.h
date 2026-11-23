@@ -650,6 +650,10 @@ typedef struct {
     int kv_head;           /* which head of the row this group reads */
     int sstride;           /* n_kv_heads: the scale row's stride */
     int q8;
+    int exp2;              /* the cell's `per` weights through one eight-wide exp2
+                            * instead of `per` libm calls; see QE_EXP2_SIMD. Zero is
+                            * what every caller carried before it existed, and it is
+                            * the same `expf` on the same number. */
     float scale;           /* 1/sqrt(head_dim) */
 } qe_attn_unit;
 
@@ -1174,7 +1178,40 @@ typedef struct qe_forward qe_forward;
 
 typedef struct {
     int n_ctx;     /* cells one sequence may grow to (KV and indexer caches) */
+    /* How many sequences this pass drives at once. 0 and 1 are one sequence, which
+     * is every caller before batching and every buffer as it was sized.
+     *
+     * The caches do not grow with it: a pass opened with n_ctx cells and B sequences
+     * gives each of them n_ctx/B of them, so B sequences share the bytes one was
+     * going to have. That is the whole reason the field exists rather than a B-fold
+     * allocation - at the 262144 cells this checkpoint was trained on, the key,
+     * value and indexer caches are 12 GiB, and B copies of that is a host that does
+     * not exist. What a shorter cell range costs a sequence is its own context
+     * length, and nothing else.
+     *
+     * The recurrences are replicated and not split, because they have no length to
+     * share: the delta-net matrices and the two conv rings are ~216 MiB a sequence,
+     * which is what one more sequence actually costs.
+     *
+     * A pass with B > 1 still answers one sequence at a time for everything that
+     * goes through a chunk (qe_forward_prefill_seq), and rows only meet each other
+     * in qe_forward_step_batch. */
+    int n_seq;
     int n_threads; /* 0 = the pool's size */
+    /* How many threads a walk of one token's worth of weights asks for, when that
+     * is fewer than `n_threads`. A chunk is arithmetic-bound and wants every core
+     * this pass has; a lone token reads a matrix once and is bound by the bus, and
+     * one kernel's walk of that bus is fastest at 16 threads and not at 19 - 78.3
+     * GB/s against 73.7, and 77.5 against 71.2 at the worst repetition of each
+     * (`make gemv`). Inside the engine that reading is wrong, and by more than the
+     * kernel gained: a step is 1.07x slower at 16 threads and 1.17x at 13, the same
+     * load measuring `block_proj` at 34.38 against 29.72 ms/token and generation at
+     * 10.66 against 11.27 tok/s (`make forward`'s width leg, ideas.md 7.26). The
+     * default is therefore the pass width. 0 - that default - is what
+     * QE_WALK_THREADS otherwise names. A request and not a reservation: the pool
+     * answers a width it cannot fill by walking on the threads it has, and a width
+     * above the pass width is clamped to the pass width. */
+    int walk_threads;
     unsigned variant; /* QE_VARIANT_* bits, 0 = the committed reading */
     int profile;      /* nonzero: accumulate per-stage wall time into the diag */
     int kv_f32;       /* nonzero: keep the key/value cache in f32 instead of q8_0 */
@@ -1269,6 +1306,56 @@ int qe_forward_step(qe_forward *f, int token, float *logits_out);
  * reader until the prompt ends. Returns the first non-zero qe_forward_step code,
  * having fed the tokens before it. */
 int qe_forward_prefill(qe_forward *f, const int *tokens, long n, float *logits_out);
+/* The same two, for one sequence of a pass opened with n_seq > 1: sequence `s` of
+ * that pass, in its own slice of the cells and its own copy of the recurrences.
+ * With n_seq == 1 both are qe_forward_step and qe_forward_prefill, and `s` has to be
+ * 0, which is what makes them the same walk rather than a second one. */
+int qe_forward_step_seq(qe_forward *f, int s, int token, float *logits_out);
+int qe_forward_prefill_seq(qe_forward *f, int s, const int *tokens, long n, float *logits_out);
+/* B sequences through the trunk in one walk of the weights: `tokens[s]` is the token
+ * sequence s continues, and `logits_out + s * qe_forward_vocab()` is the vocabulary
+ * row predicting sequence s's next token. B is at most the pass's n_seq, and every
+ * sequence advances by exactly one token, so a step of B rows is B tokens for the
+ * price of one walk of the 5568 MiB a token reads - which is the only multiplier left
+ * on a machine where a lone decode step already moves those bytes at 97 % of the
+ * measured read ceiling (docs/DESIGN.md 1.2).
+ *
+ * What it shares, and what therefore does not come free, is every stage of a layer
+ * that is a walk rather than a recurrence: the projections, the indexer's scores, the
+ * output head, and - with expert grouping on - one bucketed expert pass over all B
+ * rows. The recurrences stay one per sequence, because a delta-net state and a conv
+ * ring belong to one sequence and no arithmetic crosses them.
+ *
+ * The rows go through the same chunk walks a wide prefill does, so they carry the
+ * caveat qe_forward_prefill documents: with the projection walk off
+ * (qe_forward_set_proj_chunk(f, 0)) and expert grouping off
+ * (qe_forward_set_moe_grouped(f, 0)) every row is bit-identical to that sequence's own
+ * qe_forward_step, and with both on - the shipping defaults - a Q8_0 projection and a
+ * grouped expert walk reassociate across rows exactly as they do across the tokens of
+ * a chunk. `make batch` asserts the first as a memcmp of B rows against B independent
+ * passes and prices the second in nats over a corpus.
+ *
+ * Returns 0, or -1 when a row does not belong to a sequence with room for it. */
+int qe_forward_step_batch(qe_forward *f, const int *tokens, int B, float *logits_out);
+/* The same step with a row map: row t continues sequence `rseq[t]` and is answered at
+ * `logits_out + t * qe_forward_vocab()`. A server whose sequences finish at different
+ * times cannot keep its live requests in the sequences 0..B-1, and copying a sequence's
+ * 113 MiB of cache down a slot every time one of them stopped is a worse answer than
+ * handing the step the map. Two rows of one call may not name one sequence, and a row
+ * that names a sequence with no cell left for it fails the call the way
+ * qe_forward_step_batch does. With rseq[t] == t this is qe_forward_step_batch. */
+int qe_forward_step_batch_rows(qe_forward *f, const int *tokens, const int *rseq, int B,
+                               float *logits_out);
+/* Forget one sequence and nothing else: its cells, its recurrences, its PLE window and
+ * its cursor, so the next conversation handed that sequence starts at position 0 of a
+ * zeroed slice. qe_forward_reset takes a pass down; this is the one a server calls
+ * between two requests that share it, and it is what makes a batch of sequences a
+ * serving thing rather than a benchmark thing. Must be called between steps. */
+int qe_forward_reset_seq(qe_forward *f, int s);
+/* Where sequence `s` is: tokens fed to it so far, out of the n_ctx / n_seq cells it
+ * owns. `qe_forward_pos` is sequence 0's and is unchanged. */
+long qe_forward_seq_pos(const qe_forward *f, int s);
+int qe_forward_n_seq(const qe_forward *f);
 /* Chunk-progress hook for a prefill that takes minutes.
  *
  * An 11,758-token prompt is 1,470 chunks of eight tokens and about 860 s of
@@ -1398,6 +1485,66 @@ int qe_forward_get_head_copy(const qe_forward *f);
 void qe_forward_set_head_window(qe_forward *f, int on);
 int qe_forward_get_head_window(const qe_forward *f);
 
+/* How many threads the walk of a lone token's weights asks for, and the same request after
+ * the open. It is a scheduling question and nothing else: `gemv` hands each output row to
+ * exactly one thread and that thread walks the row with one call to one kernel, so which
+ * threads did the walking cannot change a bit of what any row sums to - which is what makes
+ * this the one throughput knob in this file that is not priced in nats. `make forward`
+ * asserts exactly that, at every width it races, byte for byte on a step's logits.
+ *
+ * The reason there is a choice to make is that a step is the bus and not the arithmetic:
+ * 5568 MiB of weights read once, and one kernel's walk of that bus goes fastest with a few
+ * of the pass's cores left out of the read (78.3 GB/s at 16 against 73.7 at 19 on the staged
+ * weights themselves - ideas.md 7.26). Measured on a step instead of on a kernel, that
+ * reading is 7 % the wrong way round, so the default is every thread the pass has. A chunk
+ * is the opposite regime, arithmetic-bound at 205 GMAC/s, and keeps every thread the pass
+ * has whichever way this knob is set: the chunk walk, the expert stage and the attention
+ * pass are all untouched here.
+ *
+ * 0 to the setter is the pass width, which is the default, how it ran before there was a
+ * choice, and how `QE_WALK_THREADS=full` starts an open. `--walk-threads N` names it on
+ * both binaries. */
+void qe_forward_set_walk_threads(qe_forward *f, int n);
+int qe_forward_get_walk_threads(const qe_forward *f);
+
+/* Whether a projection under the chunk walk's threshold (`--proj-chunk`, 1 MiB by default)
+ * is asked of the pool once for the whole chunk or once for every token of it. It is a
+ * scheduling question and nothing else: the walk of such a tensor is the same call to the
+ * same kernel per token either way, and every kernel `gemv` reaches is a loop over output
+ * rows, so a row's sum does not know which thread or which call walked it. `make forward`
+ * asserts that on the logits of a chunk, byte for byte.
+ *
+ * The reason there is a choice is what is under that threshold: 180 of the projections this
+ * checkpoint walks per token - a hyper-connection mixer's injection matrix (4 x 10240 f32,
+ * 160 KiB, 96 of them), a gated-delta block's alpha and beta (48 x 2560 f32, 480 KiB, 72)
+ * and an indexer's key projection (128 x 2560 bf16, 640 KiB, 12) - each read by every token
+ * of a chunk. Asked once a token, a width-512 chunk therefore takes 92,160 barriers where the
+ * walkable projections take one dispatch each, worth 0.47 ms of an ingested token at the 2.6
+ * us a hot dispatch costs (`make pool`), and `make forward`'s leg measures 0.46 ms of it in
+ * the stages and 0.58 ms/token of the wall (16.44 against 15.86, `/tmp/f39_wide.log`). A step
+ * is one token and so one dispatch either way - 88.1 against 88.4 ms, the same step twice -
+ * which is why this is an ingestion knob. Unset is the batch, `QE_SMALL_PROJ_BATCH=0` is the
+ * per-token loop this shipped with, and 0 to the setter is the same thing. */
+void qe_forward_set_small_proj_batch(qe_forward *f, int on);
+int qe_forward_get_small_proj_batch(const qe_forward *f);
+
+/* Whether the engine's two remaining transcendental hot spots approximate their
+ * exponentials with the eight-wide exp2 src/layer.c has always used for its gates
+ * (ideas.md §6.6) or with libm `expf`. Two spots, because they are the only ones
+ * whose element count is worth a switch: a gated-delta block's per-head decay,
+ * which 48 heads x 16 value rows x 36 layers asked of libm once a token apiece,
+ * and one cell's `per` attention weights inside the fused walk.
+ *
+ * This is a change of arithmetic and not of scheduling: the approximation is
+ * 3.5e-06 relative against libm's 1e-7, so `make fast` prices the error against a
+ * double reference and `make forward`'s leg prices the nats. What it buys is a
+ * per-element rate, 0.16 against 1.12 to 1.17 ns an element (`make fast`), on
+ * element counts that are a rounding error of a step; the leg is what decides
+ * whether that is a win at all. Unset is libm, `QE_EXP2_SIMD=1` is the
+ * approximation, and 0 to the setter is libm again. */
+void qe_forward_set_exp2_simd(qe_forward *f, int on);
+int qe_forward_get_exp2_simd(const qe_forward *f);
+
 /* The widest chunk of prompt tokens that shares one weight walk, and the width a pass
  * opens with. Two numbers because they answer different questions: the max is what the
  * chunk buffers are sized for and what a width sweep may ask for, the default is what
@@ -1440,6 +1587,13 @@ int qe_forward_get_head_window(const qe_forward *f);
  * as far as either has been measured. */
 #define QE_CHUNK_MAX 512
 #define QE_CHUNK_DEFAULT 512
+/* How many sequences one pass may drive at once (qe_forward_opts.n_seq, and so how
+ * many rows one step may feed). Eight because that is the point where the bytes a
+ * decode step reads per token have fallen to the width a chunk is already ingested
+ * at - 5568 MiB over 8 rows is 696 MiB a token, against the 76-79 GB/s the bus does
+ * at - and because the row-parallel stages of a step have QE_CHUNK_MAX rows of
+ * scratch either way, so nothing but the recurrent state grows with this. */
+#define QE_MAX_SEQ 8
 /* Whether serving groups the expert stage of a chunked prefill. Measured on, and the
  * size of the win is a function of the width it runs at: 46.8 -> 30.5 ms/token at
  * width 512 (1.53x), 46.3 -> 33.3 at 128 (1.39x), 46.1 -> 34.2 at 64 (1.35x), and
@@ -1875,6 +2029,14 @@ typedef struct {
     unsigned seed;
     int spec_k;  /* draft length; 0 disables speculation */
     int eos;     /* vocabulary id that ends generation, or -1 */
+    /* Ingestion progress for this request and nobody else's: called on the thread
+     * that is feeding the prompt, once a chunk has landed. It belongs to the request
+     * because a server that batches has several prompts in one engine at once, and
+     * one hook per engine cannot say which of them is making progress. On a batched
+     * lane it fires from the driver thread while that driver is feeding this
+     * request's slices, which is the only honest place it could fire from. */
+    qe_progress_cb progress;
+    void *progress_user;
 } qe_gen_opts;
 
 typedef struct {
@@ -2026,6 +2188,10 @@ typedef struct {
     int turn_cache_auto;
     int turn_cache_points;
     char turn_cache_err[112];
+    /* Sequences this engine drives through one weight walk, and what one of them
+     * gets: `n_ctx` above is already the per-sequence window when this is above 1,
+     * because the caches are shared and not copied. 1 means the serial engine. */
+    int n_batch;
 } qe_engine_info;
 
 typedef struct qe_engine qe_engine;
@@ -2048,6 +2214,12 @@ typedef struct {
     const char *mtp_path;
     const char *id;   /* model id reported to clients */
     int n_threads;    /* 0 = all cores */
+    /* Fewer threads than the pass for a lone token's weight walk, in
+     * qe_forward_opts.walk_threads; 0 = the default, which is the pass width,
+     * because a step measured as a step is fastest with every thread the pass has
+     * even though one kernel's walk of the same bytes is not (ideas.md 7.26).
+     * `--walk-threads N`, QE_WALK_THREADS. */
+    int walk_threads;
     int spec_k;       /* default draft length, or QE_SPEC_K_AUTO for the drafter's */
     float temp;       /* default temperature */
     /* Defaults the server offers when a request does not say, in the same "0 means
@@ -2081,6 +2253,27 @@ typedef struct {
      * number is that many MiB. Overrides QE_PROJ_MB, which the forward pass reads at
      * open; docs/DESIGN.md §12 holds the measurement that decided the default. */
     int proj_chunk_mb;
+    /* Sequences driven through one walk of the weights at once. 0 and 1 are the
+     * serial engine every caller before this field had: one request holds the
+     * engine, the next one waits for the lock, and a lone decode step reads the
+     * 5568 MiB a token costs with the machine to itself.
+     *
+     * Above one, requests share the weight read: B decode rows go through the
+     * trunk in one sweep, which `make batch` measures at 2.22x of one row at B=8
+     * for 0.060 nats a token of logit (ideas.md 7.25) - the only multiplier left
+     * on a host where a single row already reads those bytes at 97 % of the
+     * measured ceiling. That price is what a multi-row chunk does to a Q8_0
+     * projection and a bucketed expert walk, and it is charged only to a step that
+     * actually has more than one row, so a lone request on a batched engine still
+     * gets the bits it gets today.
+     *
+     * What it costs besides the nats, all of it reported at startup: the caches do
+     * not grow with B, so a sequence gets n_ctx/B tokens of window; the recurrent
+     * state is replicated, so B sequences cost (B-1) times 216 MiB; and a batched
+     * lane runs neither speculation nor the turn cache, because both are one
+     * sequence's state and the pass cannot rewind eight of them independently.
+     * Refused together with a draft head, which the lane has no way to run. */
+    int n_batch;
 } qe_engine_opts;
 
 /* Opens the engine. `stage` says where the checkpoint's bytes live; the default
@@ -2109,13 +2302,11 @@ long qe_engine_generate(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o, 
 long qe_engine_generate_tokens(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
                                qe_token_cb cb, void *user, qe_gen_stats *st);
 
-/* Route the ingestion progress of the next generation on this engine to `cb`.
- * It is the forward hook above, reached through the engine because a server has
- * the client and not the forward pass; taking it back off with a NULL cb before
- * the call returns is what makes it safe to point at a connection. Only one
- * hook is live per engine, which is the same one-client-per-generation the
- * engine lock already implies. */
-void qe_engine_set_progress(qe_engine *e, qe_progress_cb cb, void *user);
+/* How many sequences the batched lane is driving right now, between 0 and the
+ * engine's `n_batch`. What /status shows next to the width it was opened with, since
+ * "batched" and "eight requests in the walk at once" are different claims and only
+ * the second one says the engine is doing what it was configured to do. */
+int qe_engine_batch_active(qe_engine *e);
 /* What the turn cache is doing, for anything that has to explain a fast second
  * turn without being able to see the terminal: how many rewind points the budget
  * buys, how many exist, what they cost in bytes, and how many prompt tokens this
