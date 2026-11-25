@@ -489,6 +489,11 @@ static long turns_store_boundary(qe_engine *e, long n, const qe_ckpt *c, int bou
 /* The engine's own ingestion hook, installed once per forward pass and left there:
  * the counters the terminal interface reads and whatever a connection wants to know
  * are both per chunk, and only one of them can be the hook. */
+static void fwd_progress_fine(void *vp, long done, long total) {
+    qe_engine *e = vp;
+    qe_ui_ingest(e->ingest_base + done, e->ingest_total > 0 ? e->ingest_total : total);
+}
+
 static int fwd_progress(void *vp, long done, long total) {
     qe_engine *e = vp;
     qe_ui_ingest(e->ingest_base + done, e->ingest_total > 0 ? e->ingest_total : total);
@@ -927,6 +932,7 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
          * every connection, and a request installs a pointer to itself in the
          * engine's copy of it. */
         qe_forward_set_progress(e->fw, fwd_progress, e);
+    qe_forward_set_progress_fine(e->fw, fwd_progress_fine, e);
         if (e->n_batch > 1) {
             /* Every sequence at zero, once, which is what lets a lane be retired by
              * resetting its own sequence and nothing else: the first request to a slot
@@ -970,6 +976,17 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
      * 4, `/tmp/f40_head.log`). Anything the caller said wins. */
     if (e->o.spec_k == QE_SPEC_K_AUTO)
         e->o.spec_k = head_drafts ? QE_SPEC_K_HEAD : QE_SPEC_K_NGRAM;
+    /* ideas.md §7.30 moved the step and not the window: a lone token is 1.3x faster
+     * since its walks share dispatches and hand their rows out from a cursor, and a
+     * verify window of two rows is still 1.45-1.6 steps of the faster step. A pass that
+     * costs that plus a draft row and emits 1.6-1.7 ids is no faster than the plain
+     * loop, so nothing speculates unless it is asked to (`--spec-k N`, or
+     * QE_SPEC_AUTO=1 for the old resolution). */
+    {
+        const char *ev = getenv("QE_SPEC_AUTO");
+        if (e->o.spec_k > 0 && o->spec_k == QE_SPEC_K_AUTO && !(ev && atoi(ev) > 0))
+            e->o.spec_k = 0;
+    }
     e->info.spec_k = e->o.spec_k;
     char specnote[640];
     if (e->o.spec_k > 0)
@@ -1731,6 +1748,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         qe_forward_reset(e->fw);
         fed_reset(e);
     }
+    const double t_read = now();
     if (rewound) {
         /* The transcript is this prompt now. Whatever the engine remembered past the
          * boundary it restored describes a conversation that diverged somewhere, and
@@ -1891,6 +1909,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         st->rewind_lcp = lcp;
         st->snapshot_us = snap_us;
         st->seconds = now() - t0;
+        st->prefill_seconds = t_read - t0;
     }
 done:
     /* Also on the way out of a failure: a panel left saying "ingesting" because a

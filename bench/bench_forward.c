@@ -1991,6 +1991,13 @@ int main(int argc, char **argv) {
     const int was_i4_s = qe_forward_get_decode_i4(f), was_hd_s = qe_forward_get_head_copy(f);
     qe_forward_set_decode_i4(f, 0);
     qe_forward_set_head_copy(f, QE_HEAD_STORED);
+    /* And the two integer walks a lone token takes since ideas.md 7.30 - the dense copy
+     * against an int8 input, the routed experts' step tasks - which a chunk does not take,
+     * for the same reason. The cursors and the fused dispatches stay on: they move which
+     * thread computed a row and never what the row sums to, so they are inside the claim. */
+    const int was_si8_s = qe_forward_get_step_i8(f), was_sf_s = qe_forward_get_step_fuse(f);
+    qe_forward_set_step_i8(f, 0);
+    qe_forward_set_step_fuse(f, 0);
 
     printf("== prompt ingestion ==\n");
     fflush(stdout);
@@ -2305,6 +2312,8 @@ int main(int argc, char **argv) {
         qe_forward_set_moe_grouped(f, was_mg);
         qe_forward_set_decode_i4(f, was_i4_s);
         qe_forward_set_head_copy(f, was_hd_s);
+        qe_forward_set_step_i8(f, was_si8_s);
+        qe_forward_set_step_fuse(f, was_sf_s);
         qe_forward_reset(f);
         if (qe_forward_prefill(f, ids, np, logits))
             return 1;
@@ -2797,6 +2806,9 @@ int main(int argc, char **argv) {
         const int was_mg = qe_forward_get_moe_grouped(f), was_co = qe_forward_get_moe_co(f);
         const int was_af = qe_forward_get_attn_fused(f);
         const int was_i4 = qe_forward_get_decode_i4(f), was_hd = qe_forward_get_head_copy(f);
+        const int was_si8 = qe_forward_get_step_i8(f), was_sf = qe_forward_get_step_fuse(f);
+        qe_forward_set_step_i8(f, 0);
+        qe_forward_set_step_fuse(f, 0);
         qe_forward_set_proj_chunk(f, 0);
         qe_forward_set_proj_i8(f, 0);
         qe_forward_set_flat_i8(f, 0);
@@ -2821,6 +2833,8 @@ int main(int argc, char **argv) {
         qe_forward_set_attn_fused(f, was_af);
         qe_forward_set_decode_i4(f, was_i4);
         qe_forward_set_head_copy(f, was_hd);
+        qe_forward_set_step_i8(f, was_si8);
+        qe_forward_set_step_fuse(f, was_sf);
         window_case(f, ids, np, vocab, logits, W, 0, "as shipped");
         fflush(stdout);
     }
@@ -2977,6 +2991,9 @@ int main(int argc, char **argv) {
             const int was_mg = qe_forward_get_moe_grouped(f), was_co = qe_forward_get_moe_co(f);
             const int was_af = qe_forward_get_attn_fused(f);
             const int was_i4 = qe_forward_get_decode_i4(f), was_hd = qe_forward_get_head_copy(f);
+            const int was_si8 = qe_forward_get_step_i8(f), was_sf = qe_forward_get_step_fuse(f);
+            qe_forward_set_step_i8(f, 0);
+            qe_forward_set_step_fuse(f, 0);
             qe_forward_set_proj_chunk(f, 0);
             qe_forward_set_proj_i8(f, 0);
             qe_forward_set_flat_i8(f, 0);
@@ -3053,6 +3070,8 @@ int main(int argc, char **argv) {
             qe_forward_set_attn_fused(f, was_af);
             qe_forward_set_decode_i4(f, was_i4);
             qe_forward_set_head_copy(f, was_hd);
+            qe_forward_set_step_i8(f, was_si8);
+            qe_forward_set_step_fuse(f, was_sf);
             const double plain_ship = emitted ? gen * 1000.0 / (double)emitted : 0.0;
             SpecRun ship = spec_run(f, sck, ids, np, vocab, eos, K, back, spec_tokens, hbuf, mlg,
                                     got, spec_tokens + 8, NULL, 0, NULL);

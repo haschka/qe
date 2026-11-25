@@ -346,7 +346,11 @@ def geometry(label, stream):
     out what it does when somebody drags one.
     """
     fs = frames(stream)
-    check(len(fs) >= 3, f"{label}: the panel drew several frames", f"{len(fs)}")
+    # Two is enough for every property below, which are all about one frame against the
+    # last. It used to be three, and the third came from the request clock still ticking
+    # after the selftest's instant request had finished - a frame the panel no longer
+    # draws, because a finished request's clock stops.
+    check(len(fs) >= 2, f"{label}: the panel drew several frames", f"{len(fs)}")
     s = Screen()
     stale = []      # rows rewritten to the same text they already had
     fulls = []      # frames that rewrote every row of the panel

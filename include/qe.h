@@ -859,6 +859,20 @@ void qe_moe_forward_multi(qe_moe *m, const float *x, long x_stride, const qe_rou
 int qe_moe_multi_begin(qe_moe *m, const float *x, long x_stride, const qe_route *routes,
                        int routes_per_row, int T, float *y, long y_stride);
 void qe_moe_multi_item(qe_moe *m, int which, qe_pool_item *out);
+/* A decode step's routing, split so the router can share a dispatch: the router as an
+ * item writing the moe's own logits, then (on the caller, after that dispatch) the top-k
+ * and the f32 refine. qe_moe_step_begin returns how many routed items the caller adds with
+ * qe_moe_step_item (gate/up, down, reduce: 3), or 0 when `y` is already the answer.
+ * The items hand rows out from a cursor and sum per-route partials in route order, so the
+ * answer does not depend on which thread walked what (src/moe.c). */
+void qe_moe_step_router_item(qe_moe *m, const float *x, qe_pool_item *out);
+int qe_moe_step_begin(qe_moe *m, const float *x, qe_route *routes, float *y);
+void qe_moe_step_item(qe_moe *m, int which, qe_pool_item *out);
+/* QE_MOE_DYN: the grouped pass's gate/up handed out from a cursor, and its down summed
+ * deterministically - a unit owns output rows of every bucket and adds them in bucket order,
+ * with no per-thread partials to reduce (ideas.md §7.35). */
+void qe_moe_set_dyn(qe_moe *m, int on);
+int qe_moe_get_dyn(const qe_moe *m);
 
 /* Whether the grouped expert pass recodes the vector it multiplies with to int8 and walks
  * the experts with the integer forms above. It ships on, and QE_I8_MOE=0 is the way back:
@@ -1268,6 +1282,12 @@ typedef struct {
                                     * seconds above it is the rate a walk ran at,
                                     * counted from inside the stage rather than from
                                     * a tensor table someone hoped matched it. */
+    /* The pool inside each stage, same condition (qe_pool_stats): how many dispatches
+     * it asked for, the wall they took, and the part of it the master spent waiting
+     * for the slowest worker. A stage's seconds minus its pool seconds is serial. */
+    long stage_disp[QE_ST_N];
+    double stage_pool[QE_ST_N];
+    double stage_tail[QE_ST_N];
 } qe_forward_diag;
 
 /* Reads the checkpoint's shape and every tensor the pass needs, and refuses
@@ -1370,6 +1390,11 @@ int qe_forward_n_seq(const qe_forward *f);
  * qe_forward_step, which is called once per token anyway. */
 typedef int (*qe_progress_cb)(void *user, long done, long total);
 void qe_forward_set_progress(qe_forward *f, qe_progress_cb cb, void *user);
+/* After every layer of a prompt chunk: tokens of the prompt that layer has carried, as a
+ * fraction of the chunk (a count of work done, for a status panel; it cannot stop the
+ * prompt, which only the chunk hook above can). */
+void qe_forward_set_progress_fine(qe_forward *f, void (*cb)(void *user, long done, long total),
+                                  void *user);
 
 /* How big a projection has to be for a chunked pass to walk it once for the whole
  * chunk rather than once per token: a tensor of at least `bytes` goes through
@@ -1439,6 +1464,67 @@ int qe_forward_get_flat_i8(const qe_forward *f);
  * QE_I4_DENSE=0 is the way back; `make score`'s decode A/B is the price. */
 void qe_forward_set_decode_i4(qe_forward *f, int on);
 int qe_forward_get_decode_i4(const qe_forward *f);
+/* The widest pass, in rows, that reads the IQ4_NL dense copy (QE_I4_MULTI). A verify
+ * window and a batched step are a few rows, still a walk the bus pays for. */
+#ifndef QE_I4_MULTI_DEFAULT
+#define QE_I4_MULTI_DEFAULT 2
+#endif
+void qe_forward_set_multi_i4(qe_forward *f, int rows);
+int qe_forward_get_multi_i4(const qe_forward *f);
+/* QE_STAGE_PF: threads idle at a decode step's barriers pull the next stage's
+ * weights toward the cache instead of spinning. */
+#ifndef QE_STAGE_PF_DEFAULT
+#define QE_STAGE_PF_DEFAULT 0
+#endif
+void qe_forward_set_prefetch(qe_forward *f, int on);
+int qe_forward_get_prefetch(const qe_forward *f);
+/* QE_STEP_FUSE: a decode step's independent walks - the four projections of a gated-delta
+ * block, the five of an attention block, a mixer's down and inject, the router beside the
+ * shared expert's gate and up, the routed experts beside its down - each share one dispatch
+ * of the stage graph, and the routed experts take the grouped pass's one-token int8 walk. */
+#ifndef QE_STEP_FUSE_DEFAULT
+#define QE_STEP_FUSE_DEFAULT 1
+#endif
+void qe_forward_set_step_fuse(qe_forward *f, int on);
+int qe_forward_get_step_fuse(const qe_forward *f);
+/* QE_DYN_KB: a lone token's weight walk hands its rows out in chunks of about this many
+ * KiB from an atomic cursor, so a core that is done takes more instead of waiting at the
+ * barrier for the slowest; 0 is the fixed equal slice. Bit-identical either way: a row is
+ * one kernel call on one thread. */
+#ifndef QE_DYN_KB_DEFAULT
+#define QE_DYN_KB_DEFAULT 64
+#endif
+void qe_forward_set_dyn_kb(qe_forward *f, long kb);
+long qe_forward_get_dyn_kb(const qe_forward *f);
+/* QE_I8_STEP: a lone token's dense walk recodes its input to int8 once per dispatch and
+ * walks the IQ4_NL copy with the one-token integer form instead of the float kernel. */
+#ifndef QE_I8_STEP_DEFAULT
+#define QE_I8_STEP_DEFAULT 1
+#endif
+void qe_forward_set_step_i8(qe_forward *f, int on);
+int qe_forward_get_step_i8(const qe_forward *f);
+/* QE_CHUNK_DYN: a walk of several rows (a chunk, a verify window, a batched step) hands
+ * its output rows out from a cursor as well; bit-identical, as for a lone token. */
+#ifndef QE_CHUNK_DYN_DEFAULT
+#define QE_CHUNK_DYN_DEFAULT 1
+#endif
+void qe_forward_set_chunk_dyn(qe_forward *f, int on);
+int qe_forward_get_chunk_dyn(const qe_forward *f);
+/* QE_ATTN_BATCH: a prompt chunk's attention as one selection dispatch and two per 32
+ * tokens, instead of three a token (ideas.md 7.31); bit-identical to the per-token form. */
+void qe_forward_set_attn_batch(qe_forward *f, int on);
+int qe_forward_get_attn_batch(const qe_forward *f);
+/* QE_ROWS_PAR: a prompt chunk's per-token loops (mixer norms and gates, the injection into the
+ * streams and its diagnostics, the gated-delta gates and convolution, the attention prologue,
+ * the router's top-k, the shared expert's gate) run across the pool; byte-identical (§7.33). */
+void qe_forward_set_rows_par(qe_forward *f, int on);
+int qe_forward_get_rows_par(const qe_forward *f);
+/* QE_DELTA_SIMD: the gated delta rule with a unit's eight state rows walked together, eight
+ * accumulators in flight instead of one (ideas.md §7.34); reassociates, priced in nats. */
+void qe_forward_set_delta_simd(qe_forward *f, int on);
+int qe_forward_get_delta_simd(const qe_forward *f);
+void qe_forward_set_moe_dyn(qe_forward *f, int on);
+int qe_forward_get_moe_dyn(const qe_forward *f);
 
 /* Which dense matrices the copy above is refused to, as a mask of the classes below. A
  * copy is staged for every candidate matrix whatever the policy, so this is a reading and
@@ -1585,6 +1671,10 @@ int qe_forward_get_exp2_simd(const qe_forward *f);
  * two earlier loads of this configuration read 30.9 and 31.4 in the 512 row, which is the
  * 1.6 % one load of this checkpoint is worth, and the ceiling stays at 512 because that is
  * as far as either has been measured. */
+/* Measured at 1024 as well (ideas.md §7.35): 12.05 / 12.14 / 12.15 ms an ingested token at
+ * 512 / 768 / 1024 over 4,096 tokens, because the integer expert walk re-decodes its weights
+ * for every eight tokens of a bucket and a fuller bucket buys nothing until it does not.
+ * Left at 512, which is also what keeps the chunk scratch where it was. */
 #define QE_CHUNK_MAX 512
 #define QE_CHUNK_DEFAULT 512
 /* How many sequences one pass may drive at once (qe_forward_opts.n_seq, and so how
@@ -1960,6 +2050,8 @@ void qe_forward_probe_set(qe_forward *f, const int *layers, int n, float *buf);
  * second one, which matters because each holds a sequence's worth of state
  * caches. Call reset() afterwards: state a different variant produced is not
  * comparable. */
+/* The variant bits this pass runs with (what a reconfigure has to hand back). */
+unsigned qe_forward_variant(const qe_forward *f);
 void qe_forward_reconfigure(qe_forward *f, unsigned variant, int profile);
 
 /* ------------------------------------------------------------------ sampler
@@ -2082,6 +2174,11 @@ typedef struct {
      * that says so is what makes the saving checkable rather than asserted. 0 when
      * no copy happened. */
     long snapshot_us;
+    /* Seconds from the request starting to its prompt being read (the part of `seconds`
+     * that was ingestion), so a rate can be quoted for each half: an answer's tok/s over
+     * the whole wall is a number dragged down by however long its prompt was. 0 where
+     * the path does not separate them. */
+    double prefill_seconds;
 } qe_gen_stats;
 
 /* Emits generated text in order; `utf8` is a fragment and need not be a whole
@@ -2453,6 +2550,23 @@ int qe_pool_recommended(void);
  * never finishes: nothing here detects one, so a caller that builds a graph built
  * an acyclic one. nthreads is clamped to the pool, as before. */
 void qe_pool_run_items(const qe_pool_item *items, int nitems);
+
+/* Where a pass spends the pool, counted by the master (ideas.md §10.2). Off by
+ * default and two clock reads a dispatch when on: `dispatches` is how many asks a
+ * stage made, `seconds` the wall from publishing each one to its last answer, `own`
+ * the master's own slice inside that, and `tail` the master waiting for the slowest
+ * worker after it - the barrier the bus sits idle behind. A pass's time outside
+ * `seconds` is serial: the master's work while nineteen threads spin. */
+typedef struct {
+    long dispatches;
+    double seconds, own, tail;
+    /* Inside stage-graph dispatches only: thread-seconds spent running items, against
+     * threads x wall of those dispatches. Their ratio is how busy the pool was in a graph,
+     * which the master's tail cannot see because the master is a worker of the graph too. */
+    double item_busy, item_capacity;
+} qe_pool_stats;
+void qe_pool_stats_enable(int on);
+void qe_pool_stats_get(qe_pool_stats *out);
 
 /* Split [0, n) into one contiguous range of equal size for each thread.
  *

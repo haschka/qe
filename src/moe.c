@@ -65,8 +65,25 @@ struct moe_job {
 };
 typedef struct moe_job moe_job;
 
+typedef struct {
+    const struct qe_moe *m;
+    const float *x;
+    float *logits;
+} router_job;
+
 struct qe_moe {
     qe_moe_desc d;
+    router_job rjob; /* a step's router, when it runs as an item of a graph */
+    /* A decode step's routed pass (qe_moe_step_begin): the routes it walks, the output,
+     * and the two cursors its tasks hand rows out from. */
+    struct {
+        const float *x;
+        const qe_route *r;
+        float *y;
+        int n;
+        int i8;
+        long next_gu, next_dn;
+    } st;
     long rb_gate, rb_up, rb_down;       /* bytes per weight row */
     long ldd_gate, ldd_up, ldd_down;    /* leading dimension, in blocks */
     int n_threads;
@@ -103,6 +120,8 @@ struct qe_moe {
     int mt_cap;               /* rows the multi scratch fits */
     int mt_T;                 /* rows in the grouping built by the last call */
     int n_bkt;                /* buckets in the grouping built by the last call */
+    int dyn;                  /* QE_MOE_DYN: the grouped pass on cursors, down deterministic */
+    long next_gu, next_dn;    /* the cursors of the pass in flight */
     int *itm_row;             /* item -> which of the T rows it belongs to */
     int *itm_e;               /* item -> expert id */
     float *itm_w;             /* item -> routing weight */
@@ -112,7 +131,9 @@ struct qe_moe {
     int *sort_hist;           /* counting-sort histogram, n_experts+1 */
     int *sort_cur;            /* write cursor for the counting sort */
     float *h2;                /* T * top_k * N intermediate */
-    float *part2;             /* n_threads * T * K down partials */
+    float *part2;             /* n_threads * T * K down partials (sliced down only) */
+    size_t part2_bytes;
+    int part2_T;
     void *mscratch_base;
     size_t mscratch;
     const float *mx;          /* T activations, stride mx_stride */
@@ -272,6 +293,10 @@ qe_moe *qe_moe_create(const qe_moe_desc *d) {
     if (m->d.top_k > d->n_experts)
         m->d.top_k = (int)d->n_experts;
     m->n_threads = nt;
+    {
+        const char *ev = getenv("QE_MOE_DYN");
+        m->dyn = ev && *ev ? atoi(ev) : 1;
+    }
     m->shared_multi = !d->no_shared_multi;
     m->rb_gate = row_bytes_of(d->t_gate, d->K);
     m->rb_up = row_bytes_of(d->t_up, d->K);
@@ -340,18 +365,14 @@ void qe_moe_destroy(qe_moe *m) {
     free(m->hist);
     if (m->mscratch)
         qe_free_huge(m->mscratch_base, m->mscratch);
+    if (m->part2)
+        qe_free_huge(m->part2, m->part2_bytes);
     if (m->scratch)
         qe_free_huge(m->scratch_base, m->scratch);
     free(m);
 }
 
 /* ------------------------------------------------------------------- router */
-
-typedef struct {
-    const struct qe_moe *m;
-    const float *x;
-    float *logits;
-} router_job;
 
 static void router_task(void *v, int tid, int nt) {
     router_job *j = v;
@@ -653,6 +674,22 @@ void qe_moe_forward(qe_moe *m, const float *x, const qe_route *routes, int n_rou
  * QE_MOE_CHUNK rows and, inside a chunk, applies the same gate/up rows to each
  * row that asked for that expert. Eight rows of either matrix is 17 KiB, well
  * inside the 48 KiB L1, so the second and later rows hit cache, not DRAM. */
+/* The per-thread partials of the sliced down (QE_MOE_DYN=0 only), grown on demand. */
+static int moe_need_part2(qe_moe *m, int T) {
+    if (m->part2 && T <= m->part2_T)
+        return 1;
+    const size_t bytes = (size_t)m->n_threads * (size_t)T * (size_t)m->d.K * sizeof(float);
+    float *p = qe_alloc_huge(bytes);
+    if (!p)
+        return 0;
+    if (m->part2)
+        qe_free_huge(m->part2, m->part2_bytes);
+    m->part2 = p;
+    m->part2_bytes = bytes;
+    m->part2_T = T;
+    return 1;
+}
+
 static int moe_need_multi(qe_moe *m, int T) {
     if (T <= m->mt_cap)
         return 1;
@@ -668,7 +705,8 @@ static int moe_need_multi(qe_moe *m, int T) {
     bytes += qe_align_up((size_t)(E + 1) * sizeof(int), 64);     /* sort_hist */
     bytes += qe_align_up((size_t)(E + 1) * sizeof(int), 64);     /* sort_cur */
     bytes += qe_align_up((size_t)items * m->d.N * sizeof(float), 64);   /* h2 */
-    bytes += qe_align_up((size_t)m->n_threads * T * m->d.K * sizeof(float), 64); /* part2 */
+    /* part2 lives in its own allocation (moe_need_part2): the deterministic down never reads
+     * it, and at a 1024-row chunk it would be 200 MB a layer. */
     char *s = qe_alloc_huge(bytes);
     if (!s)
         return 0;
@@ -694,7 +732,7 @@ static int moe_need_multi(qe_moe *m, int T) {
     off += qe_align_up((size_t)(E + 1) * sizeof(int), 64);
     m->h2 = (float *)(s + off);
     off += qe_align_up((size_t)items * m->d.N * sizeof(float), 64);
-    m->part2 = (float *)(s + off);
+    (void)off;
     m->mt_cap = T;
     return 1;
 }
@@ -857,14 +895,38 @@ static void moe_unit_slice(const struct qe_moe *m, int tid, int nt, long per, lo
     *hi = out[1];
 }
 
+static void gate_up_range(moe_job *j, int tid, long lo, long hi);
+
+/* gate/up of a grouped pass. With the cursor (QE_MOE_DYN, ideas.md §7.35) a thread takes the
+ * next (bucket, QE_MOE_GU_ROWS-row) unit instead of a slice fixed by what the buckets were
+ * estimated to cost: every output row is still one walk on one thread, so the bytes are the
+ * slice's, and a P-core that is done takes more instead of waiting for an E-core. */
+#define QE_MOE_GU_ROWS 64
 static void gate_up_multi(void *v, int tid, int nt) {
     moe_job *j = v;
-    const struct qe_moe *m = j->m;
-    const long N = m->d.N, K = m->d.K;
+    struct qe_moe *m = (struct qe_moe *)j->m;
+    const long N = m->d.N;
+    if (m->dyn) {
+        const long upb = (N + QE_MOE_GU_ROWS - 1) / QE_MOE_GU_ROWS;
+        const long units = upb * m->n_bkt;
+        for (;;) {
+            const long c = __atomic_fetch_add(&m->next_gu, 1, __ATOMIC_RELAXED);
+            if (c >= units)
+                return;
+            const long b = c / upb, r0 = (c % upb) * QE_MOE_GU_ROWS;
+            const long run = N - r0 < QE_MOE_GU_ROWS ? N - r0 : QE_MOE_GU_ROWS;
+            gate_up_range(j, tid, b * N + r0, b * N + r0 + run);
+        }
+    }
     long lo, hi;
     moe_unit_slice(m, tid, nt, N, &lo, &hi);
-    if (lo >= hi)
-        return;
+    if (lo < hi)
+        gate_up_range(j, tid, lo, hi);
+}
+
+static void gate_up_range(moe_job *j, int tid, long lo, long hi) {
+    const struct qe_moe *m = j->m;
+    const long N = m->d.N, K = m->d.K;
     float g[QE_MOE_CHUNK], u[QE_MOE_CHUNK];
     /* A shared-dequant group cannot share those two buffers: one walk of the rows
      * writes all of its outputs, which is the whole point. */
@@ -975,8 +1037,85 @@ static void gate_up_multi(void *v, int tid, int nt) {
  * weight rows they were computed from in the core that read them. */
 #define QE_MOE_DOWN_BLOCK 128
 
+/* down of a grouped pass, deterministically under a cursor (QE_MOE_DYN, ideas.md §7.35).
+ *
+ * The sliced form below sums per-thread partials, so which thread walked which bucket is part
+ * of what an output sums to, and it zeroes and then reduces nineteen T x K partials a layer -
+ * 5 MB each at a 512-row chunk. Here a unit is QE_MOE_DN_ROWS output rows of every bucket:
+ * it zeroes those rows of the output for the chunk's tokens and adds each bucket's
+ * contribution in bucket order, so a row of the answer is summed the same way whichever thread
+ * took the unit, and nothing is reduced afterwards. */
+#define QE_MOE_DN_ROWS 32
+static void down_det(moe_job *j, int tid, int nt) {
+    struct qe_moe *m = (struct qe_moe *)j->m;
+    const long N = m->d.N, K = m->d.K;
+    const int T = m->mt_T;
+    const long units = (K + QE_MOE_DN_ROWS - 1) / QE_MOE_DN_ROWS;
+    const float *xs[QE_MOE_SHARED_GROUP];
+    float *dop[QE_MOE_SHARED_GROUP];
+    float dm[QE_MOE_SHARED_GROUP][QE_MOE_DN_ROWS];
+    float tmp[QE_MOE_DN_ROWS];
+    const int shd = m->shared_multi && qe_gemv_multi_ptrs_has(m->d.t_down);
+    const int i8d = moe_int8_on() && m->shared_multi && !(N % 32) && qe_gemv_i8_has(m->d.t_down);
+    const int i8one = i8d && qe_gemv_i8_has_1(m->d.t_down);
+    const qe_i8panel ap = moe_panel(m, 1, tid);
+    const int gmax = j->gmax;
+    for (;;) {
+        const long c = __atomic_fetch_add(&m->next_dn, 1, __ATOMIC_RELAXED);
+        if (c >= units)
+            return;
+        const long k0 = c * QE_MOE_DN_ROWS;
+        const long run = K - k0 < QE_MOE_DN_ROWS ? K - k0 : QE_MOE_DN_ROWS;
+        for (int t = 0; t < T; t++)
+            memset(m->my + (size_t)t * m->my_stride + k0, 0, (size_t)run * sizeof(float));
+        for (int b = 0; b < m->n_bkt; b++) {
+            const int e = m->bkt_e[b];
+            const uint8_t *dp = expert_row(m->d.down, m->d.down_stride, e, k0, m->rb_down);
+            const int first = m->bkt_lo[b], last = m->bkt_lo[b + 1];
+            for (int p = first; p < last;) {
+                const int np = last - p > gmax ? gmax : last - p;
+                if ((shd && np >= 2) || (i8one && np == 1)) {
+                    for (int q = 0; q < np; q++) {
+                        xs[q] = m->h2 + (size_t)m->sort_itm[p + q] * N;
+                        dop[q] = dm[q];
+                    }
+                    int walked = 0;
+                    if (i8d) {
+                        moe_panel_fill(&ap, xs, np);
+                        walked = !qe_gemv_i8_t(m->d.t_down, dp, &ap, np, dop, run, N, m->ldd_down);
+                    }
+                    if (!walked)
+                        qe_gemv_multi_ptrs_t(m->d.t_down, dp, xs, dop, np, run, N, m->ldd_down);
+                    for (int q = 0; q < np; q++) {
+                        const int itm = m->sort_itm[p + q];
+                        const float w = m->itm_w[itm];
+                        float *dst = m->my + (size_t)m->itm_row[itm] * m->my_stride + k0;
+                        for (long i = 0; i < run; i++)
+                            dst[i] += w * dm[q][i];
+                    }
+                } else {
+                    for (int q = 0; q < np; q++) {
+                        const int itm = m->sort_itm[p + q];
+                        qe_gemv_t(m->d.t_down, dp, m->h2 + (size_t)itm * N, tmp, run, N,
+                                  m->ldd_down);
+                        const float w = m->itm_w[itm];
+                        float *dst = m->my + (size_t)m->itm_row[itm] * m->my_stride + k0;
+                        for (long i = 0; i < run; i++)
+                            dst[i] += w * tmp[i];
+                    }
+                }
+                p += np;
+            }
+        }
+    }
+}
+
 static void down_multi(void *v, int tid, int nt) {
     moe_job *j = v;
+    if (((const struct qe_moe *)j->m)->dyn) {
+        down_det(j, tid, nt);
+        return;
+    }
     const struct qe_moe *m = j->m;
     const long N = m->d.N, K = m->d.K;
     const int T = m->mt_T;
@@ -1051,6 +1190,8 @@ static void down_multi(void *v, int tid, int nt) {
 static void reduce_multi(void *v, int tid, int nt) {
     moe_job *j = v;
     const struct qe_moe *m = j->m;
+    if (m->dyn)
+        return; /* down_det wrote the answer in place */
     const long K = m->d.K;
     const int T = m->mt_T;
     long lo, hi;
@@ -1084,6 +1225,8 @@ int qe_moe_multi_begin(qe_moe *m, const float *x, long x_stride, const qe_route 
         return 0;
     if (!moe_need_multi(m, T))
         return 0;
+    if (!m->dyn && !moe_need_part2(m, T))
+        return 0;
     int nb = moe_group(m, routes, routes_per_row, T);
     if (nb < 0) {
         for (int t = 0; t < T; t++)
@@ -1103,6 +1246,8 @@ int qe_moe_multi_begin(qe_moe *m, const float *x, long x_stride, const qe_route 
     m->mr_per_row = routes_per_row;
     m->mt_T = T;
     m->mjob = (moe_job){ m, x, routes, T * m->d.top_k, y, moe_shared_group() };
+    m->next_gu = 0;
+    m->next_dn = 0;
     return 1;
 }
 
@@ -1142,6 +1287,165 @@ void qe_moe_forward_multi(qe_moe *m, const float *x, long x_stride, const qe_rou
     for (int i = 0; i < 3; i++)
         qe_moe_multi_item(m, i, &items[i]);
     qe_pool_run_items(items, 3);
+}
+
+void qe_moe_set_dyn(qe_moe *m, int on) {
+    if (m)
+        m->dyn = on ? 1 : 0;
+}
+
+int qe_moe_get_dyn(const qe_moe *m) { return m ? m->dyn : 0; }
+
+void qe_moe_step_router_item(qe_moe *m, const float *x, qe_pool_item *out) {
+    m->rjob = (router_job){ m, x, m->logits };
+    *out = (qe_pool_item){ router_task, &m->rjob, m->n_threads, 0 };
+}
+
+/* A decode step's routed experts, handed out by row chunk instead of by fixed slice.
+ *
+ * The grouped pass slices its work statically, by what a bucket costs, which is right for
+ * a chunk whose buckets are many and uneven and wrong for a step whose ten buckets are one
+ * row each and whose nineteen threads run on two kinds of core: the P-cores finish their
+ * equal share and wait at the barrier for the E-cores (`make decode` prints that wait as
+ * the tail, a third of a step before this). Here every thread takes the next chunk of
+ * rows from a cursor, so a fast core takes more.
+ *
+ * The answer does not depend on which thread took what. gate/up writes each expert's
+ * intermediate rows in place; down writes each expert's weighted output into that
+ * expert's own partial (the K-wide `part` rows, one per route instead of one per thread);
+ * and the reduce sums the ten partials in route order. The grouped pass summed per-thread
+ * partials, whose grouping depends on the slicing, so the two forms differ by a
+ * reassociation and the step is priced in nats (`make score`), not asserted bitwise. */
+#define QE_MOE_STEP_GU 32   /* gate/up rows a chunk */
+#define QE_MOE_STEP_DN 128  /* down rows a chunk */
+
+static void gate_up_step(void *v, int tid, int nt) {
+    qe_moe *m = v;
+    const long N = m->d.N, K = m->d.K;
+    const long per = (N + QE_MOE_STEP_GU - 1) / QE_MOE_STEP_GU;
+    const long units = per * m->st.n;
+    const qe_i8panel ap = moe_panel(m, 0, 0); /* filled once, by the master, in begin */
+    float g[QE_MOE_STEP_GU], u[QE_MOE_STEP_GU];
+    float *gp1[1] = { g }, *up1[1] = { u };
+    for (;;) {
+        const long c = __atomic_fetch_add(&m->st.next_gu, 1, __ATOMIC_RELAXED);
+        if (c >= units)
+            return;
+        const int e = (int)(c / per);
+        const long r0 = (c % per) * QE_MOE_STEP_GU;
+        const long n = r0 + QE_MOE_STEP_GU > N ? N - r0 : QE_MOE_STEP_GU;
+        const qe_route *rt = m->st.r + e;
+        const uint8_t *gw = expert_row(m->d.gate, m->d.gate_stride, rt->expert, r0, m->rb_gate);
+        const uint8_t *uw = expert_row(m->d.up, m->d.up_stride, rt->expert, r0, m->rb_up);
+        if (m->st.i8) {
+            qe_gemv_i8_t(m->d.t_gate, gw, &ap, 1, gp1, n, K, m->ldd_gate);
+            qe_gemv_i8_t(m->d.t_up, uw, &ap, 1, up1, n, K, m->ldd_up);
+        } else {
+            qe_gemv_t(m->d.t_gate, gw, m->st.x, g, n, K, m->ldd_gate);
+            qe_gemv_t(m->d.t_up, uw, m->st.x, u, n, K, m->ldd_up);
+        }
+        qe_silu_mul(m->h + (size_t)e * (size_t)N + r0, g, u, n);
+    }
+}
+
+static void down_step(void *v, int tid, int nt) {
+    qe_moe *m = v;
+    const long N = m->d.N, K = m->d.K;
+    const long per = (K + QE_MOE_STEP_DN - 1) / QE_MOE_STEP_DN;
+    const long units = per * m->st.n;
+    const qe_i8panel ap = moe_panel(m, 1, tid);
+    float o[QE_MOE_STEP_DN];
+    float *op1[1] = { o };
+    int have = -1; /* which expert's intermediate this thread's panel holds */
+    for (;;) {
+        const long c = __atomic_fetch_add(&m->st.next_dn, 1, __ATOMIC_RELAXED);
+        if (c >= units)
+            return;
+        const int e = (int)(c / per);
+        const long r0 = (c % per) * QE_MOE_STEP_DN;
+        const long n = r0 + QE_MOE_STEP_DN > K ? K - r0 : QE_MOE_STEP_DN;
+        const qe_route *rt = m->st.r + e;
+        const float *he = m->h + (size_t)e * (size_t)N;
+        const uint8_t *dw = expert_row(m->d.down, m->d.down_stride, rt->expert, r0, m->rb_down);
+        if (m->st.i8) {
+            if (have != e) {
+                const float *xs[1] = { he };
+                moe_panel_fill(&ap, xs, 1);
+                have = e;
+            }
+            qe_gemv_i8_t(m->d.t_down, dw, &ap, 1, op1, n, N, m->ldd_down);
+        } else {
+            qe_gemv_t(m->d.t_down, dw, he, o, n, N, m->ldd_down);
+        }
+        float *dst = m->part + (size_t)e * (size_t)K + r0;
+        const float w = rt->weight;
+        for (long i = 0; i < n; i++)
+            dst[i] = w * o[i];
+    }
+}
+
+static void reduce_step(void *v, int tid, int nt) {
+    qe_moe *m = v;
+    const long K = m->d.K;
+    long lo, hi;
+    qe_slice(K, tid, nt, &lo, &hi);
+    for (long k = lo; k < hi; k++) {
+        float s = 0.0f;
+        for (int e = 0; e < m->st.n; e++)
+            s += m->part[(size_t)e * (size_t)K + k];
+        m->st.y[k] = s;
+    }
+}
+
+int qe_moe_step_begin(qe_moe *m, const float *x, qe_route *routes, float *y) {
+    const int k = m->d.top_k;
+    int n = qe_moe_select(m, m->logits, routes);
+    for (int i = n; i < k; i++)
+        routes[i].expert = -1;
+    qe_moe_refine(m, x, routes, n);
+    /* Valid routes first, in the order select left them: that order is the reduce's. */
+    int nv = 0;
+    for (int i = 0; i < n; i++)
+        if (routes[i].expert >= 0)
+            routes[nv++] = routes[i];
+    for (int i = nv; i < k; i++)
+        routes[i].expert = -1;
+    if (nv == 0) {
+        memset(y, 0, (size_t)m->d.K * sizeof(float));
+        return 0;
+    }
+    /* The per-route partials need a row each and `part` has one per pool thread. */
+    if (nv > m->n_threads) {
+        qe_moe_forward(m, x, routes, nv, y);
+        return 0;
+    }
+    if (m->hist)
+        for (int i = 0; i < nv; i++)
+            m->hist[routes[i].expert]++;
+    m->tokens++;
+    const long K = m->d.K, N = m->d.N;
+    m->st.x = x;
+    m->st.r = routes;
+    m->st.y = y;
+    m->st.n = nv;
+    m->st.next_gu = 0;
+    m->st.next_dn = 0;
+    m->st.i8 = moe_int8_on() && m->i8[0].x8 && m->i8[1].x8 && !(K % 32) && !(N % 32) &&
+               qe_gemv_i8_has_1(m->d.t_gate) && qe_gemv_i8_has_1(m->d.t_up) &&
+               qe_gemv_i8_has_1(m->d.t_down);
+    if (m->st.i8) {
+        const qe_i8panel ap = moe_panel(m, 0, 0);
+        const float *xs[1] = { x };
+        moe_panel_fill(&ap, xs, 1);
+    }
+    return 3;
+}
+
+void qe_moe_step_item(qe_moe *m, int which, qe_pool_item *out) {
+    out->fn = which == 0 ? gate_up_step : which == 1 ? down_step : reduce_step;
+    out->arg = m;
+    out->nthreads = m->n_threads;
+    out->deps = which ? (1u << (unsigned)(which - 1)) : 0;
 }
 
 void qe_moe_layer(qe_moe *m, const float *x, float *y, qe_route *routes, int *n_routes) {

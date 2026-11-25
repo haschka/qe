@@ -69,6 +69,16 @@ static struct {
     _Atomic long long cache_bytes;
     _Atomic long hits;
     _Atomic long snap_us; /* the last snapshot's copy, microseconds */
+    /* When each half of the request in hand began and last moved, so that each rate is
+     * its own tokens over its own seconds: the prompt's from the first token that had to
+     * be read, the answer's from the first token it emitted. One clock for both is how an
+     * answer used to be quoted at a third of its speed after a long prompt. */
+    _Atomic long ing_base;  /* prompt tokens already standing when the request came */
+    _Atomic double ing_t1;  /* the prompt was read: first emit, or the end */
+    _Atomic long ing_last;  /* prompt tokens read when it was */
+    _Atomic double emit_t0; /* the first emitted token */
+    _Atomic double emit_t1; /* the latest one */
+    _Atomic double req_end; /* the request finished: its clock stops here */
 } c;
 
 static double started;
@@ -138,6 +148,12 @@ void qe_ui_gen_begin(long prompt_tokens, long already) {
     atomic_store_explicit(&c.req_total, prompt_tokens, memory_order_relaxed);
     atomic_store_explicit(&c.req_done, already, memory_order_relaxed);
     atomic_store_explicit(&c.req_emitted, 0, memory_order_relaxed);
+    atomic_store_explicit(&c.ing_base, already, memory_order_relaxed);
+    atomic_store_explicit(&c.ing_t1, 0.0, memory_order_relaxed);
+    atomic_store_explicit(&c.ing_last, already, memory_order_relaxed);
+    atomic_store_explicit(&c.emit_t0, 0.0, memory_order_relaxed);
+    atomic_store_explicit(&c.emit_t1, 0.0, memory_order_relaxed);
+    atomic_store_explicit(&c.req_end, 0.0, memory_order_relaxed);
     atomic_store_explicit(&c.req_started, now_s(), memory_order_relaxed);
     atomic_store_explicit(&c.phase, INGESTING, memory_order_relaxed);
     atomic_fetch_add_explicit(&c.requests, 1, memory_order_relaxed);
@@ -155,13 +171,30 @@ void qe_ui_ingested(long tokens) {
         atomic_fetch_add_explicit(&c.ingested, (long long)tokens, memory_order_relaxed);
 }
 
+static void ingest_closed(double t) {
+    if (atomic_load_explicit(&c.ing_t1, memory_order_relaxed) <= 0.0) {
+        atomic_store_explicit(&c.ing_last, atomic_load_explicit(&c.req_done, memory_order_relaxed),
+                              memory_order_relaxed);
+        atomic_store_explicit(&c.ing_t1, t, memory_order_relaxed);
+    }
+}
+
 void qe_ui_emit(void) {
+    const double t = now_s();
+    ingest_closed(t);
+    if (atomic_load_explicit(&c.emit_t0, memory_order_relaxed) <= 0.0)
+        atomic_store_explicit(&c.emit_t0, t, memory_order_relaxed);
+    atomic_store_explicit(&c.emit_t1, t, memory_order_relaxed);
     atomic_fetch_add_explicit(&c.req_emitted, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&c.emitted, 1, memory_order_relaxed);
     atomic_store_explicit(&c.phase, EMITTING, memory_order_relaxed);
 }
 
-void qe_ui_gen_end(void) { atomic_store_explicit(&c.phase, IDLE, memory_order_relaxed); }
+void qe_ui_gen_end(void) {
+    ingest_closed(now_s());
+    atomic_store_explicit(&c.req_end, now_s(), memory_order_relaxed);
+    atomic_store_explicit(&c.phase, IDLE, memory_order_relaxed);
+}
 
 void qe_ui_cached(long tokens) {
     if (tokens > 0)
@@ -198,6 +231,18 @@ static void comma(char *dst, size_t n, long long v) {
     dst[o] = 0;
 }
 
+/* A running total in at most six columns: 987,654 stays exact, past that it is
+ * 1.23M - a process that has read a hundred million tokens needs its count, not its
+ * last digit, and the row has eighty columns to say five things in. */
+static void short_count(char *dst, size_t n, long long v) {
+    if (v < 1000000)
+        comma(dst, n, v);
+    else if (v < 1000000000LL)
+        snprintf(dst, n, "%.2fM", (double)v / 1e6);
+    else
+        snprintf(dst, n, "%.2fG", (double)v / 1e9);
+}
+
 /* The renderer.
  *
  * Three rules, all of them learned the hard way:
@@ -221,7 +266,7 @@ static void comma(char *dst, size_t n, long long v) {
  * of a library. */
 
 #define MAX_ROWS 24    /* the tallest panel this file draws */
-#define WIDTH_DEFAULT 118
+#define WIDTH_DEFAULT 80
 #define WIDTH_MIN 48   /* narrower than this the counters do not fit anyway */
 #define WIDTH_MAX 400  /* a rule is one byte per column times four; see LINE_CHARS */
 #define TICK_MS 100    /* how often the frame is recomputed; see rule 1 */
@@ -448,7 +493,9 @@ static void hms(char *dst, size_t n, double s) {
 }
 
 /* How long this request has been held, to a tenth: the one place where the tenth is
- * the answer, and only while a request is in hand. */
+ * the answer, and only while a request is in hand. It is one row's last four columns,
+ * repainted alone inside a synchronised update, which is a ticking clock and not a
+ * flicker. */
 static void secs10(char *dst, size_t n, double s) {
     if (s < 0)
         s = 0;
@@ -507,16 +554,82 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     }
     pthread_mutex_unlock(&lk);
 
-    double el = t0 > 0 ? now_s() - t0 : 0.0;
-    long passes = done + emit;
-    double mspass = passes > 0 && el > 0 ? el * 1000.0 / (double)passes : 0.0;
-    /* The same two numbers as two rows: the ingest row is honest about a step in ms
-     * because a prompt is judged by how long one token takes, and the emit row is
-     * honest about the rate because an answer is judged by how many arrive. Dividing
-     * one into the other is the whole difference, and printing ms/pass under a
-     * "passes/s" label says a 74.9 ms step is 74.9 steps a second. */
-    double pps = el > 0 ? (double)passes / el : 0.0;
-    double tps = el > 0 ? (double)emit / el : 0.0;
+    const double tnow = now_s();
+    /* The request's clock runs while it is in hand and stops when it is answered: an idle
+     * panel still counting is a panel saying a finished request is taking longer. */
+    const double rend = atomic_load_explicit(&c.req_end, memory_order_relaxed);
+    double el = t0 > 0 ? (phase == IDLE && rend > t0 ? rend : tnow) - t0 : 0.0;
+    const long base = atomic_load_explicit(&c.ing_base, memory_order_relaxed);
+    const double it1 = atomic_load_explicit(&c.ing_t1, memory_order_relaxed);
+    const long ilast = atomic_load_explicit(&c.ing_last, memory_order_relaxed);
+    const double et0 = atomic_load_explicit(&c.emit_t0, memory_order_relaxed);
+    const double et1 = atomic_load_explicit(&c.emit_t1, memory_order_relaxed);
+
+    /* Rates. Each half is its own tokens over its own seconds, and the live figure is
+     * a window over the last three seconds of samples rather than an average since the
+     * start, so a prompt that slows as its context grows says so while it does. The
+     * samples are this thread's own (it is the only reader), restarted with every
+     * request. The strings are recomputed twice a second and held in between: a rate
+     * repainted ten times a second is a number nobody can read, and a row that differs
+     * every tick is a row the terminal repaints every tick. */
+#define RATE_WIN 3.0
+#define RATE_HOLD 0.5
+    static struct {
+        double t;
+        long d, e;
+    } smp[64];
+    static int sn, sh;
+    static double s_req = -1.0, s_shown = 0.0;
+    static char s_ing[48], s_emit[48];
+    if (t0 != s_req) {
+        s_req = t0;
+        sn = sh = 0;
+        s_shown = 0.0;
+    }
+    {
+        const int at = (sh + sn) % 64;
+        smp[at].t = tnow;
+        smp[at].d = done;
+        smp[at].e = emit;
+        if (sn < 64)
+            sn++;
+        else
+            sh = (sh + 1) % 64;
+        while (sn > 2 && tnow - smp[sh].t > RATE_WIN) {
+            sh = (sh + 1) % 64;
+            sn--;
+        }
+    }
+    const double span = sn > 1 ? tnow - smp[sh].t : 0.0;
+    const double ing_win = span >= 0.4 ? (double)(done - smp[sh].d) / span : 0.0;
+    const double emit_win = span >= 0.4 ? (double)(emit - smp[sh].e) / span : 0.0;
+    /* Averages over each half, which is what an idle row shows: the prompt from its
+     * start to its first answer token, the answer from its first token to its last. */
+    const double ing_secs = (it1 > 0.0 ? it1 : tnow) - t0;
+    const long ing_read = (it1 > 0.0 ? ilast : done) - base;
+    const double ing_avg = t0 > 0 && ing_secs > 0.05 && ing_read > 0 ? ing_read / ing_secs : 0.0;
+    const double emit_avg = emit > 1 && et1 > et0 ? (double)(emit - 1) / (et1 - et0) : 0.0;
+    if (tnow - s_shown >= RATE_HOLD || s_shown == 0.0) {
+        s_shown = tnow;
+        const double ir = phase == INGESTING && ing_win > 0.0 ? ing_win : ing_avg;
+        if (total > 0 && ir > 0.0) {
+            if (phase == INGESTING && total > done) {
+                char eta[16];
+                hms(eta, sizeof eta, (double)(total - done) / ir);
+                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s %6s left", ir, eta);
+            } else {
+                char d[16];
+                hms(d, sizeof d, ing_secs);
+                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s %6s", ir, d);
+            }
+        } else if (total > 0 && base >= total) {
+            snprintf(s_ing, sizeof s_ing, "all cached");
+        } else {
+            snprintf(s_ing, sizeof s_ing, "  -.- tok/s");
+        }
+        const double er = phase == EMITTING && emit_win > 0.0 ? emit_win : emit_avg;
+        snprintf(s_emit, sizeof s_emit, "%5.1f tok/s", er);
+    }
 
     char up[32], elh[32], a[24], b[24], h2[24], u[24], e2[24], s2[24], cb[24];
     hms(up, sizeof up, now_s() - started);
@@ -524,9 +637,9 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     comma(a, sizeof a, done);
     comma(b, sizeof b, total);
     comma(h2, sizeof h2, emit);
-    comma(u, sizeof u, ing);
-    comma(e2, sizeof e2, emo);
-    comma(s2, sizeof s2, saved);
+    short_count(u, sizeof u, ing);
+    short_count(e2, sizeof e2, emo);
+    short_count(s2, sizeof s2, saved);
     comma(cb, sizeof cb, cbytes / 1048576);
 
     /* The frame is header, sub-header when there is one, rule, ingest, emit, rule,
@@ -547,7 +660,17 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
 
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, ST_HEAD, "%.120s", head);
+    {
+        /* The header gives way to the uptime, never the other way round. */
+        char hc[LINE_CHARS];
+        int room = width - vwidth(up) - 3;
+        if (room < 8)
+            room = 8;
+        int cut = vwidth(head) > room ? clip_cols(hc, sizeof hc, head, room - 2) : 0;
+        ln_addf(&l, ST_HEAD, "%s", cut ? hc : head);
+        if (cut)
+            ln_addf(&l, ST_LABEL, "..");
+    }
     ln_to(&l, width - vwidth(up) < l.used ? l.used : width - vwidth(up));
     ln_addf(&l, ST_DIM, "%s", up);
     n++;
@@ -572,58 +695,67 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         ln_rule(&l, g.rule);
     }
 
-    /* INGEST: how far the network is through the prompt, right now. */
+    /* INGEST: the bar, how far through the prompt, and how fast it is being read.
+     *
+     *   INGEST ▸ ██████████████░░░░░░░░░░  12,288/20,480   61.2 tok/s  2m14s left
+     *
+     * The tail is measured and right-aligned on the last column, so the bar takes what
+     * the terminal has left and the numbers never slide sideways as they change. */
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
     ln_addf(&l, phase == INGESTING ? ST_LABEL : ST_DIM, "%-7s%s", "INGEST", g.arrow);
     ln_put(&l, " ", ST_PLAIN);
     if (total > 0) {
-        int tail = 24 + vwidth(b);
+        char cnt[64];
+        char pad[24];
+        snprintf(pad, sizeof pad, "%*s", vwidth(b) - vwidth(a) > 0 ? vwidth(b) - vwidth(a) : 0, "");
+        snprintf(cnt, sizeof cnt, "%s%s/%s", pad, a, b);
+        const int tail = 2 + vwidth(cnt) + 2 + vwidth(s_ing);
         int bw = width - l.used - tail;
-        if (bw < 6)
-            bw = 6;
-        if (bw > 44)
-            bw = 44;
-        char cells[44 * 4];
-        bar(cells, sizeof cells, bw, done, total);
-        /* Not "%.*s" with bw: the precision of printf is bytes, and a byte precision
-         * that lands inside a three-column-byte block cell both shortens the bar to a
-         * third of the width asked for and hands ln_put a half a character. bw cells is
-         * exactly bw columns, so the count lives in bar() and nowhere else. */
-        ln_addf(&l, ST_BAR, "%s", cells);
-        ln_put(&l, "  ", ST_PLAIN);
-        ln_raddf(&l, vwidth(b), ST_PLAIN, "%s", a);
+        if (bw > 48)
+            bw = 48;
+        if (bw >= 6) {
+            char cells[48 * 4 + 8];
+            bar(cells, sizeof cells, bw, done, total);
+            /* Not "%.*s" with bw: the precision of printf is bytes, and a byte precision
+             * that lands inside a three-byte block cell both shortens the bar and hands
+             * ln_put half a character. bw cells is bw columns; the count lives in bar(). */
+            ln_addf(&l, ST_BAR, "%s", cells);
+        }
+        ln_to(&l, width - tail + 2);
+        ln_addf(&l, ST_PLAIN, "%s", pad);
+        ln_addf(&l, ST_PLAIN, "%s", a);
         ln_addf(&l, ST_DIM, "/%s", b);
-        ln_addf(&l, ST_PLAIN, " tok");
-        /* Measured and not guessed: the tail is right-aligned on the sum of its own
-         * widths, so that 9.9 ms/pass and 104.3 ms/pass both end on the last column
-         * and the number stops sliding sideways as it changes. A constant here is a
-         * tail that lands one column off every time a counter gains a digit. */
-        char rate[32];
-        snprintf(rate, sizeof rate, "%.1f ms/pass", mspass);
-        int tw = vwidth(elh) + vwidth(g.sep) + vwidth(rate);
-        ln_to(&l, width - tw);
-        ln_addf(&l, ST_PLAIN, "%s", elh);
-        ln_addf(&l, ST_DIM, "%s", g.sep);
-        ln_addf(&l, ST_PLAIN, "%s", rate);
+        ln_to(&l, width - vwidth(s_ing));
+        ln_addf(&l, phase == INGESTING ? ST_PLAIN : ST_DIM, "%s", s_ing);
     } else {
         ln_addf(&l, ST_DIM, "no prompt in hand");
     }
     n++;
 
-    /* EMIT: the answer, its rate, and who is waiting for it. */
+    /* EMIT: the answer so far, how fast it is coming, for how long, and for whom.
+     *
+     *   EMIT   ▸ 1,234 tok   15.6 tok/s   12s                         chat 3f9a1c */
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
     ln_addf(&l, phase == EMITTING ? ST_LABEL : ST_DIM, "%-7s%s", "EMIT", g.arrow);
     ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, emit > 0 ? ST_HOT : ST_PLAIN, "%s", h2);
+    ln_raddf(&l, 6, emit > 0 ? ST_HOT : ST_PLAIN, "%s", h2);
     ln_addf(&l, ST_PLAIN, " tok");
     ln_addf(&l, ST_DIM, "%s", g.sep);
-    ln_addf(&l, ST_PLAIN, "%.1f tok/s", tps);
+    ln_addf(&l, phase == EMITTING ? ST_PLAIN : ST_DIM, "%s", s_emit);
     ln_addf(&l, ST_DIM, "%s", g.sep);
-    ln_addf(&l, ST_PLAIN, "%.1f passes/s", pps);
-    ln_to(&l, width - vwidth(who) - 1 < l.used ? l.used : width - vwidth(who) - 1);
-    ln_addf(&l, ST_DIM, "%s", who);
+    ln_addf(&l, ST_PLAIN, "%s", elh);
+    {
+        /* The request id is the right-hand end of the row and the first thing to go. */
+        char wc[LINE_CHARS];
+        int room = width - l.used - 2;
+        if (room >= 6) {
+            int cut = vwidth(who) > room ? clip_cols(wc, sizeof wc, who, room) : 0;
+            ln_to(&l, width - (cut ? room : vwidth(who)));
+            ln_addf(&l, ST_DIM, "%s", cut ? wc : who);
+        }
+    }
     n++;
 
     if (show_rules) {
@@ -634,19 +766,19 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     if (show_tail) {
         ln_open(&l, out[n], LINE_CHARS, width);
         ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_LABEL, "%-7s", "total");
+        ln_addf(&l, ST_LABEL, "%-9s", "total");
         ln_addf(&l, ST_PLAIN, "%s ingested", u);
         ln_addf(&l, ST_DIM, "%s", g.sep);
         ln_addf(&l, ST_PLAIN, "%s emitted", e2);
         ln_addf(&l, ST_DIM, "%s", g.sep);
         ln_addf(&l, ST_PLAIN, "%ld request%s", reqs, reqs == 1 ? "" : "s");
         ln_addf(&l, ST_DIM, "%s", g.sep);
-        ln_addf(&l, ST_PLAIN, "%s tok never re-read", s2);
+        ln_addf(&l, ST_PLAIN, "%s reused", s2);
         n++;
 
         ln_open(&l, out[n], LINE_CHARS, width);
         ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_LABEL, "%-7s", "cache");
+        ln_addf(&l, ST_LABEL, "%-9s", "cache");
         if (slots > 0) {
             ln_addf(&l, held > 0 ? ST_PLAIN : ST_DIM, "%ld of %ld rewind point%s", held, slots,
                     held == 1 ? "" : "s");
@@ -655,9 +787,9 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
             ln_addf(&l, ST_DIM, "%s", g.sep);
             ln_addf(&l, hits > 0 ? ST_HOT : ST_PLAIN, "%ld hit%s", hits, hits == 1 ? "" : "s");
             ln_addf(&l, ST_DIM, "%s", g.sep);
-            ln_addf(&l, ST_DIM, "last snapshot %.1f ms", (double)sus / 1000.0);
+            ln_addf(&l, ST_DIM, "snapshot %.1f ms", (double)sus / 1000.0);
         } else {
-            ln_addf(&l, ST_DIM, "no rewind points (nothing to go back to; --turn-cache)");
+            ln_addf(&l, ST_DIM, "no rewind points (--turn-cache)");
         }
         n++;
     }

@@ -36,11 +36,11 @@ COREOBJ := $(CORE:.c=.o)
 ENGOBJ := $(ENG:.c=.o)
 BIN := bin/bench_kern bin/bench_gemv bin/bench_moe bin/bench_mtp bin/bench_json bin/bench_chat \
        bin/bench_route bin/bench_stage bin/bench_tok bin/bench_ple bin/bench_prefill \
-       bin/bench_forward bin/bench_score bin/bench_pool bin/bench_prefix bin/bench_alu \
+       bin/bench_forward bin/bench_decode bin/bench_score bin/bench_pool bin/bench_prefix bin/bench_alu \
        bin/bench_sample bin/bench_turns bin/bench_walk bin/bench_cosched bin/bench_serve \
        bin/bench_batch
 
-.PHONY: all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve lane score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup batch
+.PHONY: all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve lane score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup batch decode probe-igpu
 
 all: $(BIN) bin/qe-serve
 
@@ -138,6 +138,9 @@ bin/bench_forward: $(COREOBJ) src/mtp.o bench/bench_forward.c | bin
 # only loss can answer, so this asks it once per load: teacher-forced nll for
 # every variant the forward pass exposes, a depth-probe loss curve that names the
 # layer class that stopped helping, and the wall clock of a step by stage.
+bin/bench_decode: $(COREOBJ) bench/bench_decode.c | bin
+	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_decode.c $(LDFLAGS)
+
 bin/bench_score: $(COREOBJ) bench/bench_score.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_score.c $(LDFLAGS)
 
@@ -636,6 +639,20 @@ SCORELOG ?= /tmp/score.log
 # minutes of prefill and the smallest count where "the greedy choice moved in
 # N of M" says anything.
 INGEST ?= 4
+# The integrated GPU probe (ideas.md 7.32.4): one layer's routed experts walked on the iGPU from
+# host memory, checked against a C reference, with --duty S for a CPU run beside it. The only
+# target that links OpenCL; nothing else in the tree does.
+probe-igpu: tools/probe_igpu.c | bin
+	$(CC) -O2 -o bin/probe_igpu tools/probe_igpu.c -lOpenCL -lm
+	$(TO) 300 ./bin/probe_igpu --tile 8 --rps 8 --reps 6
+
+# Where a decode step's time goes - pool, barrier tail, serial - per stage, and a race of
+# the decode-side switches in one load (ARMS=ship,nopf,...). FUSE=2400; it pays the load.
+ARMS ?= ship
+decode: bin/bench_decode
+	$(TO) $$(( $(FUSE) + 120 )) ./bin/bench_decode --model $(CHECKPOINT) --fuse $(FUSE) \
+	  --arms $(ARMS) --text ideas.md
+
 score: bin/bench_score
 	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_score --model $(CHECKPOINT) --threads $(THREADS) \
 	  --fuse $(FUSE) --corpus $(CORPUS) --tokens 96 --gen 32 --probe --profile \

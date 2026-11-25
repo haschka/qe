@@ -1,6 +1,6 @@
 # qe
 
-![qe: 1.22x faster prefill, 1.43x faster generation, 1.51x with MTP drafting, against llama.cpp on one CPU](marketing.svg)
+![qe: 1.8x faster prefill, 2.0x faster generation, against llama.cpp on one CPU](marketing.svg)
 
 **A CPU-only inference engine for `Qwen3.8-Flash-Next`, hand-tuned to one machine:
 an Intel Core Ultra 7 265 with 128 GB of DDR5 and no GPU in the picture.**
@@ -23,18 +23,25 @@ Measured on this host, default settings, 19 of 20 cores, one sequence:
 
 | | qe | llama.cpp | |
 |---|---|---|---|
-| **Prompt ingestion**, 512-token batch | **61.3 - 63.7 tok/s** | 51.33 tok/s | **1.19 - 1.24x** |
-| **Prompt ingestion**, 64-token batch | 48 - 49 tok/s | 38.8 tok/s | **1.25x** |
-| **Generation**, greedy | **10.9 tok/s** (91.4 ms/token) | 7.65 tok/s (130.7 ms) | **1.43x** |
-| **Generation**, greedy + draft head | **11.5 tok/s** (86.7 ms/token) | none | **1.51x** |
-| **Throughput**, eight sequences in one step (`--batch 8`) | **18.0 tok/s** across a wave of eight, 10.06 each alone | none | **1.79x** |
+| **Prompt ingestion**, 512-token batch | **87 - 93 tok/s** (10.7 - 11.5 ms/token) | 51.33 tok/s | **1.7 - 1.8x** |
+| Prompt ingestion at 4,096 tokens of context | 83 tok/s (12.0 ms/token) | | |
+| **Generation**, greedy | **15.3 - 15.6 tok/s** (64 - 65 ms/token) | 7.65 tok/s (130.7 ms) | **2.0x** |
+| Generation at 4,096 tokens of context | 15.0 tok/s (66.5 ms/token) | | |
+| **Throughput**, eight sequences in one step (`--batch 8`) | 18.0 tok/s across a wave of eight (measured before §7.30 below) | none | |
 
 llama.cpp is the same checkpoint and the same host: b12359 for ingestion
 (`-ngl 0 -t 20 -fa on`), b12110 for generation on the same corpus. The two engines
 are never resident at the same time; nothing here was measured with both of them
 holding 90 GB of weights.
 
-Instruments, so that none of the above is a claim: `make forward` (the ingestion
+The generation row moved from 10.9 to 15.6 tok/s in one cycle, and not by a faster kernel:
+a third of every decode step was nineteen threads waiting at a barrier for the slowest of
+them, because this chip is eight fast cores and twelve slow ones and every dispatch handed
+them equal slices. `make decode` is the instrument that found it (ideas.md §7.30).
+
+Instruments, so that none of the above is a claim: `make decode` (where a step's time goes
+per stage - pool, barrier tail, serial - and a race of decode switches priced in nats),
+`make forward` (the ingestion
 sweep and one A/B leg per arithmetic switch), `make head` (a step, a draft row and
 a verified window, with the nextn head resident), `make batch` (B sequences through
 one step, three arithmetic arms, and a row of a partly full step asserted byte for
@@ -50,6 +57,25 @@ alone.
 Because it was written against this machine's measurements instead of a portable
 model of a CPU.
 
+- **Rows handed out from a cursor, not sliced equally.** The pool has eight P-cores and
+  eleven E-cores in it, and a slice that is equal by construction ends every dispatch on an
+  E-core: measured, 32.5 ms of an 89 ms step was the master waiting for the last worker.
+  Every walk whose output rows are independent - the dense GEMVs, the expert chunks, the
+  indexer's block scores, the attention units, the delta rule's state rows - now takes
+  its next chunk of rows from an atomic counter, so a fast core simply walks more; and the
+  walks of a step that read the same input share one dispatch of the stage graph (953
+  dispatches a step became 461). The tail is 2.1 ms. A row is still one kernel call, so
+  this part is byte-identical to what it replaced.
+- **A prompt's per-token work on every core, and the recurrence and the experts unstalled.**
+  The loops between a chunk's walks (norms, gates, injections, the convolution, the attention
+  prologue) were 3.3 ms of every ingested token on one thread; they run across the pool now,
+  byte-identical. The gated-delta recurrence walks eight state rows at once instead of waiting
+  on one FMA chain at a time, and the expert stage takes its work from cursors with a down
+  projection that sums in a fixed order. Ingestion went 63 → 87 tok/s (ideas.md §7.33-7.35).
+- **Integer walks on a decode step too.** A step's input is recoded to int8 once per
+  dispatch, and both the IQ4_NL dense copy and the routed experts are walked with
+  `vpdpbssd` against it - the form a chunk already used, which a lone token never reached.
+  The dense projections then read at 80 GB/s, the bus.
 - **The whole checkpoint is resident before the listener opens.** 87.25 GiB of
   weights are placed in RAM (or hugetlb) at startup, `mlock`ed and reused; an
   engine that cannot make the file resident prints the two numbers that decided it
@@ -80,14 +106,12 @@ model of a CPU.
   ingested token; one grouped pass over the bucketed experts is **27.0 ms**, and the
   seven dispatches around it are one stage graph so a short stage lends its threads
   to a long one's tail.
-- **Speculation that actually pays, and only at one draft length.** The nextn head
-  these checkpoints ship as a sidecar file is staged resident and runs as one more
-  layer of the trunk. A draft row is 0.129 of a step; a nine-row verify window is
-  4.35x a step. Acceptance only beats the window at the shortest draft, so the
-  engine resolves its draft length at open from the drafter that won: 1.06x of the
-  plain loop for a head at k=1, 1.05x for the n-gram drafter at k=2, and 0.99x at
-  k=8 - which is why 8 is not a default anywhere in this repository, and why the
-  verify window is given the same cheap read of the output head that a step gets.
+- **Speculation is built, measured, and off by default.** The nextn head these
+  checkpoints ship as a sidecar file stages resident and runs as one more layer of the
+  trunk, and at the old step speed it was worth 1.06x at one draft token. The step is now
+  1.38x faster and a two-row verify window is not: it costs 1.6 of the new steps, so a pass
+  that emits 1.6-1.7 ids no longer beats the plain loop. `--spec-k 1` (with `--mtp`) turns
+  it back on; ideas.md row 30 is what would make it pay again.
 - **Built for an agent's turn, not a benchmark's.** Prompt reuse across turns
   against a bounded rewind cache, q8_0 KV (21.3 KiB per token of context), an
   indexer that scores blocks so a 262,144-token window stays in line, greedy
@@ -137,8 +161,9 @@ curl -s localhost:8097/v1/chat/completions -H 'content-type: application/json' \
 ```
 
 Only volume 1 of a multi-volume checkpoint is named; the rest are found by name.
-`--mtp` is what turns on speculation for greedy requests; leave it off and the
-engine falls back to an n-gram drafter (k=2, worth 1.05x of the plain loop).
+Speculation is off unless asked for: `--spec-k 1` with `--mtp` drafts from the nextn
+head, `--spec-k 2` without it from the n-gram hash. At today's step speed neither beats
+the plain loop (ideas.md §7.30), which is why neither is the default.
 `--stage huge` moves the arena into a reserved hugetlb pool and reuses it across
 restarts. `--ctx N` is a memory setting as much as a token limit. `SIGTERM` closes
 the listener immediately and gives the port back inside its grace period.
@@ -183,12 +208,21 @@ ones worth knowing:
 
 | variable | default | what it does |
 |---|---|---|
+| `QE_DYN_KB` | `64` | a lone token's walk hands its rows out in chunks of about this many KiB of weights from a cursor, so a P-core takes more rows than an E-core instead of waiting for it; `0` is the equal slice. Byte-identical either way |
+| `QE_STEP_FUSE` | `1` | a step's walks that read the same input share one dispatch (the four GDN projections, the five attention ones, a mixer's pair, router beside shared expert), and the routed experts take the one-token int8 walk with per-route partials |
+| `QE_I8_STEP` | `1` | a lone token's dense walk recodes its input to int8 once per dispatch and walks the IQ4_NL copy with `vpdpbssd`: 23.2 → 20.6 ms of a step, nll -0.03 over 400 positions |
+| `QE_I4_MULTI` | `2` | passes of up to this many rows (a verify window) read the IQ4_NL dense copy too |
+| `QE_ROWS_PAR` | `1` | a prompt chunk's per-token loops across the pool; byte-identical |
+| `QE_DELTA_SIMD` | `1` | the gated delta rule eight state rows at a time; nll unmoved |
+| `QE_MOE_DYN` | `1` | the grouped expert pass on cursors, its down summed in bucket order (no per-thread partials, 4.8 GB less RAM) |
+| `QE_ATTN_BATCH` | `1` | a prompt chunk's attention as one selection dispatch and two per 32 tokens, instead of three a token; byte-identical |
+| `QE_CHUNK_DYN` | `1` | the cursor for multi-row walks as well |
 | `QE_I4_DENSE` | `all` | read the load-time IQ4_NL copy of the dense projections; `lean` holds the 194 hyper-connection mixers and the 31 matrices at the trunk's ends at `Q8_0`, buying back two thirds of the loss for 8 ms of a step; `0` is off |
 | `QE_I4_HEAD` | `q8` | walk the output head from its `Q8_0` copy (`i4`, or `stored` for the file's own `Q6_K`) |
 | `QE_I4_HEAD_WIN` | `1` | let a verify window read that copy too, which is what keeps k=1 speculation ahead |
 | `QE_I8_FLAT` | `1` | the flat one-scale-per-row dense copy a chunked prefill walks three rows against |
 | `QE_I8_MOE`, `QE_I8_RS`, `QE_I8_PROJ` | on | the int8 activation panel in front of the experts, the row scale, and the dense projections |
-| `--spec-k N` | auto | draft length; `0` turns speculation off, a head resolves to 1, the n-gram drafter to 2 |
+| `--spec-k N` | 0 | draft length for greedy requests: `1` with `--mtp` drafts off the head, `2` without it off the n-gram hash; off by default because at today's step speed neither beats the plain loop (`QE_SPEC_AUTO=1` restores the old resolution) |
 | `--batch N` | `1` | drive N sequences through one walk of the weights: 2.15-2.20x the step they share and 1.79x a wave of eight short requests, for 0.060 nats and a per-client tok/s that gets worse (`make lane`) |
 | `--walk-threads N`, `QE_WALK_THREADS` | every thread `--threads` has | threads a lone token's weight walk asks for. One kernel walking those bytes prefers 16 of 19 by 6.2 %; a step of them is 1.07x slower there, so the default is the whole pass and the knob is for a host whose bus is shaped differently (`make forward`'s width leg) |
 | `QE_SMALL_PROJ_BATCH` | `1` | whether a projection under `--proj-chunk`'s 1 MiB threshold is asked of the pool once for the chunk or once for every token of it. 180 of this checkpoint's projections are under it, and the loop barriered a nineteen-thread pool 92,160 times a width-512 chunk for them, so the batch is 1.037x of an ingested token and byte for byte the same logits; `0` is the loop back (`make forward`'s small-projection leg) |

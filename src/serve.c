@@ -151,10 +151,37 @@ static void request_log(const char *kind, const char *id, long prompt_tokens,
              gs->seconds > 0 ? (double)gs->steps / gs->seconds : 0.0,
              content_bytes, thinking_bytes, n_calls, finish ? finish : "-",
              streamed ? " stream" : "", client_left ? " client-left" : "");
-    if (qe_ui_on())
+    if (qe_ui_on()) {
+        /* The panel's own history row: the same request in one 80-column line, with the
+         * two halves of the wall quoted at their own rates - a prompt read at 60 tok/s
+         * and an answer written at 15 are two facts, and the line above divides the
+         * answer by both. The line above stays the line every harness greps for. */
+        char when[16], idt[16];
+        time_t tt = time(NULL);
+        struct tm tmv;
+        localtime_r(&tt, &tmv);
+        strftime(when, sizeof when, "%H:%M:%S", &tmv);
+        const size_t il = strlen(id);
+        snprintf(idt, sizeof idt, "%s", il > 6 ? id + il - 6 : id);
+        const long fed = prompt_tokens - gs->cached;
+        const double pf = gs->prefill_seconds;
+        const double dec = gs->seconds - pf;
+        char ing[48], out[48];
+        if (fed > 0 && pf > 0.0)
+            snprintf(ing, sizeof ing, "%.1f t/s", (double)fed / pf);
+        else
+            snprintf(ing, sizeof ing, fed > 0 ? "-" : "cached");
+        if (gs->tokens > 0 && dec > 0.0)
+            snprintf(out, sizeof out, "%.1f t/s", (double)gs->tokens / dec);
+        else
+            snprintf(out, sizeof out, "-");
+        snprintf(line, sizeof line, "qe: %s %s %s  in %ld+%ld %s  out %ld %s  %s%s",
+                 kind, idt, when, fed, gs->cached, ing, gs->tokens, out, finish ? finish : "-",
+                 client_left ? " left" : "");
         qe_ui_log(line);
-    else
+    } else {
         fprintf(stderr, "%s\n", line);
+    }
     /* The turn nobody saw. Cut short by the budget, or by a reader that stopped
      * listening, it is expected; a turn that finished on its own holding nothing a
      * client can show is the bug, and it is silent on the client's side. */

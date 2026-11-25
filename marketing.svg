@@ -95,9 +95,9 @@
     <text x="744" y="376" font-size="30" font-weight="400" fill="#a3b8d4">experts read</text>
     <text x="744" y="406" font-size="30" font-weight="400" fill="#a3b8d4">per token</text>
 
-    <text x="88" y="498" font-size="38" font-weight="700" fill="#ffffff">k = 1</text>
-    <text x="88" y="536" font-size="30" font-weight="400" fill="#a3b8d4">the draft length</text>
-    <text x="88" y="566" font-size="30" font-weight="400" fill="#a3b8d4">that wins</text>
+    <text x="88" y="498" font-size="38" font-weight="700" fill="#ffffff">2 ms</text>
+    <text x="88" y="536" font-size="30" font-weight="400" fill="#a3b8d4">barrier wait</text>
+    <text x="88" y="566" font-size="30" font-weight="400" fill="#a3b8d4">per step</text>
 
     <text x="416" y="498" font-size="38" font-weight="700" fill="#ffffff">83 GB/s</text>
     <text x="416" y="536" font-size="30" font-weight="400" fill="#a3b8d4">read on 8 cores,</text>
@@ -113,33 +113,33 @@
   <g>
     <rect x="60" y="656" width="470" height="292" rx="10" fill="#0a1424" stroke="#1b3355" stroke-width="1.5"/>
     <text x="88" y="706" font-size="31" font-weight="700" letter-spacing="2" fill="#e0ecfd">PREFILL</text>
-    <text x="502" y="710" text-anchor="end" fill="#22d3ee" font-size="56" font-weight="700">1.22x</text>
+    <text x="502" y="710" text-anchor="end" fill="#22d3ee" font-size="56" font-weight="700">1.70x</text>
 
     <text x="88" y="754" font-size="30" font-weight="400" fill="#b6cae4">qe</text>
-    <text x="502" y="756" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">62.9</text>
+    <text x="502" y="756" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">86.9</text>
     <rect x="88" y="768" width="414" height="26" rx="4" fill="url(#gCy)"/>
 
     <text x="88" y="826" font-size="30" font-weight="400" fill="#b6cae4">llama.cpp</text>
     <text x="502" y="828" text-anchor="end" fill="#c3d3e8" font-size="35" font-weight="700" >51.3</text>
-    <rect x="88" y="840" width="338" height="26" rx="4" fill="#3b5c8c"/>
+    <rect x="88" y="840" width="244" height="26" rx="4" fill="#3b5c8c"/>
 
     <text x="88" y="906" font-size="29" font-weight="400" fill="#7d92b0">512 rows, one batch</text>
 
     <rect x="550" y="656" width="470" height="292" rx="10" fill="#0a1424" stroke="#1b3355" stroke-width="1.5"/>
     <text x="578" y="706" font-size="31" font-weight="700" letter-spacing="2" fill="#e0ecfd">GENERATE</text>
-    <text x="992" y="710" text-anchor="end" fill="#a3e635" font-size="56" font-weight="700">1.51x</text>
+    <text x="992" y="710" text-anchor="end" fill="#a3e635" font-size="56" font-weight="700">2.04x</text>
 
-    <text x="578" y="750" font-size="30" font-weight="400" fill="#b6cae4">qe + MTP</text>
-    <text x="992" y="752" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">11.5</text>
+    <text x="578" y="750" font-size="30" font-weight="400" fill="#b6cae4">qe</text>
+    <text x="992" y="752" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">15.6</text>
     <rect x="578" y="762" width="414" height="24" rx="4" fill="url(#gVi)"/>
 
-    <text x="578" y="812" font-size="30" font-weight="400" fill="#b6cae4">qe</text>
+    <text x="578" y="812" font-size="30" font-weight="400" fill="#b6cae4">qe, last cycle</text>
     <text x="992" y="814" text-anchor="end" font-size="35" font-weight="700" fill="#ffffff">10.9</text>
-    <rect x="578" y="824" width="393" height="24" rx="4" fill="url(#gLi)"/>
+    <rect x="578" y="824" width="289" height="24" rx="4" fill="url(#gLi)"/>
 
     <text x="578" y="874" font-size="30" font-weight="400" fill="#b6cae4">llama.cpp</text>
     <text x="992" y="876" text-anchor="end" fill="#c3d3e8" font-size="35" font-weight="700" >7.65</text>
-    <rect x="578" y="886" width="276" height="24" rx="4" fill="#3b5c8c"/>
+    <rect x="578" y="886" width="203" height="24" rx="4" fill="#3b5c8c"/>
 
     <text x="578" y="926" font-size="29" font-weight="400" fill="#7d92b0">one token at a time</text>
   </g>

@@ -27,6 +27,14 @@ licence claim on a kernel. What the relaxation buys is reach: §7.2b's parked wa
 row sub-tiling of §7.3c, and any reassociating accumulation order are now judged on
 machine cost alone instead of on an identity they were never going to keep.
 
+**Status (2026-11-25).** §7.30 and §7.31 are this cycle: the decode step went from 88.4 to
+64.0 ms (11.3 → 15.6 tok/s, 2.0x llama.cpp's 7.65) by removing the barrier tail §1's "+25 ms
+gap" turned out to be, and a prompt chunk's attention stopped being three dispatches a token.
+`make decode` is the instrument both were found with. Speculation is off by default since then
+(row 30 is why, and what would bring it back). §7.32 is the ranked list of everything left on
+this machine, the integrated GPU included (rows 32-38). §7.33-7.35 then took ingestion from 15.85
+to 11.50 ms an ingested token (63 → 87 tok/s) on the CPU alone.
+
 ## 0. How to read this
 
 There are exactly four levers, and they are named by what they move:
@@ -108,6 +116,16 @@ gap is epilogue and shape rather than the bus.
 | 26 | B sequences through one step (item 11, §8.1): the aggregate-throughput answer | throughput | **built, wired, and on behind a flag**: 2.15-2.20x a step of eight rows, 1.79x a wave of eight short requests, for 0.060 nats and a per-request tok/s that gets worse (`--batch N`, `make lane`, §7.25). The byte model puts the ceiling 1.25x further out and the wall at the 32.4 ms a step pays per row, which is item 22's tile; the external anchors still bracket the result - 5.76-6.6x of decode elsewhere against 1.28x on an agent-shaped mix - and the half of that range this host is in is the ingestion half: two 512-token clients together cost 1.00-1.02x of the same two one at a time, and a row of a partly full step is byte for byte the row that sequence walks alone (`make batch`, §7.25) | done, `/tmp/batch4.log`, `/tmp/lane8c.log` |
 | 27 | Three knobs with no kernel in them: a thread count of its own for a chunked prefill, core class chosen per stage by arithmetic intensity instead of per slice, and PGO left where §9.2 left it | dispatch, configuration | one of the three is built, measured, and settled at the reading it replaced: the walk of a lone token's weights now asks for a width of its own (`--walk-threads`, `QE_WALK_THREADS`, `make forward`'s width leg), and six widths raced inside the engine say the pass width is the fastest of them - 1.07x slower at four fifths of it and 1.17x at thirteen - where the same kernel raced on its own prefers 16 threads to 19 by 6 % (§7.26). Prefill-only threads are what llama.cpp exposes as `-tb`: a chunk never wanted more than the pass has, so the knob is on the other side of that split and ships asking for all of them (item 20's second half); the stage-class rule is the tiles-above-four-tokens-per-expert dispatch, which §7.16's cost charge already computes, and is a different thing from the P/E-weighted *slice* §11 killed; PGO stays priced down - there is no published number for this codebase, and +1 % on MySQL under Propeller is the honest prior for a bandwidth-bound walk (§7.24) | P2, §7.24, §7.26 |
 | 28 | One ask of the pool for a projection under the chunk walk's threshold, instead of one per token of the chunk | dispatches | **built, wired, and on**: 180 of this checkpoint's projections are under `QE_PROJ_MB` (96 mixer injection matrices at 160 KiB, 72 gated-delta alpha and beta at 480 KiB, 12 indexer key projections at 640 KiB), and the per-token loop asked a nineteen-thread pool to barrier 92,160 times per width-512 chunk for them. One dispatch over the flattened `(token, row)` space is **1.037x** of an ingested token (16.44 → 15.86 ms/token, 60.8 → **63.0 tok/s**), 1.13x of `block_proj` and 1.16-1.19x of the two mixers, for zero outputs moved - every GEMV kernel is a loop over output rows, and `make forward`'s leg holds a chunk's logits byte for byte at both settings. A step is 1.00x, because a token is one dispatch either way (`QE_SMALL_PROJ_BATCH`, §7.27) | done, `/tmp/f39_wide.log`, `/tmp/f40_wide.log` |
+| 29 | The pool's own counters, per stage: dispatches, wall, and the master's wait for the slowest worker (§10.2, built) - and what they said, that a third of a decode step was that wait | dispatches and barriers | **done**: 32.5 of 89.4 ms a step was barrier tail on a P+E pool with equal slices. Rows handed out from an atomic cursor (`QE_DYN_KB`), independent walks of a step fused into one graph dispatch (`QE_STEP_FUSE`), the routed experts on the one-token int8 walk with per-route partials, and the IQ4_NL dense copy on the same integer form (`QE_I8_STEP`): **88.4 → 64.0 ms a step, 1.38x, 15.6 tok/s**, tail 2.1 ms, nll -0.031 over 400 positions (§7.30, `make decode`) | done |
+| 30 | A verify window of k+1 rows walked with the step's fused, cursor-driven machinery instead of a chunk's | bytes + dispatches, speculation | open, and now the only route back to speculation: a two-row window is 1.61 steps of the new step with the IQ4_NL copy (`QE_I4_MULTI=2`) and its checkpoint copies on the pool, which a k=1 pass at 1.6-1.7 ids cannot beat, so the engine no longer speculates by default (§7.30) | P1 |
+| 31 | A prompt chunk's attention as a few dispatches instead of three a token | dispatches, long context | **built**: the prologue per token on the master, then one dispatch for every token's indexer scores and selection, and two per 32 tokens for the fused walk and its combine, cut exactly as the per-token form cuts them (`QE_ATTN_BATCH`, §7.31) | done |
+| 32 | **Done (§7.33): 1.16x, byte-identical.** Hand a chunk's serial islands to the pool: the mixers' per-token norms and gates, the attention prologue, `sweep`/`hc_combine`, the router's top-k, the PLE collect | serial time, ingestion | ~2 ms of an ingested token, ~1.1x, byte-identical (§7.32.2 I1) | P0 |
+| 33 | **Superseded by §7.34 (eight rows at a time, block_core 3.15 → 1.65 ms, 1.11x of ingestion, nll unmoved); the chunkwise form stays open for what is left of it.** The delta rule in chunkwise-parallel (WY/UT) form for a prompt chunk | ingestion arithmetic | ~1.5-2.5 of ~3 ms, ~1.1-1.2x, nats-gated (§7.32.2 I2) | P1 |
+| 34 | **Counters and cursors done (§7.35): 79 % busy → `moe_ffn` 7.72 → 6.60 ms, 1.08x; the IQ3_S repack is withdrawn for ingestion (`make moe`: Q8_0 is 0.73-0.80x of the codebooks at equal MACs, so the codebook is not the cost); decode-once-per-bucket tiles are what is left, and what would make wider chunks pay.** The expert stage on the CPU: per-item busy counters first, then the lossless IQ3_S 4-bit repack (+6.9 GiB, bit-identical), then decode-once-per-bucket int8 tiles | ingestion, and a step's gate/up | ~1.1-1.25x of ingestion together (§7.32.2 I3) | P1 |
+| 35 | The integrated GPU (64 EUs, DP4a, zero-copy host memory) for ingestion's expert stage, two chunks pipelined | ingestion, a second device | **probed and parked**: the device does 2.96 TMAC/s and reads host memory at 49 GB/s, a correct expert kernel reached 110 GMAC/s (21.4 ms a token against the CPU's 7.2), and an active iGPU drops the cores from ~4-4.8 GHz to ~2 GHz, costing a CPU ingestion ~30 % - so ~1.1x now and ~1.4-1.5x at best with a 3x kernel. Reopen on a firmware power-balance change (§7.32.4, `make probe-igpu`) | parked |
+| 36 | Long context: the 8k/32k/128k curve, the twelve attention layers' selection agreement, then selection reuse across layers | decode and ingestion at long context | grows with the context; 10.7 of a 70.6 ms step at 8k is the indexer and attention (§7.32.3 D4) | P0 for an agent workload |
+| 37 | A step's last ~10 %: the expert stage at 60 of 80 GB/s, 4.7 ms of serial work, the mixers' row shape | decode | 64 → 57-60 ms (§7.32.3 D1-D3) | P2 |
+| 38 | Speculative sampling at temperature > 0, on top of row 30 | decode, sampled requests | ~1.0-1.08x; measure the head's acceptance at temp 1 first (§7.32.5) | P3 |
 
 Sections 3 onward take these one at a time, plus everything that did not make the
 table. Section 11 lists what has already been measured dead, so that nobody spends an
@@ -2908,6 +2926,489 @@ numerator can move that far is a shared-machine artifact, and the row is only tr
 host; 1.19, 1.22 and 1.18x on the quiet runs against 0.95x on the loaded one is the evidence for
 reading it that way rather than for a pairing that sometimes reverses.
 
+## 7.30 The barrier was the step: a third of a decode step was nineteen threads waiting for the slowest of them, and a cursor took it back.
+
+§1's table had carried a +25 ms "gap" between what a step's bytes cost at the bus and what a step
+took for the whole life of this file, and §10.2 named the instrument that would split it - dispatch
+count and barrier wait per stage - without anyone building it. It is built now: `qe_pool_stats`
+(`include/qe.h`) counts, on the master, every dispatch, the wall it took, and the part of that wall
+the master spent waiting for the last worker after finishing its own slice; the stage profiler
+banks the three per stage, and `make decode` (`bench/bench_decode.c`) prints them for a step, a
+prompt, and a verify window, and races any set of decode switches in one load with the logits of
+every arm compared and a teacher-forced loss leg (`--nll N`) beside them.
+
+The first reading (`/tmp/qd_base.log`, 512 tokens of context, the shipping engine):
+
+| stage | ms | dispatches | in the pool | **tail** | serial |
+|---|---|---|---|---|---|
+| block_proj | 30.25 | 252 | 30.19 | **11.93** | 0.06 |
+| block_core | 4.23 | 72 | 2.86 | 1.36 | 1.37 |
+| hc_attn + hc_ffn | 8.81 | 288 | 8.02 | 3.63 | 0.79 |
+| moe_ffn | 34.33 | 336 | 33.79 | **12.31** | 0.54 |
+| lm_head | 9.81 | 1 | 9.45 | **3.18** | 0.36 |
+| **a step** | **89.37** | **953** | 84.74 | **32.49** | 4.63 |
+
+Serial work was 4.6 ms and the handshakes were the 1.5 ms §6 always said they were. The gap was the
+tail: **32.5 ms of an 89 ms step**, the master done with its share and the bus idling down while the
+slowest of nineteen threads finished an equal share. §3.2 and §11 explain why: this host is eight
+P-cores and twelve E-cores, a slice is equal by construction (`qe_slice`), and a P-core walks its
+slice faster - so every one of 953 dispatches ends on an E-core. The single dispatch that is the
+head says it most plainly: 3.2 of its 9.5 ms are the tail. `cpu_capacity` weights were measured as
+a loss (§11) because a static weight is the wrong ruler for a core whose rate depends on what the
+other eighteen are doing to the bus; the ruler that is always right is the one the work keeps itself.
+
+**What ships, three switches, every one of them measured in the same load and then priced in nats.**
+
+1. **A cursor instead of a slice** (`QE_DYN_KB`, 64): a lone token's walk hands its output rows out
+   in chunks of about 64 KiB of weights from an atomic counter (`gemv_task`); whoever is free takes
+   the next chunk, so a P-core walks more rows and nobody waits. A row is still one kernel call on
+   one thread, so the step's logits are **byte for byte** the fixed slice's at every chunk size
+   (16, 64 and 256 KiB raced: 71.6, 71.1 and 72.2 ms, all identical logits, `/tmp/qd_dyn1.log`). The
+   same cursor runs the multi-row chunk walk (`QE_CHUNK_DYN`, 24-row multiples), the indexer's
+   block scores, the fused attention units and the delta rule's state rows - each of them a set of
+   independent outputs, so each of them bit-identical.
+2. **One dispatch where nothing orders the walks** (`QE_STEP_FUSE`): the four projections of a
+   gated-delta block, the five of an attention block, a mixer's down and inject, and - in the
+   expert stage - the router beside the shared expert's gate and up, then the routed experts beside
+   the shared expert's down, each run as one dispatch of the stage graph (`gemv_group`,
+   `moe_block_step`). 953 dispatches a step become 461. Alone it is worth 1.06x (83.2 against 88.2
+   ms), because a barrier removed is a tail removed; with the cursor the two are 1.24x.
+3. **The routed experts on the one-token int8 walk, handed out by chunk.** §7.22 built the
+   one-token integer form and said a step reached it; it did not - a step took
+   `qe_moe_layer`'s float walk, and only a bucket of one inside a multi-row pass reached the form.
+   `qe_moe_step_begin` / `qe_moe_step_item` (`src/moe.c`) route one token, recode it once, and hand
+   out (expert, 32-row) gate/up chunks and (expert, 128-row) down chunks from two cursors. The down
+   chunks write a partial **per route** rather than per thread and the reduce sums them in route
+   order, so the answer does not depend on which thread walked what. `moe_ffn` 26.2 → 23.0 ms.
+4. **The dense copy walked with the same integer form** (`QE_I8_STEP`): a lone token's input is
+   recoded to int8 once per dispatch (one panel per distinct input of a fused group, `step_panel`)
+   and the IQ4_NL copy is walked with `vpdpbssd` instead of being converted to floats first.
+   `block_proj` 23.2 → 20.6 ms, which is the projections' ~1.57 GiB at **80 GB/s**, the bus.
+
+The race (`/tmp/qd_moe.log`, `/tmp/qd_nll.log`; 512 tokens of this file as context, 16 steps, best
+of three, the loss over the 400 positions that follow):
+
+| arm | ms a step | tok/s | of the old step | nll | top-1 kept |
+|---|---|---|---|---|---|
+| the engine before this section | 88.37 | 11.32 | 1.00x | 2.2192 | 400 of 400 |
+| fused dispatches only | 83.19 | 12.02 | 1.06x | - | - |
+| + the cursor | 71.13 | 14.06 | 1.24x | - | - |
+| + the routed experts' step tasks | 68.58 | 14.58 | 1.29x | 2.2159 | 351 |
+| **+ the dense integer walk (ships)** | **64.00** | **15.63** | **1.38x** | **2.1879** | 318 |
+
+The profile of what ships (`/tmp/qd_pp.log`): 63.7 ms, 461 dispatches, **2.1 ms of tail** where there
+were 32.5, `block_proj` and the head both at the bus (80-82 GB/s), and what is left above the byte
+floor is the expert stage (~60 GB/s), the mixers' badly shaped rows, 4.8 ms of serial work and the
+growing block core. At 4096 tokens of context the step is 66.5 ms (15.0 tok/s), the cursor alone
+4.3 ms of it (`/tmp/qd_ctx.log`).
+
+The quality reading, and why it is not argued away. The two integer walks reassociate, so they are
+priced and not asserted: over 400 teacher-forced positions the loss moves **-0.003** and **-0.031**
+nats - inside the noise of a 400-position mean and on the good side of it - while 82 of 400 greedy
+choices differ from the old step. That is the same kind of figure §7.23's head copy (13 of 1499)
+and the fused attention (100 of 1499) were judged by, and it is a mixture of two things that do not
+compound: the IQ4_NL dense copy already moved 295 of 1199 choices against the stored format, and
+the integer walk moves them again about as much as the copy did. `make forward`'s identity legs -
+a chunk against the ordered step loop - stay green, because both sides of them walk the same arithmetic.
+
+**What it did to speculation, which is the price of this section.** A verify window is a pass of
+several rows and got none of the above (it is a chunk, not a step), so the ratio speculation has
+to beat moved the wrong way: a two-row window with every row's logits is **1.85 steps** of the new
+step (126 ms, `/tmp/qd_win.log`). Its own profile named two things: 11 ms of the master copying 36
+layers of recurrent state for the rewind points (`ckpt_slot`, now the pool's), and the dense rows
+read from the flat Q8_0 copy at twice the IQ4_NL copy's bytes (`QE_I4_MULTI`, now 2: a window of up
+to two rows reads the IQ4_NL copy, 126 → 110 ms, 1.61 steps). Even then a k=1 pass costs ~1.5
+steps plus a draft row for 1.6-1.7 ids, which is level with the plain loop at best. The engine
+therefore no longer speculates unless asked: `--spec-k N` turns it on, `QE_SPEC_AUTO=1` restores
+the old resolution, and §8.1's "a window is N+1 rows of one sequence" is now the item that would
+make it pay - a window walked with the step's fused, cursor-driven machinery rather than a chunk's.
+
+## 7.31 A prompt's attention, three dispatches a token: the one ingestion stage that grows with the conversation, taken from per token to per chunk.
+
+What the cursor of §7.30 could not reach in an ingested token was the attention half of
+`block_core`. A chunk walks its weights once for 512 tokens, but `qsa_core` ran once per token
+inside it - the indexer's block scores, the fused walk and its combine, three dispatches of a
+token's worth of work each - so at a few thousand cells of context a 512-token chunk asked the
+pool for ~18,000 tiny dispatches per attention layer, each too small to share nineteen ways.
+`make decode --pp 4096` read it as 35.3 dispatches, **2.26 ms of tail and 1.03 ms of serial work
+in a 5.75 ms block stage** per ingested token (`/tmp/qd_ctx.log`), the master running every
+token's top-k while the pool spun.
+
+A token of a chunk reads a cache that every token before it in the chunk has already written,
+so once the cheap, ordered part has run for all of them - the cache writes, the pooled indexer
+keys, the normed and rotated queries - what is left is T independent problems. `qsa_core_chunk`
+runs that prologue token by token on the master exactly as `qsa_core` does, then asks the pool
+once for every token's indexer scores, top-k and selection (`csel_task`, thread-private scratch,
+the same three functions on the same inputs), and twice per 32 tokens for the fused walk and the
+combine (`cattn_walk_task`, `cattn_comb_task`), the gate applied a head at a time inside the
+combine. Each token's selection is cut into chunks by the per-token rule itself
+(`attn_chunking`), so every partial and every fold is the same arithmetic in the same order.
+
+That is checked rather than claimed: `make forward`'s "the ordered walk is the step loop with
+the head withheld, byte for byte" walks a 598-token prompt through this path and the step loop
+through the per-token one, and it is green (`/tmp/qf_new3.log`, 0 FAIL); `make decode` reports
+the batched and per-token ingestion of 8,192 tokens with byte-identical logits. The first
+version of this function passed its argument order to `qe_sigmoid` backwards, gated every head
+by the sigmoid of a stack buffer, and ran at full speed with plausible numbers on every leg that
+only checks a return code - the ordered-walk leg is what caught it, as a refused prefill with
+11,456 non-finite values in layer 3. `QE_DEBUG_NF=1` now names the first layer a non-finite value
+appears in.
+
+The reading, one load, 8,192 tokens of this file (`/tmp/qd_8k.log`):
+
+| | ms per ingested token | tok/s | `block_core` | dispatches a token in it | its tail |
+|---|---|---|---|---|---|
+| per token (`QE_ATTN_BATCH=0`) | 17.70 | 56.5 | 5.59 ms | 35.70 | 1.56 ms |
+| **per chunk (ships)** | **16.58** | **60.3** | **4.29 ms** | **0.84** | **0.07 ms** |
+
+1.07x of ingestion at 8k and growing with the context, since it is the context-dependent part
+of a token that moved; on `make forward`'s 598-token prompt it is inside the noise (14.8-14.9
+ms/token either way). What is left of the stage is arithmetic and the master's prologue: 0.82 ms
+serial of the 4.29, the pooled-key and query normalisation a token at a time, which is the next
+thing to hand out if a 32k-token prompt is what is being optimised. A decode step is untouched
+(one token is one token), and at 8,192 tokens of context its `block_core` is 10.7 of a 70.6 ms
+step - the indexer's scan of every block, ideas.md row 25's item, is now the largest thing in a
+step that grows with the conversation.
+
+## 7.32 What is left on this machine, ranked, after §7.30-7.31 - and the integrated GPU, which is now in scope.
+
+Written at the end of the cycle that took a step from 88.4 to 64.0 ms and an ingested token
+from 15.7 to 14.8 ms, so that the next cycle starts from a list instead of a survey. The owner's
+standing instruction (2026-11-25) is to use everything this machine can provide in the long term,
+which puts the integrated GPU in scope for the first time (§12 is amended to say so). Every
+size below is an **estimate** unless it names a log; each item names the instrument that turns it
+into a measurement, and none of it is to be argued past that instrument.
+
+### 7.32.1 Where each of the three numbers stands against the hardware
+
+| quantity | now | the machine's wall | headroom |
+|---|---|---|---|
+| decode, short context | 64.0 ms (15.6 tok/s) | ~4.0 GiB a step at the ~80 GB/s this bus gives a real pattern (89.6 peak): **52-54 ms, ~19 tok/s** | ~1.15-1.2x, then only fewer bytes or faster DRAM |
+| decode, long context | 66.5 ms at 4k, 70.6 at 8k | the same bytes, plus an indexer scan that is linear in the context | grows with context: the largest decode lever for an agent |
+| ingestion | 14.8-16.6 ms (60-67 tok/s) | ~6 GMAC a token against ~3-4 TMAC/s of int8 on 20 cores: **~2 ms** | 5-7x on paper, ~1.4x of it reachable on the CPU, more with the iGPU |
+
+Decode is a bandwidth problem and is at ~82 % of its wall; ingestion is an arithmetic problem
+and is nowhere near its own. That asymmetry is the whole plan.
+
+### 7.32.2 Ingestion (where most of the remaining machine is)
+
+The profile it is ranked against (`make decode --pp 8192`, `/tmp/qd_8k.log`, ms per ingested
+token): `moe_ffn` 7.4, `block_core` 4.3 (0.8 serial), `block_proj` 1.6 (at the issue-rate ceiling
+of §7.28), `hc_attn`+`hc_ffn` 1.4 (**0.7 serial**), `ple` and the inter-stage loops ~0.5-1, mostly
+serial.
+
+**I1. The serial islands of a chunk, handed to the pool. ~1.1x, low risk, days.** About 2 ms of
+every ingested token is the master alone while eighteen threads spin: the mixers' grouped norm
+and stream gate a token at a time (`hc_mixer_t`'s two loops), the attention prologue of
+`qsa_core_chunk` (query/key norm and rope, the pooled indexer keys - only the pooled-key write is
+ordered, and only within a block of four), the `sweep()` diagnostics and `hc_combine` per token in
+`chunk_impl`, the router's 512-logit top-k per row (`moe_block_chunk`), and the PLE collect. All of
+them are independent per token, so one dispatch over the chunk's rows keeps them byte-identical,
+exactly as §7.27 and §7.30 were. Instrument: `make decode --pp N`'s serial column, and `make
+forward`'s identity legs.
+
+**I2. The delta rule in chunkwise-parallel form. ~1.1-1.2x, medium risk, about a week.** 36
+gated-delta layers update a 128x128 state per head a row and a token at a time: ~85 M FMA a
+token, run at ~30 GFLOP/s in `delta_task` - a few per cent of the cores. The chunkwise form
+(the WY / UT-transform representation flash-linear-attention uses for gated delta nets) turns a
+chunk's recurrence into small dense products - intra-chunk attention-like terms plus one state
+update per sub-chunk - which the int8 or f32 tiles of §7.18/§7.28 walk at hundreds of GFLOP/s.
+Expected 1.5-2.5 of the ~3 ms. It reassociates, so it enters through `make score` and the
+chunk-against-step legs' tolerances, not byte identity; and the per-boundary state a verify
+window checkpoints has to come out of it, which the sub-chunk boundary gives for free only if the
+sub-chunk is one row in that case (keep the row-at-a-time form for `STEP_CKPT`).
+
+**I3. The expert stage on the CPU. ~1.1-1.25x, three parts of different cost.**
+- *I3a, measure it.* The grouped pass is sliced statically by what a bucket costs (§7.16), and
+  `qe_pool_stats` cannot see a tail inside a stage-graph dispatch. Per-item busy time in
+  `qe_drain_items` is the counter; until it exists the stage's imbalance is unknown, not zero.
+  If it is large: `gate_up_multi` can take a cursor deterministically (its outputs are per item
+  row); `down_multi` cannot while it sums per-thread partials - it needs per-item or K-sliced
+  partials first, the same move `down_step` made for a step (§7.30).
+- *I3b, the lossless IQ3_S repack.* Every entry of `qe_iq3s_grid` is a byte from {1,3,...,15}
+  (checked: 512 entries, eight magnitudes), so an IQ3_S weight is exactly a 3-bit magnitude and a
+  sign. Re-stored at open as 4-bit codes with the block's d and 4-bit sub-scales kept, the scalar
+  grid gather (§11's "vector codebook indices" row is why it is scalar) becomes one `pshufb`
+  against a 16-entry table, like IQ4_NL's. Bit-identical values, 4.19 against 3.44 bits a weight,
+  **+6.9 GiB** for the 31.6 GiB of gate/up (fits; the original can be `madvise`d away after the
+  copy). Helps the codebook-bound walk on both sides: ingestion's expert stage and a step's
+  gate/up. Instrument: `make walk`, `make moe`, then `make forward`.
+- *I3c, decode once per bucket.* Dense projections reach ~1.7 TMAC/s with the flat r3 tile
+  (§7.28); the experts reach ~0.33 because each 8-row group decodes the codebook again. Decoding
+  an expert's rows once per bucket into an int8 tile that stays in L2 (a gate or up matrix is
+  ~1.6 MB int8; a P-core has 3 MB of L2, an E-core cluster 4 MB) and walking the tile with the
+  dense kernel family is item 19 of §2, still unpriced. The open problem is the scale: one scale
+  per row is what makes the flat tile fast and it is lossy for IQ3_S's per-32 sub-scales, so the
+  form to build keeps an integer sub-scale exit per 32 (int8 codes are <= 15, sub-scales <= 31)
+  and is priced against §7.10's 1.36x per-block-exit measurement. Largest of the three, most
+  research.
+
+**I4. The integrated GPU for the experts, pipelined across two chunks. ~1.4-1.6x, weeks.** See
+§7.32.4; it overlaps I3 and should be decided by its probe before I3c is built.
+
+**Not worth it, measured:** chunks wider than 512 (flat, §7.9 and the width sweep), a fourth
+rewrite of the dense walk (§7.28's issue-rate ceiling), DRAM speed (an ingested token reads
+~7 GB/s of weights).
+
+CPU-only, I1-I3 together: ~15 → ~10-11 ms per ingested token, **~90-100 tok/s**.
+
+### 7.32.3 Decode
+
+**D1. The expert stage of a step, ~60 GB/s against ~80.** ~5 ms. Ten small, scattered matrices
+a layer; candidates are I3b (the codebook is ALU at T=1 too), putting the next layer's
+known-in-advance dense weights in flight while a step's router and top-k run (the bus is idle
+there; this is a cross-dispatch prefetch by threads that have run out of rows, not §11's
+in-loop software prefetch), and the shared expert's down walked as rows of the routed pass.
+Instrument: `make decode`'s `moe_ffn` row against its bytes.
+
+**D2. The step's serial work, 4.7 ms.** Grouped norms, gates, `sweep()`, the router's top-k and
+f32 refine, the head's 248k-logit `sweep` (0.36 ms; it can ride inside the head's own walk, each
+thread checking its rows). Some of it overlaps the next dispatch (§6.3's two-slot job), some
+parallelises. ~1-2 ms.
+
+**D3. The mixers' 340-byte rows, ~2 ms.** §6.1/§6.2's load-time concatenation and fold - the row
+shape half §7.27 left - is what is left of that item.
+
+**D4. Long context: the indexer.** At 8,192 tokens `block_core` is 10.7 of a 70.6 ms step, and it
+is linear in the context. In order: measure the curve at 8k/32k/128k (§10.4, never run; `make
+decode --prefix N` is now the instrument), count how often the twelve attention layers' top-k
+selections agree (§2 row 25 - published overlap between adjacent layers is 70-100 %), then reuse a
+selection across neighbouring layers behind a quality gate (`make score` at long context), then
+parallelise or prune the scan itself. This is the item an agent's long prompts pay for on every
+token; it ranks first for that workload.
+
+**D5. Fewer bytes, priced in nats.** The IQ4_NL head copy is staged already (`QE_I4_HEAD=i4`, -4
+ms a step, +0.021 nats, §7.23). Lower-bit dense copies are the same trade, larger.
+
+**D6. Hardware.** Decode is ~1:1 with DRAM rate. Two DIMMs at DDR5-6400 would be ~+14 %; whether
+128 GB runs at that rate on this board is a question for the board, not this repository.
+
+Realistic decode with D1-D3: 57-60 ms (16.7-17.5 tok/s) at short context. Past ~19 tok/s only D5
+and D6 move it.
+
+### 7.32.4 The integrated GPU
+
+**What is there (read off this host, 2026-11-25).** Arrow Lake-S "Intel Graphics", PCI 8086:7d67,
+**64 EUs (4 Xe-LPG cores) at up to 1.95 GHz**, `i915`, intel-compute-runtime 26.31 with both
+OpenCL (`/etc/OpenCL/vendors/intel.icd`) and Level Zero (`libze_loader.so.1.32`), `/dev/dri/renderD128`
+world-accessible. `cl_khr_integer_dot_product` with 4x8-bit inputs (DP4a); **no
+`cl_intel_subgroup_matrix_multiply_accumulate`, so no XMX/DPAS** on this part. fp16 yes, fp64 yes.
+`Unified memory for Host and Device: Yes`, `cl_intel_unified_shared_memory`,
+`cl_intel_mem_force_host_memory`: the GPU can read the engine's pinned arena in place, with a
+**4 GiB maximum allocation** - the largest routed expert tensor is ~660 MB, so a tensor maps as one
+buffer and the 144 pools as 144.
+
+**What it is worth on paper.** 64 EUs x 8 lanes x 4 int8 MACs x 1.95 GHz is **~4 TMAC/s** of DP4a;
+quantised kernels without matrix engines reach maybe 20-40 %, so 0.8-1.6 TMAC/s. The expert stage
+needs ~2.4 GMAC a token and the CPU delivers it at ~0.33 TMAC/s (7.2 ms), so the iGPU matches the
+CPU at under a tenth of its peak. The dense half is not a candidate: the CPU already walks it at
+~1.7 TMAC/s.
+
+**Why decode is not a candidate.** A step is bound by the DRAM rate, and the iGPU reads the same two
+channels. (Splitting a step's walks between the two would only move who waits for the bus.)
+
+**The schedule that turns it into a speed-up, not a relocation.** A chunk's layers are strictly
+ordered, so moving the experts to the GPU and waiting for them gains only the rate difference.
+Two chunks in flight overlap the two devices:
+
+```
+CPU :  A.dense(L) | B.dense(L)   | A.dense(L+1) | B.dense(L+1) | ...
+iGPU:             | A.experts(L) | B.experts(L) | A.experts(L+1)| ...
+```
+
+B's layer L needs A's recurrent state and caches of layer L, which exist before A's experts of
+layer L run; A's layer L+1 needs A's experts of layer L, which the GPU finishes while the CPU walks
+B. An ingested token then costs the larger of the CPU's non-expert part (~7.8 ms today, less after
+I1/I2) and the GPU's expert part: **ideal ~1.9x, realistic ~1.4-1.6x** of ingestion. Prompts
+shorter than two chunks gain only the rate difference. The expert routing (router, top-k, refine,
+bucket sort) stays on the CPU; the GPU receives bucket lists and the chunk's int8 panel.
+
+**What has to be built, in order:**
+1. **The probe (one day, no engine change).** A standalone OpenCL program that maps real expert
+   tensors zero-copy from a pinned host buffer and runs the grouped IQ3_S gate/up and IQ4_NL down
+   walks for a realistic bucket mix (the router's histogram from `make route`), DP4a against a
+   row-scaled int8 panel, measuring GMAC/s **twice: idle CPU, and with all twenty cores running an
+   ingestion at the same time.** The second figure is the decision, because the iGPU shares the
+   package power budget (65 W base, 182 W turbo) with cores that are already at their limit
+   during ingestion, and a GPU that steals the CPU's clock buys less than its own rate says.
+   Gate: >= ~0.8 TMAC/s under load → build it; <= ~0.4 → don't, and I3 is the path.
+2. Kernels for the three expert formats (IQ3_S, IQ4_NL, Q8_0 for the few Q8_0 pools), held to
+   `make fast`'s double reference the way the CPU forms are.
+3. The two-chunk pipeline in `prefill_rows`/`chunk_impl`, with the GPU's work as an asynchronous
+   item the CPU's layer loop waits on only when it needs the answer.
+4. A fallback that is the CPU path exactly, chosen at open, refused with a printed reason when the
+   device is absent, and a switch (`QE_IGPU=0`) for every A/B.
+
+**What it costs the repository, said once.** README's "no CUDA, Metal, Vulkan, ROCm, OpenCL or
+SYCL" and "two libraries" stop being true: this adds `libOpenCL` (or `libze_loader`) as a dlopen'd,
+optional dependency, so that a build or a host without it is the engine that exists today. The
+GPU's summation order is its own, so ingestion with it on is a different arithmetic, priced by
+`make score` and the head's-range legs, and the chunk-against-step identity legs run with it off.
+And the engine's answers on this host then depend on whether the GPU path was on, which the
+banner and `/health` have to say.
+
+**The probe, run (2026-11-25): measured, and not built.** `tools/probe_igpu.c` (`make
+probe-igpu`; standalone, the only file in the tree that links OpenCL) builds one layer's routed
+pools in the checkpoint's block layouts and shapes in page-aligned host memory the GPU reads in
+place, routes a 512-token chunk top-10 with a skewed router (512 buckets, mean 10 rows, largest
+20), walks gate/up (IQ3_S) and down (IQ4_NL) with `dot()` against a row-scaled int8 panel, and
+checks 128 sampled outputs against a C reference (worst 1.6e-04).
+
+| what | measured |
+|---|---|
+| the device's own ceilings (`dot` loop, FMA loop, a 1 GiB read) | **2.96 TMAC/s** int8 (`dot_acc_sat` 2.5), 1.95 TFLOPS f32, **49 GB/s** from host memory |
+| the floor that read rate puts on the expert stage | 1.14 GB a layer: ~23 ms a chunk, **~2.3 ms per ingested token** |
+| kernel v1: one work item per row | 53 GMAC/s |
+| kernel v3: SLM-staged activations, 16 lanes a row, gate and up decoded together, tile 8 tokens, 8 rows a subgroup | **110 GMAC/s** (gate/up 96, down 150-160): **21.4 ms per ingested token** against the CPU's 7.2 |
+| the iGPU's rate with the CPU ingesting beside it | unchanged, 109-110 GMAC/s |
+| **the CPU's ingestion with the iGPU walking beside it** (2,048 tokens, ten repetitions lined up against a 45 s on/off duty cycle, `/tmp/qd_igpu_cpu.log`, `/tmp/qp_duty.log`) | **16.1-16.2 ms/token with the iGPU idle, 20.5-21.4 with it walking: ~30 % slower** |
+| why: the mean core clock under a 19-thread AVX-VNNI load | **4.6-4.8 GHz alone (4.0-4.1 sustained), ~2.0 GHz the moment the iGPU runs anything** - the probe or a pure-arithmetic `dot` loop that touches no memory alike |
+
+Two findings decide it. The kernel is 4 % of the device's dot rate; the remaining waste is visible
+(data-dependent table lookups - IQ4_NL's sixteen values out of constant memory, IQ3_S's grid out of
+SLM - serialise across lanes, and the decode is repeated per token tile), and a further 3-5x is
+plausible with sub-group shuffles as the 16-entry table and a row-major re-layout. But the second
+finding caps what any kernel can buy: **on this board, as configured, an active iGPU takes the CPU
+cores from ~4.0-4.8 GHz to ~2.0 GHz** (firmware power sharing between the graphics and core
+domains; the package limits read PL1 65 W, PL2 182 W, and RAPL is not readable without root), and
+ingestion pays ~30 % for it. Pipelined as designed above, the best split with today's kernel is
+~1.1x; with a kernel at CPU parity (~7 ms) it is bounded by the CPU's own non-expert work run 1.3x
+slower, ~10 ms, **~1.4-1.5x at the very best** - weeks of work for less than the CPU-only items
+I1-I3 promise without the clock penalty.
+
+**What would reopen it:** a firmware setting that stops the graphics domain from pulling the cores'
+clock (BIOS power-balance / GT-IA limits, or the package limits themselves - root or the board's
+setup screen, not this repository), re-measured with the probe's `--duty` mode beside `make decode
+--pp`; or a kernel at >= 0.4-0.5 TMAC/s *and* a measured penalty well under 30 %. The probe is the
+instrument for both, and the reading above is the bar.
+
+**A side finding worth a row of its own:** the CPU alone sags from 4.8 to ~4.0 GHz after ~25 s of
+an all-core AVX-VNNI load. Ingestion is arithmetic-bound, so the package limits are a lever on it
+too; raising PL1 (65 W) in the board's setup and re-running `make decode --pp` is a no-code
+experiment (§7.32.3 D6's neighbour).
+
+### 7.32.5 Speculation
+
+What came off in §7.30 and what would bring it back. A k=1 pass costs a two-row window plus a
+draft row for 1 + acceptance ids.
+- **S1, the window on the step's machinery** (§2 row 30): fused dispatches, cursors, the int8
+  walks and a two-row form of the routed step tasks. Estimated window ~1.35-1.4 steps (dense and
+  head shared, routed experts ~2x, per-row attention/state). With the draft head's own dense
+  matrices on the IQ4_NL copy (S2) a draft row is ~6-7 ms. Greedy at acceptance 0.65-0.75:
+  **1.11-1.18x**; if the window only reaches 1.5 steps, ~1.03x.
+- **S3, speculative sampling for temperature > 0.** The engine speculates only for greedy
+  requests, and an agent client at the checkpoint's default (temp 1.0, top-k 20, top-p 0.95)
+  never speculates. Accept a draft x with probability min(1, p(x)/q(x)) and resample a rejection
+  from max(0, p - q) renormalised, both distributions after the same top-k/top-p filter; the
+  output distribution is exactly the target's. Acceptance at temp 1 is lower (0.5-0.6 is typical),
+  so **~1.0-1.08x** on top of S1. Measure the head's acceptance at temp 1 with `make head` before
+  writing it.
+- k = 2 does not help either case: a three-row window is ~1.7 steps for ~2.1 ids.
+
+The ceiling is structural on this checkpoint: the second row of a window mostly wants other
+experts (10 of 512), so a third of a step does not amortise.
+
+### 7.32.6 The order, for the next cycle
+
+For the agent workload this host serves (long prompts, temperature 1): **D4** (measure the long
+curve, then the indexer) and **I1** first; then **I2**; then the **iGPU probe**, whose answer
+decides between building **I4** and building **I3c**; **I3a/I3b** as soon as either is touched;
+**D1-D3** for the last ~10 % of short-context decode; **S1** and **S3** only if a greedy or a
+measured temp-1 acceptance makes them pay. Each lands through `make decode` and `make forward`
+like §7.30 did, and each says in this file what it measured.
+
+## 7.33 A prompt chunk's per-token loops across the pool: 3.3 ms of serial work an ingested token, byte for byte the same answer.
+
+§7.32.2 I1, built. `make decode --pp 2048` (now with an "outside" row: the per-token loops of
+`chunk_impl` between its stages) put the master's own work at **3.3 of 15.85 ms an ingested
+token**: 1.44 outside every stage (the magnitude sweeps and the injection of a block's and the
+experts' output into the residual streams), 0.82 in `block_core` (the gated-delta gates and causal
+convolution, the attention prologue), 0.71 in the mixers (grouped norm, silu, stream gate), 0.16
+in the experts (the router's top-k, the shared expert's gate), 0.15 in the PLE collect
+(`/tmp/qi_base.log`).
+
+Every one of those loops is a token's business, so `rows_run` hands a chunk's rows out from a
+cursor, one call of the same function on the same row per row. The pieces that needed thought:
+- **the diagnostics** (`sweep`: a running maximum per band and a non-finite count) are kept per
+  thread and folded after the dispatch; a maximum and a count do not care about order, and a row
+  that goes non-finite leaves the band where the serial loop left it;
+- **the causal convolution** reads, for each token, the three tokens before it: from the chunk's
+  own `qkv` rows where they are in the chunk and from the history ring for the first three, and
+  the ring is written once, after every row has read it (no in-chunk token overwrites a slot a
+  later token of the same chunk still needs - checked against the ring's index arithmetic);
+- **the attention prologue** splits in two: every token's raw indexer key, query/key norms and
+  rotations and cache writes, then the pooled key of every block of four cells the chunk
+  completes, written in place instead of through a shared scratch row;
+- **the PLE collect** stays serial: it pops a FIFO in position order, and it is 0.15 ms.
+
+Measured in one load (`/tmp/qi_rows.log`, 2,048 tokens): **16.03 → 13.83 ms an ingested token
+(1.16x, 62.4 → 72.4 tok/s)**, serial 3.3 → ~0.15 ms, and the last chunk's logits **byte-identical**
+with `QE_ROWS_PAR` on and off; decode steps unchanged (a step is one row). `make forward` 0 FAIL,
+its width-512 row 14.8 → 12.8 ms/token, the ordered walk still the step loop to the bit
+(`/tmp/qf_rows.log`).
+
+## 7.34 The delta rule eight rows at a time: the recurrence was waiting on FMA latency.
+
+`delta_task` walked a unit of eight state rows one row after another: per row and token a 128-wide
+dot product, an update, a second dot product, each one accumulation chain ending in a horizontal
+sum, so a core waited on the latency of its own FMAs - 85 M FMA an ingested token at a few per cent
+of the FP32 rate. `delta_task_simd` walks the eight rows together: the prediction is eight
+independent accumulators over one load of `k`, folded by one transposing `hadd` tree; the update
+and the read-out keep eight read-out accumulators in flight the same way (13 of the 16 `ymm`).
+Same operations on the same values; the dot products are summed in a different order, so it is
+priced in nats, and the chunk and the step share the kernel, so the chunk-against-step identity
+legs hold (`QE_DELTA_SIMD`, on).
+
+| | before | after |
+|---|---|---|
+| `block_core` of an ingested token (2,048 tokens) | 3.15 ms | **1.65 ms** |
+| an ingested token | 13.83 ms | **12.45 ms (80.3 tok/s)** |
+| `block_core` of a decode step | 7.6 ms | 5.4 ms |
+| a decode step (same load) | 67.26 ms | **65.22 ms** |
+| nll over 300 teacher-forced positions | 2.3303 | **2.3255** |
+
+(`/tmp/qi_delta.log`.) 51 of 300 greedy choices move, which is the usual amplification of a
+reassociation through 36 recurrent layers at a nll that does not move; that is the gate this file
+holds a reassociation to.
+
+## 7.35 The expert stage on cursors, with a down projection that sums deterministically.
+
+The new counter (`qe_pool_stats.item_busy` / `item_capacity`, threads that are inside an item of a
+stage graph against threads times its wall) read **79 %**: a fifth of the expert stage's thread-time
+was the pool idle inside the graph, which the master's tail cannot show because the master is a
+worker of the graph. The grouped pass is sliced statically by estimated cost (§7.16), and like
+every equal share on this chip it ends on an E-core.
+
+- **gate/up** takes (bucket, 64-row) units from a cursor: every output row is still one walk on one
+  thread, so the bytes are the slice's.
+- **down** cannot do that as built, because it sums per-thread partials and which thread took which
+  bucket is part of what an output sums to. `down_det` makes a unit 32 output rows *of every
+  bucket*: it zeroes those rows of the chunk's output and adds each bucket's contribution in bucket
+  order, so a row of the answer is summed the same way whichever thread took the unit, and there is
+  nothing to reduce. The per-thread T x K partials it retires were 100 MB a layer at the 512-row
+  chunk - **4.8 GB of RAM** the engine no longer allocates (`moe_need_part2` keeps them for
+  `QE_MOE_DYN=0` only).
+
+`/tmp/qi_moedyn.log`: `moe_ffn` 7.72 → **6.60 ms**, an ingested token 12.44 → **11.50 ms (86.9
+tok/s)**. The answer moves by the summation order of the down projection; `make forward` holds it
+to the same next token as the ordered walk, half the head's range, and eight greedy steps after the
+prompt identical id for id - all green, 0 FAIL, the width-512 row **10.7 ms/token** (`/tmp/qf_moe.log`).
+`make moe` passes both paths. A side effect worth having: the logits of a prompt no longer depend
+on the chunk width (512, 768 and 1024 byte-identical, below).
+
+**Wider chunks, measured and not taken.** With the partials gone a 1024-row chunk costs only its
+scratch, so `QE_CHUNK_MAX` was raised and the widths raced over 4,096 tokens: **12.04 / 12.14 / 12.12
+ms an ingested token at 512 / 768 / 1024** (`/tmp/qi_width.log`). The expert stage gains 2 % and
+the dense walk loses as much, because the integer expert walk decodes a weight block once per
+eight tokens of a bucket (the sixteen-register budget, §7.12/§7.21): a bucket of twenty is three
+decodes, so a fuller bucket buys nothing. That is §7.32.2's I3c - decode a bucket's rows once into
+an int8 tile in L2 - and it is the item that would make width pay. The cap is back at 512.
+
+**Where ingestion stands after §7.33-7.35** (2,048 tokens, `make decode --pp`): 15.85 → **11.50 ms
+an ingested token, 63 → 87 tok/s (1.38x)**; 83 tok/s at 4,096 tokens; `make forward`'s 598-token
+prompt 14.8 → 10.7 ms (93 tok/s). Left: experts 6.6 ms (57 %, now the walk itself), dense
+projections 1.85 (issue-rate ceiling), `block_core` 1.7, mixers 0.94, PLE 0.38.
+
 ## 8. Sequences, state and concurrency
 
 **8.1 Built, and it was the multiplier: B sequences through one step.** Generation used to
@@ -3147,6 +3648,13 @@ them is only interesting as a device-dependent number.
 Two things are out of scope for a different reason: the checkpoint's own template
 evaluator and a vision encoder (`§8`'s gap rows). Both are features, and neither
 would move a byte of a decode step.
+
+**Amended (owner, 2026-11-25): the integrated GPU is in scope.** The instruction is to use
+everything this machine can provide in the long term, and the Arrow Lake iGPU is the one
+arithmetic unit the engine has never used. It enters as an optional, dlopen'd path for
+ingestion's expert stage, behind a probe that has to show it pays with the CPU busy (§7.32.4),
+with the CPU path kept exact and selectable. A discrete or remote accelerator remains out of
+scope: this is still one machine's engine.
 
 ## 13. Appendix: drift found while reading, worth fixing near the code it lives in
 

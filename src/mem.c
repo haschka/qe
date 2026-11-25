@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(__x86_64__)
@@ -190,6 +191,18 @@ static struct {
     volatile int shutdown;
 } P;
 
+static struct {
+    int on;
+    qe_pool_stats s;
+    long busy_ns; /* item time, added to by every worker */
+} PS;
+
+static double ps_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
 /* One dispatch of a stage graph, run by whoever woke up to it.
  *
  * A worker takes the lowest-numbered ready slot it can see and re-reads the
@@ -237,7 +250,13 @@ static void qe_drain_items(const qe_dispatch *d) {
             if (!__atomic_compare_exchange_n(&P.cursor[i], &c, c + 1, 0, __ATOMIC_ACQ_REL,
                                              __ATOMIC_ACQUIRE))
                 continue;
-            items[i].fn(items[i].arg, c, items[i].nthreads);
+            if (PS.on) {
+                const double t1 = ps_now();
+                items[i].fn(items[i].arg, c, items[i].nthreads);
+                __atomic_add_fetch(&PS.busy_ns, (long)((ps_now() - t1) * 1e9), __ATOMIC_RELAXED);
+            } else {
+                items[i].fn(items[i].arg, c, items[i].nthreads);
+            }
             if (__atomic_add_fetch(&P.icensus[i], 1, __ATOMIC_ACQ_REL) == items[i].nthreads)
                 __atomic_or_fetch(&P.ready, 1u << i, __ATOMIC_ACQ_REL);
             took = 1;
@@ -636,7 +655,33 @@ const char *qe_slice_summary(char *buf, size_t buflen) {
     return buf;
 }
 
+void qe_pool_stats_enable(int on) { PS.on = on; }
+
+void qe_pool_stats_get(qe_pool_stats *out) {
+    if (out)
+        *out = PS.s;
+}
+
+static void qe_pool_run_inner(qe_task_fn fn, void *arg, int nthreads, double *own_end);
+
 void qe_pool_run(qe_task_fn fn, void *arg, int nthreads) {
+    if (!PS.on) {
+        qe_pool_run_inner(fn, arg, nthreads, NULL);
+        return;
+    }
+    const double t0 = ps_now();
+    double t1 = 0.0;
+    qe_pool_run_inner(fn, arg, nthreads, &t1);
+    const double t2 = ps_now();
+    if (t1 <= 0.0)
+        t1 = t2;
+    PS.s.dispatches++;
+    PS.s.seconds += t2 - t0;
+    PS.s.own += t1 - t0;
+    PS.s.tail += t2 - t1;
+}
+
+static void qe_pool_run_inner(qe_task_fn fn, void *arg, int nthreads, double *own_end) {
     if (P.n <= 1 || nthreads <= 1) {
         fn(arg, 0, 1);
         return;
@@ -669,6 +714,8 @@ void qe_pool_run(qe_task_fn fn, void *arg, int nthreads) {
      * early during shutdown, which is exactly how the first version of this
      * pool hung on exit. */
     fn(arg, 0, nthreads);
+    if (own_end)
+        *own_end = ps_now();
     while (__atomic_load_n(&P.done, __ATOMIC_ACQUIRE) < nthreads - 1) {
         if (P.shutdown)
             return;
@@ -676,7 +723,25 @@ void qe_pool_run(qe_task_fn fn, void *arg, int nthreads) {
     }
 }
 
+static void qe_pool_run_items_inner(const qe_pool_item *items, int nitems);
+
 void qe_pool_run_items(const qe_pool_item *items, int nitems) {
+    if (!PS.on) {
+        qe_pool_run_items_inner(items, nitems);
+        return;
+    }
+    const long b0 = __atomic_load_n(&PS.busy_ns, __ATOMIC_RELAXED);
+    const double t0 = ps_now();
+    qe_pool_run_items_inner(items, nitems);
+    const double t2 = ps_now();
+    PS.s.dispatches++;
+    PS.s.seconds += t2 - t0;
+    PS.s.own += t2 - t0;
+    PS.s.item_busy += 1e-9 * (double)(__atomic_load_n(&PS.busy_ns, __ATOMIC_RELAXED) - b0);
+    PS.s.item_capacity += (t2 - t0) * (double)(P.n > 0 ? P.n : 1);
+}
+
+static void qe_pool_run_items_inner(const qe_pool_item *items, int nitems) {
     if (!items || nitems <= 0)
         return;
     if (nitems > QE_POOL_MAX_ITEMS) {

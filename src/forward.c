@@ -66,6 +66,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <immintrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,10 @@
 /* QE_CHUNK, clamped to QE_CHUNK_MAX: the width a pass opens with. Defined with the
  * chunk loop it configures; declared here because qe_forward_open reads it once
  * before any chunk runs. */
+/* Tokens of a prompt chunk whose attention partials are held at once (qsa_core_chunk). */
+#define ATTN_GROUP 32
+#define QE_MAX_HEAD_DIM 512
+
 static int prefill_chunk(void);
 
 /* QE_MOE_GROUP: whether a chunked prefill groups the expert stage. Declared here
@@ -131,7 +136,8 @@ enum {
     E_pkey, E_pval, E_pgated, E_pgnorm, E_pconv, E_pemb,
     E_e640, E_u640, E_h640, E_mlogits, E_cmlogits, E_ey,
     E_cs, E_sel, E_selbits, E_attnpy, E_attnpm, E_attnpl,
-    E_routes, E_seq, E_heap, E_heapb, E_i8x, E_i8s, E_i8p, E_COUNT
+    E_routes, E_seq, E_heap, E_heapb, E_i8x, E_i8s, E_i8p,
+    E_cqwork, E_csel, E_tiscore, E_theap, E_theapb, E_tbits, E_gpy, E_gpm, E_gpl, E_COUNT
 };
 
 typedef struct {
@@ -149,6 +155,7 @@ typedef struct {
 } qe_layer;
 
 struct qe_forward {
+    qe_pool_stats pst0; /* the pool counters when the stage being timed began */
     qe_model *m;
     qe_forward_opts o;
     int n_threads;
@@ -333,6 +340,28 @@ struct qe_forward {
      * the flat copies, refused with two numbers on a host that cannot afford them, and
      * 1.8 GiB on this checkpoint. */
     int dq_i4;
+    int dq_multi;   /* widest pass (rows) that reads the IQ4_NL dense copy: QE_I4_MULTI */
+    int stage_pf;   /* QE_STAGE_PF: idle threads pull the next weights toward the cache */
+    int step_fuse;  /* QE_STEP_FUSE: a step's independent walks share one dispatch */
+    size_t dyn_bytes; /* QE_DYN_KB: a lone token's walk is handed out in chunks this big */
+    int step_i8;      /* QE_I8_STEP: a lone token's walk spends int8 against the codebook */
+    int chunk_dyn;    /* QE_CHUNK_DYN: a multi-row walk hands its rows out from a cursor too */
+    int delta_simd;   /* QE_DELTA_SIMD: the delta rule eight rows at a time (§7.34) */
+    int rows_par;     /* QE_ROWS_PAR: a chunk's per-token loops across the pool (§7.33) */
+    int attn_batch;   /* QE_ATTN_BATCH: a prompt chunk's attention as a few dispatches, not 3 a token */
+    float *cqwork;    /* QE_CHUNK_MAX rows of normed, rotated queries */
+    int *csel;        /* QE_CHUNK_MAX selections of up to sel_cap cells */
+    long sel_cap;
+    float *tiscore;   /* per pool thread: one row of block scores */
+    float *theap;     /* per pool thread: a top-k heap */
+    int *theapb;
+    uint64_t *tbits;  /* per pool thread: the selection bitmap */
+    long tbits_words;
+    float *gpy, *gpm, *gpl; /* partials of one group of a chunk's attention */
+#define QE_STEP_PANELS 8
+    qe_i8panel spanel[QE_STEP_PANELS];
+    const float *spanel_x[QE_STEP_PANELS];
+    long spanel_k[QE_STEP_PANELS];
     void *dq_w;    /* every copy, one arena, a tensor's rows K/32 blocks apart */
     long *dq_woff; /* byte offset of a tensor's first row, by tensor index, -1 for none */
     /* Which classes of matrix this is, by tensor index: the hyper-connection mixers, the
@@ -451,6 +480,12 @@ struct qe_forward {
 
     /* chunk-progress hook, see qe_forward_set_progress */
     qe_progress_cb progress;
+    /* Called after every layer of a prompt chunk with the tokens that layer has carried,
+     * as a fraction of the chunk: what a status panel draws between the chunk hooks, which
+     * on a 512-row chunk are eight seconds apart. A count of work done, never an estimate. */
+    void (*progress_fine)(void *user, long done, long total);
+    void *progress_fine_user;
+    long pf_base, pf_total; /* where the prompt in flight is, while one is */
     void *progress_user;
 };
 
@@ -568,6 +603,13 @@ typedef struct {
      * own branch so nothing about a step changes. */
     int T;
     long xstride, ystride;
+    /* Rows handed out by an atomic cursor in chunks of `dyn` rows instead of one fixed
+     * slice per thread (0 = the fixed slice). See `dyn_rows`. */
+    long dyn;
+    long next;
+    /* A lone token's activation recoded to int8 once for the dispatch, when the type the
+     * walk reads has a one-token integer form (QE_I8_STEP). */
+    const qe_i8panel *ap;
 } gemv_job;
 
 static long dq_copy_for(const qe_forward *f, const qe_tensor *t);
@@ -694,6 +736,12 @@ int qe_forward_get_exp2_simd(const qe_forward *f) {
  * `make forward`'s small-projection leg hold it to. */
 static void gemv_row_call(const gemv_job *j, const float *x, float *y, long row0, long n) {
     const void *W = j->w4 ? j->w4 : j->w;
+    if (j->ap) {
+        float *yp[1] = { y };
+        if (qe_gemv_i8_t(j->type, (const char *)W + (size_t)row0 * (size_t)j->row_bytes, j->ap, 1,
+                         yp, n, j->K, j->ldd) == 0)
+            return;
+    }
     if (qe_gemv_t(j->type, (const char *)W + (size_t)row0 * (size_t)j->row_bytes, x, y, n,
                   j->K, j->ldd) != 0) {
         /* A type with no kernel would otherwise score itself as zeros, which a
@@ -708,6 +756,18 @@ static void gemv_task(void *v, int tid, int nthreads) {
     gemv_job *j = v;
     const long n_rows = (long)j->t->ne[1];
     long lo, hi;
+    if (j->T == 1 && j->dyn > 0) {
+        /* Whoever is free takes the next chunk. A row is still one kernel call on one
+         * thread, so the bytes of every output are what the fixed slice makes; only
+         * which core walked them moves, and a P-core that finishes early walks more. */
+        for (;;) {
+            const long r0 = __atomic_fetch_add(&j->next, j->dyn, __ATOMIC_RELAXED);
+            if (r0 >= n_rows)
+                return;
+            const long n = r0 + j->dyn > n_rows ? n_rows - r0 : j->dyn;
+            gemv_row_call(j, j->x, j->y + r0, r0, n);
+        }
+    }
     if (j->T == 1) {
         qe_slice(n_rows, tid, nthreads, &lo, &hi);
         if (lo < hi)
@@ -757,16 +817,72 @@ static void gemv_job_for(qe_forward *f, const qe_tensor *t, const float *x, floa
                        ctype,
                        T,
                        xstride,
-                       ystride };
+                       ystride,
+                       0,
+                       0,
+                       NULL };
+    if (T == 1 && f->dyn_bytes > 0) {
+        /* Chunks of about `dyn_bytes` of weights, never fewer rows than a kernel's
+         * own row group, and small enough that every thread gets several. */
+        long rows = (long)(f->dyn_bytes / (size_t)out->row_bytes);
+        const long per = (long)t->ne[1] / (4L * f->n_threads);
+        if (rows > per)
+            rows = per;
+        out->dyn = rows < 8 ? 8 : (rows + 7) & ~7L;
+    }
     if (out->K <= 0 || t->ne[1] <= 0) {
         fprintf(stderr, "qe: tensor %s has an impossible shape\n", t->name);
         abort();
     }
 }
 
+/* The int8 recode of a lone token's input for the walks of one dispatch (QE_I8_STEP).
+ *
+ * A step's dense walk reads the IQ4_NL copy through the float kernel, which converts every
+ * codebook value to a float and multiplies: 60 GB/s on this host where the bus is ~80 and
+ * the head's Q8_0 walk reaches it. The one-token integer form of §7.22 spends the codebook
+ * against an int8 activation instead - the same panel a chunk recodes, filled once on the
+ * master for every matrix of the dispatch that reads that input. Panels live in the chunk
+ * panel's rows, which a step never uses. `nslot` distinct inputs at most per dispatch. */
+static qe_i8panel *step_panel(qe_forward *f, const float *x, long K, int slot) {
+    if (!f->step_i8 || !f->i8x || K % 32 || K > f->i8k || slot >= QE_STEP_PANELS)
+        return NULL;
+    qe_i8panel *a = &f->spanel[slot];
+    *a = (qe_i8panel){ .x8 = f->i8x + (size_t)slot * (size_t)f->i8k,
+                       .s = f->i8s + (size_t)slot * (size_t)(f->i8k / 32),
+                       .p = f->i8pseed + (size_t)slot * (size_t)(f->i8k / 32),
+                       .stride8 = K,
+                       .nb = K / 32 };
+    (qe_i8_rowscale() ? qe_quant_q8_0_row_rs : qe_quant_q8_0_row)(x, a->x8, a->s, a->p, K);
+    f->spanel_x[slot] = x;
+    f->spanel_k[slot] = K;
+    return a;
+}
+
+/* Attach a panel to a job when its walk has a one-token integer form, reusing the panel of
+ * an earlier job of the same dispatch that read the same input. */
+static void step_attach(qe_forward *f, gemv_job *j, int *nslots) {
+    if (!f->step_i8 || j->T != 1 || !qe_gemv_i8_has_1(j->type))
+        return;
+    for (int i = 0; i < *nslots; i++)
+        if (f->spanel_x[i] == j->x && f->spanel_k[i] == j->K) {
+            j->ap = &f->spanel[i];
+            return;
+        }
+    qe_i8panel *a = step_panel(f, j->x, j->K, *nslots);
+    if (a) {
+        j->ap = a;
+        (*nslots)++;
+    }
+}
+
 static void gemv(qe_forward *f, const qe_tensor *t, const float *x, float *y) {
     gemv_job j;
     gemv_job_for(f, t, x, y, 0, 0, 1, &j);
+    if (f->chunk_T == 1) {
+        int ns = 0;
+        step_attach(f, &j, &ns);
+    }
     if (f->o.profile)
         f->walk_mac += (double)t->ne[0] * (double)t->ne[1];
     /* A width of its own, on a token of its own and on nothing else: a chunk's rows share a
@@ -779,6 +895,37 @@ static void gemv(qe_forward *f, const qe_tensor *t, const float *x, float *y) {
      * walking is not part of what any row sums to. `make forward` races widths against each
      * other and asserts the logits of a step byte for byte. */
     qe_pool_run(gemv_task, &j, f->chunk_T == 1 ? f->walk_threads : f->n_threads);
+}
+
+/* Several walks of one token that read inputs nobody in the group writes, as one dispatch
+ * of the pool's stage graph instead of one dispatch each (ideas.md §7.30).
+ *
+ * A decode step is ~800 dispatches over ~4 GiB, and each of them ends in a barrier where
+ * the bus goes quiet until the slowest of nineteen threads is done and the next matrix's
+ * first lines are on their way. Four projections that read the same mixer output have no
+ * ordering between them, so a thread that finishes its slice of the first takes a slice of
+ * the next one instead of waiting: one barrier where there were four. Every slice is still
+ * one output row range of one tensor walked in one kernel call, so what any row sums to is
+ * the same bytes as the four dispatches - this is a scheduling change and nothing else. */
+#define QE_GROUP_MAX 8
+static void gemv_group(qe_forward *f, int n, const qe_tensor *const *t, const float *const *x,
+                       float *const *y) {
+    if (f->chunk_T != 1 || !f->step_fuse || n < 2) {
+        for (int i = 0; i < n; i++)
+            gemv(f, t[i], x[i], y[i]);
+        return;
+    }
+    gemv_job j[QE_GROUP_MAX];
+    qe_pool_item it[QE_GROUP_MAX];
+    int ns = 0;
+    for (int i = 0; i < n; i++) {
+        gemv_job_for(f, t[i], x[i], y[i], 0, 0, 1, &j[i]);
+        step_attach(f, &j[i], &ns);
+        if (f->o.profile)
+            f->walk_mac += (double)t[i]->ne[0] * (double)t[i]->ne[1];
+        it[i] = (qe_pool_item){ gemv_task, &j[i], f->walk_threads, 0 };
+    }
+    qe_pool_run_items(it, n);
 }
 
 /* A projection under the chunk walk's threshold, every token of the chunk in one ask of
@@ -834,6 +981,10 @@ typedef struct {
      * head: those are another format, and the walk is handed row bytes and a leading
      * dimension that only make sense with them. */
     qe_type type;
+    /* Rows handed out from a cursor in chunks of `dyn` (0 = one fixed slice a thread), the
+     * same trade as gemv_job's: every output row is still one kernel call's. */
+    long dyn;
+    long next;
 } gemv_chunk_job;
 
 /* The chunk recode, one slice of the T token rows per thread. It is a dispatch of its
@@ -875,13 +1026,29 @@ static void panel_fill_task(void *v, int tid, int nthreads) {
  * every width above eight tokens: 1.84x of the walk that ships at T=512). */
 #define QE_FLAT_TILE 3
 
+static void gemv_chunk_rows(gemv_chunk_job *j, long lo, long hi);
+
 static void gemv_chunk_task(void *v, int tid, int nthreads) {
     gemv_chunk_job *j = v;
     long n_rows = (long)j->t->ne[1];
     long lo, hi;
+    if (j->dyn > 0) {
+        for (;;) {
+            lo = __atomic_fetch_add(&j->next, j->dyn, __ATOMIC_RELAXED);
+            if (lo >= n_rows)
+                return;
+            hi = lo + j->dyn > n_rows ? n_rows : lo + j->dyn;
+            gemv_chunk_rows(j, lo, hi);
+        }
+    }
     qe_slice(n_rows, tid, nthreads, &lo, &hi);
     if (lo >= hi)
         return;
+    gemv_chunk_rows(j, lo, hi);
+}
+
+/* Rows [lo, hi) of one chunk walk: the body of gemv_chunk_task for one range. */
+static void gemv_chunk_rows(gemv_chunk_job *j, long lo, long hi) {
     if (j->ap) {
         /* One pointer per token row of the chunk, offset to this slice's first row: the
          * integer walk writes ys[u][r] for r in [0, n_rows) of the weight rows it was
@@ -911,6 +1078,17 @@ static void gemv_chunk_task(void *v, int tid, int nthreads) {
                 qe_type_info_of(j->type)->name, j->t->name);
         abort();
     }
+}
+
+/* The chunk size a multi-row walk hands out, in rows: about four per thread so a fast core
+ * can take a fifth while a slow one finishes, a multiple of 24 so the three-row flat tile and
+ * the eight-row walks keep whole groups, and none at all when `QE_DYN_KB` is 0. */
+static long chunk_dyn_rows(const qe_forward *f, long n_rows) {
+    if (!f->dyn_bytes || !f->chunk_dyn)
+        return 0;
+    long r = n_rows / (4L * f->n_threads);
+    r = (r / 24) * 24;
+    return r < 24 ? 24 : r;
 }
 
 /* Row t of a chunk buffer that is `stride` floats per row. */
@@ -951,7 +1129,9 @@ static void gemv_rows(qe_forward *f, const qe_tensor *t, const float *x, float *
                          NULL,
                          NULL,
                          NULL,
-                         wh ? ctype : t->type };
+                         wh ? ctype : t->type,
+                         chunk_dyn_rows(f, (long)t->ne[1]),
+                         0 };
     if (f->o.profile)
         f->walk_mac += (double)t->ne[0] * (double)t->ne[1] * (double)T;
     qe_pool_run(gemv_chunk_task, &j, f->n_threads);
@@ -1015,7 +1195,7 @@ static long flat_copy_for(const qe_forward *f, const qe_tensor *t) {
 }
 
 static long dq_copy_for(const qe_forward *f, const qe_tensor *t) {
-    if (!f->dq_i4 || !f->dq_woff || f->chunk_T != 1)
+    if (!f->dq_i4 || !f->dq_woff || f->chunk_T < 1 || f->chunk_T > f->dq_multi)
         return -1;
     if (t->owner && t->owner != f->m)
         return -1;
@@ -1077,15 +1257,25 @@ static void proj_item(qe_forward *f, const qe_tensor *t, const float *x, long xs
                       qe_pool_item *out) {
     /* The copy is only read with a recoded panel under it, so a tensor that is not
      * getting one gets the walk it has always got. */
-    const long fi = ap ? flat_copy_for(f, t) : -1;
+    const long di = dq_copy_for(f, t);
+    const long fi = (ap && di < 0) ? flat_copy_for(f, t) : -1;
+    const long nb = (long)t->ne[0] / 32;
     if (f->o.profile)
         f->walk_mac += (double)t->ne[0] * (double)t->ne[1] * (double)f->chunk_T;
-    *job = (gemv_chunk_job){ t,     qe_tensor_data(f->m, t), x,       y,
-                             (long)t->ne[0], tensor_row_bytes(t), tensor_ldd(t), xstride,
+    *job = (gemv_chunk_job){ t,
+                             di >= 0 ? (const void *)((const char *)f->dq_w + f->dq_woff[di])
+                                     : qe_tensor_data(f->m, t),
+                             x,       y,
+                             (long)t->ne[0],
+                             di >= 0 ? nb * (long)qe_type_info_of(QE_IQ4_NL)->block_sz
+                                     : tensor_row_bytes(t),
+                             di >= 0 ? nb : tensor_ldd(t), xstride,
                              ystride,        f->chunk_T,          ap,
                              fi >= 0 ? (const char *)f->flat_w + f->flat_woff[fi] : NULL,
                              fi >= 0 ? f->flat_s + f->flat_soff[fi] : NULL,
-                             t->type };
+                             di >= 0 ? QE_IQ4_NL : t->type,
+                             chunk_dyn_rows(f, (long)t->ne[1]),
+                             0 };
     out->fn = gemv_chunk_task;
     out->arg = job;
     out->nthreads = f->n_threads;
@@ -1255,6 +1445,104 @@ void qe_forward_set_decode_i4(qe_forward *f, int on) {
 
 int qe_forward_get_decode_i4(const qe_forward *f) {
     return f ? f->dq_i4 : 0;
+}
+
+/* QE_I4_MULTI=N: passes of up to N rows read the IQ4_NL dense copy too (1 = a lone
+ * token only, which is how the copy first shipped). */
+static int dq_multi_env(void) {
+    const char *e = getenv("QE_I4_MULTI");
+    int v = e && *e ? atoi(e) : QE_I4_MULTI_DEFAULT;
+    return v < 1 ? 1 : v > QE_CHUNK_MAX ? QE_CHUNK_MAX : v;
+}
+
+void qe_forward_set_multi_i4(qe_forward *f, int rows) {
+    if (f)
+        f->dq_multi = rows < 1 ? 1 : rows > QE_CHUNK_MAX ? QE_CHUNK_MAX : rows;
+}
+
+int qe_forward_get_multi_i4(const qe_forward *f) { return f ? f->dq_multi : 0; }
+
+static int stage_pf_env(void) {
+    const char *e = getenv("QE_STAGE_PF");
+    return e && *e ? atoi(e) : QE_STAGE_PF_DEFAULT;
+}
+
+void qe_forward_set_prefetch(qe_forward *f, int on) {
+    if (f)
+        f->stage_pf = on;
+}
+
+int qe_forward_get_prefetch(const qe_forward *f) { return f ? f->stage_pf : 0; }
+
+static int step_fuse_env(void) {
+    const char *e = getenv("QE_STEP_FUSE");
+    return e && *e ? atoi(e) : QE_STEP_FUSE_DEFAULT;
+}
+
+void qe_forward_set_step_fuse(qe_forward *f, int on) {
+    if (f)
+        f->step_fuse = on;
+}
+
+int qe_forward_get_step_fuse(const qe_forward *f) { return f ? f->step_fuse : 0; }
+
+static size_t dyn_env(void) {
+    const char *e = getenv("QE_DYN_KB");
+    long kb = e && *e ? atol(e) : QE_DYN_KB_DEFAULT;
+    return kb > 0 ? (size_t)kb * 1024u : 0;
+}
+
+void qe_forward_set_dyn_kb(qe_forward *f, long kb) {
+    if (f)
+        f->dyn_bytes = kb > 0 ? (size_t)kb * 1024u : 0;
+}
+
+long qe_forward_get_dyn_kb(const qe_forward *f) { return f ? (long)(f->dyn_bytes / 1024u) : 0; }
+
+void qe_forward_set_step_i8(qe_forward *f, int on) {
+    if (f)
+        f->step_i8 = on;
+}
+
+int qe_forward_get_step_i8(const qe_forward *f) { return f ? f->step_i8 : 0; }
+
+void qe_forward_set_chunk_dyn(qe_forward *f, int on) {
+    if (f)
+        f->chunk_dyn = on;
+}
+
+int qe_forward_get_chunk_dyn(const qe_forward *f) { return f ? f->chunk_dyn : 0; }
+
+void qe_forward_set_attn_batch(qe_forward *f, int on) {
+    if (f)
+        f->attn_batch = on && f->cqwork ? 1 : 0;
+}
+
+int qe_forward_get_attn_batch(const qe_forward *f) { return f ? f->attn_batch : 0; }
+
+void qe_forward_set_rows_par(qe_forward *f, int on) {
+    if (f)
+        f->rows_par = on;
+}
+
+int qe_forward_get_rows_par(const qe_forward *f) { return f ? f->rows_par : 0; }
+
+void qe_forward_set_delta_simd(qe_forward *f, int on) {
+    if (f)
+        f->delta_simd = on;
+}
+
+int qe_forward_get_delta_simd(const qe_forward *f) { return f ? f->delta_simd : 0; }
+
+void qe_forward_set_moe_dyn(qe_forward *f, int on) {
+    if (f)
+        for (int il = 0; il < f->n_layer; il++)
+            if (f->moe[il])
+                qe_moe_set_dyn(f->moe[il], on);
+}
+
+int qe_forward_get_moe_dyn(const qe_forward *f) {
+    return f && f->n_layer > 0 && f->moe[0] ? qe_moe_get_dyn(f->moe[0]) : 0;
 }
 
 /* Which classes of dense matrix are refused the smaller copy - the `qe_dense_class` of the
@@ -1470,14 +1758,27 @@ static void proj(qe_forward *f, const qe_tensor *t, const float *x, long xstride
         panel_job pj = { x, f->i8x, f->i8s, f->i8pseed, xstride, K, f->chunk_T };
         qe_pool_run(panel_fill_task, &pj, f->n_threads);
     }
-    const long fi = i8 ? flat_copy_for(f, t) : -1;
+    /* A pass of a few rows - a verify window, a batched step - is still a walk the bus
+     * pays for, so it reads the IQ4_NL copy a lone token reads when one was staged and
+     * `QE_I4_MULTI` says this width is narrow enough; the flat Q8_0 copy below is for
+     * the widths where the walk is arithmetic and fewer bytes buy nothing. */
+    const long di = dq_copy_for(f, t);
+    const long fi = (i8 && di < 0) ? flat_copy_for(f, t) : -1;
+    const long nb = K / 32;
     gemv_chunk_job j = { t,
-                         qe_tensor_data(f->m, t), x,       y,
-                         (long)t->ne[0], tensor_row_bytes(t), tensor_ldd(t), xstride,
+                         di >= 0 ? (const void *)((const char *)f->dq_w + f->dq_woff[di])
+                                 : qe_tensor_data(f->m, t),
+                         x,       y,
+                         (long)t->ne[0],
+                         di >= 0 ? nb * (long)qe_type_info_of(QE_IQ4_NL)->block_sz
+                                 : tensor_row_bytes(t),
+                         di >= 0 ? nb : tensor_ldd(t), xstride,
                          ystride,        f->chunk_T,          i8 ? &panel : NULL,
                          fi >= 0 ? (const char *)f->flat_w + f->flat_woff[fi] : NULL,
                          fi >= 0 ? f->flat_s + f->flat_soff[fi] : NULL,
-                         t->type };
+                         di >= 0 ? QE_IQ4_NL : t->type,
+                         chunk_dyn_rows(f, (long)t->ne[1]),
+                         0 };
     qe_pool_run(gemv_chunk_task, &j, f->n_threads);
 }
 
@@ -2355,6 +2656,20 @@ qe_forward *qe_forward_open(qe_model *m, const qe_forward_opts *opts, char *err,
     f->proj_i8 = proj_i8_env();
     f->flat_i8 = flat_i8_env();
     f->dq_i4 = dq_i4_env();
+    f->dq_multi = dq_multi_env();
+    f->stage_pf = stage_pf_env();
+    f->step_fuse = step_fuse_env();
+    f->dyn_bytes = dyn_env();
+    {
+        const char *e = getenv("QE_I8_STEP");
+        f->step_i8 = e && *e ? atoi(e) : QE_I8_STEP_DEFAULT;
+        e = getenv("QE_CHUNK_DYN");
+        f->chunk_dyn = e && *e ? atoi(e) : QE_CHUNK_DYN_DEFAULT;
+        e = getenv("QE_DELTA_SIMD");
+        f->delta_simd = e && *e ? atoi(e) : 1;
+        e = getenv("QE_ROWS_PAR");
+        f->rows_par = e && *e ? atoi(e) : 1;
+    }
     f->dq_tier = dq_tier_env();
     f->head_win = head_win_env();
     f->small_proj_batch = small_proj_env();
@@ -2891,6 +3206,33 @@ qe_forward *qe_forward_open(qe_model *m, const qe_forward_opts *opts, char *err,
         qe_forward_close(f);
         return NULL;
     }
+    {
+        /* The batched attention of a prompt chunk (qsa_core_chunk): optional, so a pass
+         * that cannot afford its scratch keeps the per-token form and says nothing. */
+        const char *e = getenv("QE_ATTN_BATCH");
+        f->attn_batch = e && *e ? atoi(e) : 1;
+        /* The gate is applied a head at a time, which is the whole row's sigmoid only when a
+         * head is whole vector blocks: the SIMD body and the scalar tail differ. */
+        if (f->head_dim > QE_MAX_HEAD_DIM || f->head_dim % 8)
+            f->attn_batch = 0;
+        const int nthr = f->n_threads > 0 ? f->n_threads : 1;
+        const int per = f->n_q_heads / f->n_kv_heads;
+        f->sel_cap = (long)f->idx_topk_blocks * f->kpool_ratio + f->kpool_ratio;
+        f->tbits_words = (long)((n_ctx / (size_t)f->kpool_ratio + 64) / 64);
+        const size_t gunits = (size_t)ATTN_GROUP * (size_t)attn_units_bound(nthr, f->n_kv_heads);
+        if (!(f->cqwork = scratch(f, E_cqwork, ROWS(f->head_dim * f->n_q_heads))) ||
+            !(f->csel = scratch(f, E_csel, (size_t)QE_CHUNK_MAX * (size_t)f->sel_cap * sizeof(int))) ||
+            !(f->tiscore = scratch(f, E_tiscore, (size_t)nthr * (size_t)(f->o.n_ctx / f->kpool_ratio + 1) * sizeof(float))) ||
+            !(f->theap = scratch(f, E_theap, (size_t)nthr * ((size_t)f->idx_topk_blocks + 1) * sizeof(float))) ||
+            !(f->theapb = scratch(f, E_theapb, (size_t)nthr * ((size_t)f->idx_topk_blocks + 1) * sizeof(int))) ||
+            !(f->tbits = scratch(f, E_tbits, (size_t)nthr * (size_t)f->tbits_words * sizeof(uint64_t))) ||
+            !(f->gpy = scratch(f, E_gpy, gunits * (size_t)per * (size_t)f->head_dim * sizeof(float))) ||
+            !(f->gpm = scratch(f, E_gpm, gunits * (size_t)per * sizeof(float))) ||
+            !(f->gpl = scratch(f, E_gpl, gunits * (size_t)per * sizeof(float)))) {
+            f->cqwork = NULL;
+            f->attn_batch = 0;
+        }
+    }
     use_row(f, 0);
 #undef ROWS
     /* Last, so that the memory it reads as free is memory a step will not need.
@@ -3299,11 +3641,146 @@ static void embed(qe_forward *f, long row) {
  * weights once a token, worth 663 MiB of the 5.4 GiB a decode step moves, and
  * nothing about it is a recurrence. What stays per token is the elementwise
  * between the two walks, which is a few thousand floats. */
+/* A prompt chunk's per-token work, a row at a time across the pool (ideas.md §7.33).
+ *
+ * Between the walks of a chunk sit loops that are a token's business alone - the mixers'
+ * grouped norms and gates, the injection into the residual streams and the magnitude bands
+ * the diagnostics keep, the gated-delta block's gates and causal convolution, the top-k of a
+ * router row. Run on the master they were 3.3 ms of a 15.9 ms ingested token while eighteen
+ * threads spun (`make decode --pp`'s serial and outside columns). Each row here is the same
+ * function on the same inputs it was in the loop, so every value comes out the same bytes; the
+ * one shared quantity, the diagnostics' running maxima and non-finite count, is kept per
+ * thread and folded after the dispatch, and a maximum and a count do not care about order. */
+#define ROWS_PAR_MIN 4
+typedef struct rows_job rows_job;
+struct rows_job {
+    qe_forward *f;
+    void (*fn)(rows_job *j, int t, int tid);
+    int T;
+    long next;
+    const void *a, *b, *c, *d;
+    float fa;
+    long l0;
+    unsigned flags;
+    struct {
+        float res, block;
+        long nonfinite;
+        char pad[52];
+    } acc[64];
+};
+
+static void rows_task(void *v, int tid, int nthreads) {
+    rows_job *j = v;
+    for (;;) {
+        const long t = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (t >= j->T)
+            return;
+        j->fn(j, (int)t, tid);
+    }
+}
+
+/* Runs fn over rows [0, T); folds the diagnostics when `diag` says the rows swept anything. */
+static void rows_run(qe_forward *f, rows_job *j, int diag) {
+    j->f = f;
+    j->next = 0;
+    const int nt = f->n_threads > 0 ? f->n_threads : 1;
+    if (diag)
+        for (int i = 0; i < nt && i < 64; i++) {
+            j->acc[i].res = f->d.max_abs_res;
+            j->acc[i].block = f->d.max_abs_block;
+            j->acc[i].nonfinite = 0;
+        }
+    if (!f->rows_par || j->T < ROWS_PAR_MIN || nt < 2 || nt > 64 || qe_pool_size() < 2)
+        for (int t = 0; t < j->T; t++)
+            j->fn(j, t, 0);
+    else
+        qe_pool_run(rows_task, j, nt);
+    if (diag)
+        for (int i = 0; i < nt && i < 64; i++) {
+            if (j->acc[i].res > f->d.max_abs_res)
+                f->d.max_abs_res = j->acc[i].res;
+            if (j->acc[i].block > f->d.max_abs_block)
+                f->d.max_abs_block = j->acc[i].block;
+            f->d.nonfinite += j->acc[i].nonfinite;
+        }
+}
+
+/* sweep(), against one thread's copy of the band. */
+static void sweep_row(rows_job *j, int tid, const float *v, long n, int block) {
+    float m = block ? j->acc[tid].block : j->acc[tid].res;
+    for (long i = 0; i < n; i++) {
+        const float a = fabsf(v[i]);
+        if (!(a < 1e30f)) {
+            j->acc[tid].nonfinite++;
+            return;
+        }
+        if (a > m)
+            m = a;
+    }
+    if (block)
+        j->acc[tid].block = m;
+    else
+        j->acc[tid].res = m;
+}
+
+/* The three per-token passes of chunk_impl between its stages. */
+static void row_sweep_cxn(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    sweep_row(j, tid, crow(f->cxn, f->K, t), f->K, 0);
+}
+
+/* A block's (flags & 1) or the experts' (flags & 2) output into the streams; flags & 4
+ * zeroes it first (an ablation), flags & 8 sweeps the residual afterwards. */
+static void row_inject(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    float *y = crow(f->cy, f->K, t);
+    float *res = f->cres + (size_t)t * (size_t)f->hc_dim;
+    const float *inj = f->cinj + (size_t)t * (size_t)f->HC;
+    if (j->flags & 4)
+        memset(y, 0, (size_t)f->K * sizeof(float));
+    sweep_row(j, tid, y, f->K, 1);
+    qe_stream_inject_add(res, y, inj, f->K, f->HC);
+    if (j->flags & 8)
+        sweep_row(j, tid, res, f->hc_dim, 0);
+}
+
+/* The mixer's three per-token loops. */
+static void row_mix_norm(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const int HCW = f->hc_dim;
+    const int t0 = (int)j->fa;
+    qe_rms_norm_grouped(crow(f->cres, HCW, t0 + t), (const float *)j->a, f->K,
+                        crow((float *)j->b, HCW, t), f->K, f->HC, f->eps);
+}
+
+static void row_mix_silu(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const int LR = f->low_rank;
+    const float q = 1.0f / (float)f->HC;
+    float *l = crow((float *)j->a, LR, t);
+    for (int i = 0; i < LR; i++)
+        l[i] *= q;
+    qe_silu(l, l, LR);
+}
+
+static void row_mix_gate(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const int HCW = f->hc_dim;
+    const int t0 = (int)j->fa;
+    const float q = 1.0f / (float)f->HC;
+    qe_stream_gate_mean(crow((float *)j->a, HCW, t), crow((float *)j->b, HCW, t),
+                        crow(f->cxn, f->K, t0 + t), f->K, f->HC);
+    if (j->flags & 1) {
+        float *ir = crow((float *)j->c, f->HC, t);
+        for (int s = 0; s < f->HC; s++)
+            ir[s] *= q;
+    }
+}
+
 static void hc_mixer_t(qe_forward *f, const qe_tensor *norm, const qe_tensor *down,
                        const qe_tensor *up, const qe_tensor *inj, int t0, int T,
                        int inject_on) {
     const int HCW = f->hc_dim, LR = f->low_rank;
-    const float q = 1.0f / (float)f->HC;
     const int rows = f->chunk_T;
     f->chunk_T = T;
 
@@ -3318,27 +3795,29 @@ static void hc_mixer_t(qe_forward *f, const qe_tensor *norm, const qe_tensor *do
 
     /* Grouped by stream: gamma_stride is the stream width, and one flat
      * reduction over the concatenation is a different network. */
-    for (int t = 0; t < T; t++)
-        qe_rms_norm_grouped(crow(f->cres, HCW, t0 + t), f32v(f, norm), f->K, crow(hn, HCW, t), f->K,
-                            f->HC, f->eps);
-    proj(f, down, hn, HCW, lo, LR);
-    if (inj)
-        proj(f, inj, hn, HCW, cinj, f->HC);
-    for (int t = 0; t < T; t++) {
-        float *l = crow(lo, LR, t);
-        for (int i = 0; i < LR; i++)
-            l[i] *= q;
-        qe_silu(l, l, LR);
+    {
+        rows_job rj = { .fn = row_mix_norm, .T = T, .a = f32v(f, norm), .b = hn, .fa = (float)t0 };
+        rows_run(f, &rj, 0);
+    }
+    if (inj && T == 1 && f->step_fuse) {
+        const qe_tensor *tt[2] = { down, inj };
+        const float *xx[2] = { hn, hn };
+        float *yy[2] = { lo, cinj };
+        gemv_group(f, 2, tt, xx, yy);
+    } else {
+        proj(f, down, hn, HCW, lo, LR);
+        if (inj)
+            proj(f, inj, hn, HCW, cinj, f->HC);
+    }
+    {
+        rows_job rj = { .fn = row_mix_silu, .T = T, .a = lo };
+        rows_run(f, &rj, 0);
     }
     proj(f, up, lo, LR, gate, HCW);
-    for (int t = 0; t < T; t++) {
-        qe_stream_gate_mean(crow(hn, HCW, t), crow(gate, HCW, t), crow(f->cxn, f->K, t0 + t), f->K,
-                            f->HC);
-        if (inject_on) {
-            float *ir = crow(cinj, f->HC, t);
-            for (int s = 0; s < f->HC; s++)
-                ir[s] *= q;
-        }
+    {
+        rows_job rj = { .fn = row_mix_gate, .T = T, .a = hn, .b = gate, .c = cinj,
+                        .fa = (float)t0, .flags = inject_on ? 1u : 0u };
+        rows_run(f, &rj, 0);
     }
     f->chunk_T = rows;
 }
@@ -3385,6 +3864,10 @@ typedef struct {
     int row0;
     float scale;
     long costep, ystep; /* a token's stride into co, and into y */
+    /* Units handed out from a cursor when `dyn` is set: a unit is DELTA_ROWS rows of one
+     * head's state, independent of every other, so which thread walks it moves nothing. */
+    int dyn;
+    long next;
 } delta_job;
 
 #define DELTA_ROWS 8
@@ -3406,6 +3889,98 @@ typedef struct {
  * (nk + qk) * hs with qk known only at runtime, so no declaration answers it.
  * Left unmarked: the check is the overlap test, and a marking that changed
  * nothing would only be a claim about this file. */
+/* The same unit of work - DELTA_ROWS rows of one head's state while a chunk's tokens go by -
+ * with the rows walked together rather than one after another (ideas.md §7.34). The scalar
+ * form is two dot products and an update per row per token, each one accumulation chain into a
+ * horizontal sum, so a core spends its time waiting on FMA latency: 85 M FMA an ingested
+ * token at a few per cent of the FP32 rate. Here the prediction of all eight rows is eight
+ * independent accumulators over the same k loads, folded by one transposing reduction; the
+ * update and read-out keep eight read-out accumulators in flight the same way. Same
+ * operations on the same values, summed in a different order: priced in nats, and the chunk
+ * and the step share it, so `make forward`'s identity legs between them hold. */
+static inline __m256 hsum8x8(__m256 a0, __m256 a1, __m256 a2, __m256 a3, __m256 a4, __m256 a5,
+                             __m256 a6, __m256 a7) {
+    const __m256 t0 = _mm256_hadd_ps(a0, a1), t1 = _mm256_hadd_ps(a2, a3);
+    const __m256 t2 = _mm256_hadd_ps(a4, a5), t3 = _mm256_hadd_ps(a6, a7);
+    const __m256 u0 = _mm256_hadd_ps(t0, t1), u1 = _mm256_hadd_ps(t2, t3);
+    return _mm256_add_ps(_mm256_permute2f128_ps(u0, u1, 0x20), _mm256_permute2f128_ps(u0, u1, 0x31));
+}
+
+static void delta_task_simd(void *vp, int tid, int nthreads) {
+    delta_job *j = vp;
+    const int hs = j->hs;
+    const long per_head = hs / DELTA_ROWS;
+    const long total = (long)j->nheads * per_head;
+    long lo, hi;
+    qe_slice(total, tid, nthreads, &lo, &hi);
+    if (j->dyn) {
+        lo = 0;
+        hi = total;
+    }
+    for (long c0 = lo; c0 < hi; c0++) {
+        long c = c0;
+        if (j->dyn) {
+            c = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+            if (c >= total)
+                break;
+        }
+        const int h = (int)(c / per_head);
+        const int r0 = (int)((c % per_head) * DELTA_ROWS);
+        const int qk = j->gva_mod ? h % j->nk : h / j->kdiv;
+        float *S = j->S + (size_t)h * (size_t)hs * (size_t)hs + (size_t)r0 * (size_t)hs;
+        for (int t = j->row0; t < j->row0 + j->T; t++) {
+            const float *cob = j->co + (long)t * j->costep;
+            const float *qh = cob + (size_t)qk * hs;
+            const float *kh = cob + (size_t)(j->nk + qk) * hs;
+            const float ea = j->gexp[(long)t * j->nheads + h];
+            const float be = j->beta[(long)t * j->nheads + h];
+            __m256 p0 = _mm256_setzero_ps(), p1 = p0, p2 = p0, p3 = p0, p4 = p0, p5 = p0, p6 = p0,
+                   p7 = p0;
+            for (int i = 0; i < hs; i += 8) {
+                const __m256 k = _mm256_loadu_ps(kh + i);
+                p0 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 0 * hs + i), k, p0);
+                p1 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 1 * hs + i), k, p1);
+                p2 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 2 * hs + i), k, p2);
+                p3 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 3 * hs + i), k, p3);
+                p4 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 4 * hs + i), k, p4);
+                p5 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 5 * hs + i), k, p5);
+                p6 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 6 * hs + i), k, p6);
+                p7 = _mm256_fmadd_ps(_mm256_loadu_ps(S + 7 * hs + i), k, p7);
+            }
+            const __m256 pred = hsum8x8(p0, p1, p2, p3, p4, p5, p6, p7);
+            const __m256 v = _mm256_loadu_ps(cob + (size_t)(2 * j->nk + h) * hs + r0);
+            const __m256 g = _mm256_set1_ps(ea);
+            float d[8];
+            _mm256_storeu_ps(d, _mm256_mul_ps(_mm256_sub_ps(v, _mm256_mul_ps(pred, g)),
+                                              _mm256_set1_ps(be)));
+            __m256 o0 = _mm256_setzero_ps(), o1 = o0, o2 = o0, o3 = o0, o4 = o0, o5 = o0, o6 = o0,
+                   o7 = o0;
+#define DELTA_ROW(r, o)                                                                           \
+    do {                                                                                          \
+        const __m256 s_ = _mm256_fmadd_ps(k, _mm256_set1_ps(d[r]),                                \
+                                          _mm256_mul_ps(_mm256_loadu_ps(S + (r) * hs + i), g));  \
+        _mm256_storeu_ps(S + (r) * hs + i, s_);                                                   \
+        o = _mm256_fmadd_ps(s_, q, o);                                                            \
+    } while (0)
+            for (int i = 0; i < hs; i += 8) {
+                const __m256 k = _mm256_loadu_ps(kh + i), q = _mm256_loadu_ps(qh + i);
+                DELTA_ROW(0, o0);
+                DELTA_ROW(1, o1);
+                DELTA_ROW(2, o2);
+                DELTA_ROW(3, o3);
+                DELTA_ROW(4, o4);
+                DELTA_ROW(5, o5);
+                DELTA_ROW(6, o6);
+                DELTA_ROW(7, o7);
+            }
+#undef DELTA_ROW
+            const __m256 out = _mm256_mul_ps(hsum8x8(o0, o1, o2, o3, o4, o5, o6, o7),
+                                             _mm256_set1_ps(j->scale));
+            _mm256_storeu_ps(j->y + (long)t * j->ystep + (size_t)h * hs + r0, out);
+        }
+    }
+}
+
 static void delta_task(void *vp, int tid, int nthreads) {
     delta_job *j = vp;
     const int hs = j->hs;
@@ -3413,7 +3988,17 @@ static void delta_task(void *vp, int tid, int nthreads) {
     const long total = (long)j->nheads * per_head;
     long lo, hi;
     qe_slice(total, tid, nthreads, &lo, &hi);
-    for (long c = lo; c < hi; c++) {
+    if (j->dyn) {
+        lo = 0;
+        hi = total;
+    }
+    for (long c0 = lo; c0 < hi; c0++) {
+        long c = c0;
+        if (j->dyn) {
+            c = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+            if (c >= total)
+                break;
+        }
         const int h = (int)(c / per_head);
         const int r0 = (int)((c % per_head) * DELTA_ROWS);
         /* Which of the 16 key heads a value head reads. einops writes the group
@@ -3459,6 +4044,13 @@ static void gdn_proj(qe_forward *f, const qe_layer *L) {
     const long C = f->gdn_channels, Z = (long)f->head_state * f->n_gdn_heads;
     const int nh = f->n_gdn_heads;
 
+    if (f->chunk_T == 1 && f->step_fuse) {
+        const qe_tensor *t[4] = { L->qkv, L->zgate, L->ssm_beta, L->ssm_alpha };
+        const float *x[4] = { f->cxn, f->cxn, f->cxn, f->cxn };
+        float *y[4] = { f->qkv, f->z, f->beta, f->alpha };
+        gemv_group(f, 4, t, x, y);
+        return;
+    }
     proj(f, L->qkv, f->cxn, f->K, f->qkv, C);
     proj(f, L->zgate, f->cxn, f->K, f->z, Z);
     proj(f, L->ssm_beta, f->cxn, f->K, f->beta, nh);
@@ -3486,6 +4078,71 @@ static void gdn_proj(qe_forward *f, const qe_layer *L) {
  * time, and a row of a window is row `t` of the chunk, not row 0: read at 0 it is
  * the first token's projections walked a second time, and every row past the first
  * never gets written at all. */
+/* One row of gdn_core_chunk's prologue: the gates, the causal convolution, the silu and
+ * the l2 norm, with the taps read from the chunk's own earlier rows where they are in it. */
+static void row_gdn_pre(rows_job *j, int ti, int tid) {
+    qe_forward *f = j->f;
+    const qe_layer *L = j->a;
+    const float *hist = j->b;
+    const int row0 = (int)j->fa, hist_rows = (int)j->flags;
+    const int t = row0 + ti;
+    const long C = f->gdn_channels;
+    const int hs = f->head_state, nh = f->n_gdn_heads, nk = f->n_gdn_kheads;
+    const int kh = f->gdn_kernel;
+    const float *sa = f32v(f, L->ssm_a), *dt = f32v(f, L->ssm_dt);
+    const float *w = f32v(f, L->conv);
+    const long pos = j->l0 + ti;
+    const float *qkv = crow(f->qkv, C, t);
+    float *alpha = crow(f->alpha, nh, t), *beta = crow(f->beta, nh, t);
+    float *co = crow(f->conv_out, C, t);
+    for (int h = 0; h < nh; h++)
+        alpha[h] += dt[h];
+    qe_sigmoid(beta, beta, nh);
+    qe_softplus(alpha, alpha, nh);
+    for (int h = 0; h < nh; h++)
+        alpha[h] *= sa[h];
+    float *gexp = crow(f->gexp, nh, t);
+    if (f->exp2_simd)
+        qe_exp2v(alpha, gexp, nh);
+    else
+        for (int h = 0; h < nh; h++)
+            gexp[h] = expf(alpha[h]);
+    /* tap i is the token hist_rows - i positions back */
+    const float *tap[QE_GDN_TAP_MAX];
+    for (int i = 0; i < hist_rows; i++) {
+        const int back = hist_rows - i;
+        tap[i] = ti - back >= 0 ? crow(f->qkv, C, t - back)
+                                : hist + (size_t)((pos + i) % hist_rows) * (size_t)C;
+    }
+    for (long c = 0; c < C; c++) {
+        const float *wc = w + (size_t)c * (size_t)kh;
+        float acc = wc[kh - 1] * qkv[c];
+        for (int i = 0; i < hist_rows; i++)
+            acc += wc[i] * tap[i][c];
+        co[c] = acc;
+    }
+    qe_silu(co, co, C);
+    if (f->o.variant & QE_VARIANT_L2NORM_ROOT)
+        qe_l2_norm_grouped_under(co, co, hs, 2 * nk, f->eps);
+    else
+        qe_l2_norm_grouped(co, co, hs, 2 * nk, f->eps);
+}
+
+static void row_gdn_post(rows_job *j, int ti, int tid) {
+    qe_forward *f = j->f;
+    const qe_layer *L = j->a;
+    const int t = (int)j->fa + ti;
+    const int hs = f->head_state, nh = f->n_gdn_heads;
+    const long Z = (long)hs * nh;
+    float *att_row = crow(f->att, Z, t);
+    float *att_norm = crow(f->att_norm, Z, t);
+    const float *z = crow(f->z, Z, t);
+    qe_rms_norm_grouped(att_row, f32v(f, L->ssm_norm), 0, att_norm, hs, nh, f->eps);
+    qe_sigmoid(z, att_row, (long)nh * hs);
+    for (long i = 0; i < (long)nh * hs; i++)
+        att_norm[i] *= att_row[i];
+}
+
 static void gdn_core_chunk(qe_forward *f, const qe_layer *L, int slot, int s, long pos0,
                            int row0, int T) {
     const long C = f->gdn_channels;
@@ -3499,6 +4156,20 @@ static void gdn_core_chunk(qe_forward *f, const qe_layer *L, int slot, int s, lo
     const float *w = f32v(f, L->conv); /* [channel][tap] */
     float *hist = f->gconv + (size_t)sub * (size_t)hist_rows * (size_t)C;
 
+    if (T >= ROWS_PAR_MIN && f->rows_par) {
+        /* Every row at once: a row's taps are the rows before it in this chunk, or the ring
+         * for the first `hist_rows` of them, and the ring is only written once all rows have
+         * read it - the same values in the same order as the loop below (§7.33). */
+        rows_job rj = { .fn = row_gdn_pre, .T = T, .a = L, .b = hist, .fa = (float)row0 };
+        rj.flags = (unsigned)hist_rows;
+        rj.l0 = pos0;
+        rows_run(f, &rj, 0);
+        for (int t = tend - hist_rows > row0 ? tend - hist_rows : row0; t < tend; t++) {
+            const long pos = pos0 + (t - row0);
+            memcpy(hist + (size_t)(pos % hist_rows) * (size_t)C, crow(f->qkv, C, t),
+                   (size_t)C * sizeof(float));
+        }
+    } else
     for (int t = row0; t < tend; t++) {
         const long pos = pos0 + (t - row0);
         const float *qkv = crow(f->qkv, C, t);
@@ -3573,21 +4244,17 @@ static void gdn_core_chunk(qe_forward *f, const qe_layer *L, int slot, int s, lo
                      .gva_mod = (f->o.variant & QE_VARIANT_GDN_GVA_MOD) != 0,
                      .scale = (f->o.variant & QE_VARIANT_GDN_NOSCALE) ? 1.0f : f->gdn_scale,
                      .costep = C,
-                     .ystep = Z };
-    qe_pool_run(delta_task, &dj, f->n_threads);
+                     .ystep = Z,
+                     .dyn = f->dyn_bytes > 0 };
+    qe_pool_run(f->delta_simd && dj.hs % 8 == 0 ? delta_task_simd : delta_task, &dj, f->n_threads);
 
     /* One gamma shared by the 48 heads (gamma_stride 0), and the output gate is a
      * sigmoid, not the silu Qwen3.5's GDN uses - the one numeric difference the
      * file's architecture notes call out. Neither of these touches state, so both
      * run after the walk, one row of the chunk at a time. */
-    for (int t = row0; t < tend; t++) {
-        float *att_row = crow(f->att, Z, t);
-        float *att_norm = crow(f->att_norm, Z, t);
-        const float *z = crow(f->z, Z, t);
-        qe_rms_norm_grouped(att_row, f32v(f, L->ssm_norm), 0, att_norm, hs, nh, f->eps);
-        qe_sigmoid(z, att_row, (long)nh * hs);
-        for (long i = 0; i < (long)nh * hs; i++)
-            att_norm[i] *= att_row[i];
+    {
+        rows_job rj = { .fn = row_gdn_post, .T = T, .a = L, .fa = (float)row0 };
+        rows_run(f, &rj, 0);
     }
 }
 
@@ -3740,29 +4407,34 @@ static void attn_task(void *vp, int tid, int nthreads) {
  * is a reassociation of an exp-weighted sum and is therefore answered by the nll
  * gate rather than by a claim of bit-identity. The bitmap is consumed here, so a
  * token's selection leaves nothing behind for the next one. */
-static int sel_ascending(qe_forward *f, const int *blocks, long nblocks, long cur, int ratio,
-                         long pos) {
+static int sel_ascending_to(uint64_t *sel_bits, int *sel, const int *blocks, long nblocks,
+                            long cur, int ratio, long pos) {
     for (long i = 0; i < nblocks; i++) {
         const long b = blocks[i];
-        f->sel_bits[b >> 6] |= 1ull << (b & 63);
+        sel_bits[b >> 6] |= 1ull << (b & 63);
     }
     int nsel = 0;
     const long words = cur > 0 ? (cur + 63) / 64 : 0;
     for (long w = 0; w < words; w++) {
-        uint64_t bits = f->sel_bits[w];
-        f->sel_bits[w] = 0;
+        uint64_t bits = sel_bits[w];
+        sel_bits[w] = 0;
         while (bits) {
             const long b = 64 * w + __builtin_ctzll(bits);
             bits &= bits - 1;
             for (int r = 0; r < ratio; r++)
-                f->sel[nsel++] = (int)(b * ratio + r);
+                sel[nsel++] = (int)(b * ratio + r);
         }
     }
     /* The query's own partial block is always attended, and it is the highest
      * address of the lot, so appending it keeps the walk ascending. */
     for (long c = cur * ratio; c <= pos; c++)
-        f->sel[nsel++] = (int)c;
+        sel[nsel++] = (int)c;
     return nsel;
+}
+
+static int sel_ascending(qe_forward *f, const int *blocks, long nblocks, long cur, int ratio,
+                         long pos) {
+    return sel_ascending_to(f->sel_bits, f->sel, blocks, nblocks, cur, ratio, pos);
 }
 
 /* The fused walk, chunked over the selection so that a KV group's one pass does
@@ -3785,13 +4457,15 @@ typedef struct {
     int q8;
     int exp2; /* QE_EXP2_SIMD, carried to every unit of the walk */
     float scale;
+    long next; /* units handed out from a cursor: a unit is one walk, so any thread may take it */
 } attnf_job;
 
 static void attnf_task(void *vp, int tid, int nthreads) {
     attnf_job *j = vp;
-    long lo, hi;
-    qe_slice(j->units, tid, nthreads, &lo, &hi);
-    for (int u = (int)lo; u < (int)hi; u++) {
+    for (;;) {
+        const int u = (int)__atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (u >= j->units)
+            return;
         const int g = u / j->nchunks, c = u % j->nchunks;
         const long first = (long)c * j->chunk;
         const long left = (long)j->nsel - first;
@@ -3837,6 +4511,13 @@ static void qsa_proj(qe_forward *f, const qe_layer *L) {
     const int krow = (int)f->kv_row, id = f->idx_dim, nih = f->n_idx_heads;
     const long qrow = 2 * (long)f->head_dim * f->n_q_heads;
 
+    if (f->chunk_T == 1 && f->step_fuse) {
+        const qe_tensor *t[5] = { L->aq, L->ixq, L->ak, L->av, L->ixk };
+        const float *x[5] = { f->cxn, f->cxn, f->cxn, f->cxn, f->cxn };
+        float *y[5] = { f->qg, f->iq, f->kcur, f->vcur, f->ikraw };
+        gemv_group(f, 5, t, x, y);
+        return;
+    }
     proj(f, L->ixk, f->cxn, f->K, f->ikraw, id);
     proj(f, L->ixq, f->cxn, f->K, f->iq, (long)id * nih);
     proj(f, L->aq, f->cxn, f->K, f->qg, qrow);
@@ -3863,6 +4544,8 @@ typedef struct {
     long cur;
     float scale;
     int id, nih;
+    long next; /* blocks handed out from a cursor, in runs of `run` */
+    long run;
 } idx_job;
 
 static void idx_score_rows(const idx_job *j, long lo, long hi) {
@@ -3878,11 +4561,24 @@ static void idx_score_rows(const idx_job *j, long lo, long hi) {
     }
 }
 
+/* Blocks handed out from a cursor rather than one fixed slice a thread: a score is a
+ * function of its block alone, so who computed it moves nothing, and the slowest core of
+ * the two kinds stops being the length of the dispatch (ideas.md §7.30). */
 static void idx_score_task(void *vp, int tid, int nthreads) {
     idx_job *j = vp;
-    long lo, hi;
-    qe_slice(j->cur, tid, nthreads, &lo, &hi);
-    idx_score_rows(j, lo, hi);
+    long run = j->run;
+    if (run <= 0) {
+        long lo, hi;
+        qe_slice(j->cur, tid, nthreads, &lo, &hi);
+        idx_score_rows(j, lo, hi);
+        return;
+    }
+    for (;;) {
+        const long lo = __atomic_fetch_add(&j->next, run, __ATOMIC_RELAXED);
+        if (lo >= j->cur)
+            return;
+        idx_score_rows(j, lo, lo + run > j->cur ? j->cur : lo + run);
+    }
 }
 
 /* Sixty-four blocks is sixty-four sets of four 128-value dots, which is the same
@@ -3947,7 +4643,10 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
                    .cur = cur,
                    .scale = f->idx_scale,
                    .id = id,
-                   .nih = nih };
+                   .nih = nih,
+                   .run = f->dyn_bytes ? (cur / (4L * f->n_threads) < 16 ? 16
+                                                                       : cur / (4L * f->n_threads))
+                                       : 0 };
     if (cur >= QE_IDX_PAR_MIN)
         qe_pool_run(idx_score_task, &ij, f->n_threads);
     else
@@ -4070,6 +4769,283 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
     qe_sigmoid(f->qgate, f->qgate, (long)nqh * hd);
     for (long i = 0; i < (long)nqh * hd; i++)
         attn_y[i] *= f->qgate[i];
+}
+
+/* How a token's selection is cut into chunks for the fused walk: the per-token path's
+ * own rule, kept in one place because a chunk that cut it differently would combine its
+ * softmax partials in a different order and stop being the same bytes as a step. */
+static void attn_chunking(const qe_forward *f, int nsel, int *chunk_out, int *nchunks_out) {
+    const int nthr = f->n_threads > 0 ? f->n_threads : 1;
+    int nchunks = nthr / f->n_kv_heads;
+    const int most = (nsel + QE_ATTN_CELL_MIN - 1) / QE_ATTN_CELL_MIN;
+    if (nchunks > most)
+        nchunks = most;
+    if (nchunks < 1)
+        nchunks = 1;
+    int chunk = (nsel + nchunks - 1) / nchunks;
+    if (chunk < 1)
+        chunk = 1;
+    *chunk_out = chunk;
+    *nchunks_out = (nsel + chunk - 1) / chunk;
+}
+
+/* A prompt chunk's attention, all of its tokens at once (ideas.md §7.31).
+ *
+ * The per-token form asks the pool three times a token - the indexer's scores, the
+ * fused walk, the combine - and a token's attention at a few thousand cells of context
+ * is too little work to share nineteen ways: at 4096 tokens of context the block stage
+ * of an ingested token was 5.7 ms, 2.3 of it nineteen threads waiting for the slowest
+ * and 1.0 the master's top-k while they spun. Every token of a chunk reads a cache that
+ * the tokens before it in the chunk have already written, so once the cheap per-token
+ * prologue has run for all of them - the cache writes, the pooled indexer keys, the
+ * normed and rotated queries - the rest is T independent problems, and the pool can be
+ * handed all of them at once.
+ *
+ * Nothing about a token's arithmetic moves. Its indexer scores, its top-k and its
+ * selection are the same functions on the same inputs; its walk is cut into chunks by
+ * the same rule (`attn_chunking`), each chunk is the same `qe_attn_walk`, and the
+ * combine folds the same partials in the same order. Only who ran it and when changes,
+ * which is why `make forward`'s chunk-against-step identity legs still hold byte for
+ * byte. */
+typedef struct {
+    qe_forward *f;
+    const float *kpoolc;
+    long pos0;
+    int T, id, nih, ratio;
+    int nsel[QE_CHUNK_MAX];
+    long next;
+} csel_job;
+
+static void csel_task(void *vp, int tid, int nthreads) {
+    csel_job *j = vp;
+    qe_forward *f = j->f;
+    float *isc = f->tiscore + (size_t)tid * (size_t)(f->o.n_ctx / f->kpool_ratio + 1);
+    float *hs = f->theap + (size_t)tid * (size_t)(f->idx_topk_blocks + 1);
+    int *hb = f->theapb + (size_t)tid * (size_t)(f->idx_topk_blocks + 1);
+    int *blocks = hb; /* top_blocks writes its answer over its own heap, as the step does */
+    uint64_t *bits = f->tbits + (size_t)tid * (size_t)f->tbits_words;
+    for (;;) {
+        const long t = __atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (t >= j->T)
+            return;
+        const long pos = j->pos0 + t;
+        const long cur = pos / j->ratio;
+        idx_job ij = { .iq = crow(f->iq, (long)j->id * j->nih, (int)t),
+                       .pool = j->kpoolc,
+                       .iscore = isc,
+                       .cur = cur,
+                       .scale = f->idx_scale,
+                       .id = j->id,
+                       .nih = j->nih };
+        idx_score_rows(&ij, 0, cur);
+        long nblocks;
+        int *bl = blocks;
+        if (cur <= f->idx_topk_blocks) {
+            nblocks = cur;
+            for (long b = 0; b < cur; b++)
+                bl[b] = (int)b;
+        } else {
+            nblocks = top_blocks(isc, cur, f->idx_topk_blocks, bl, hs, hb);
+        }
+        j->nsel[t] = sel_ascending_to(bits, f->csel + (size_t)t * (size_t)f->sel_cap, bl,
+                                      nblocks, cur, j->ratio, pos);
+    }
+}
+
+typedef struct {
+    qe_forward *f;
+    const float *kc, *vc;
+    const int8_t *kqd, *vqd;
+    const float *kqs, *vqs;
+    int t0, nt;            /* the tokens of this group */
+    int uoff[ATTN_GROUP + 1]; /* first unit of each token of the group */
+    int chunk[ATTN_GROUP], nchunks[ATTN_GROUP];
+    const int *nsel;
+    int units;
+    long next, next2;
+} cattn_job;
+
+static void cattn_walk_task(void *vp, int tid, int nthreads) {
+    cattn_job *j = vp;
+    qe_forward *f = j->f;
+    const int per = f->n_q_heads / f->n_kv_heads, hd = f->head_dim;
+    for (;;) {
+        const int u = (int)__atomic_fetch_add(&j->next, 1, __ATOMIC_RELAXED);
+        if (u >= j->units)
+            return;
+        int i = 0;
+        while (j->uoff[i + 1] <= u)
+            i++;
+        const int t = j->t0 + i, lu = u - j->uoff[i];
+        const int g = lu / j->nchunks[i], c = lu % j->nchunks[i];
+        const long first = (long)c * j->chunk[i];
+        const long left = (long)j->nsel[t] - first;
+        qe_attn_unit au = { .q = f->cqwork + (size_t)t * (size_t)hd * f->n_q_heads +
+                                 (size_t)g * per * hd,
+                            .kd = j->kqd, .vd = j->vqd, .kc = j->kc, .vc = j->vc,
+                            .ks = j->kqs, .vs = j->vqs,
+                            .sel = f->csel + (size_t)t * (size_t)f->sel_cap + first,
+                            .y = f->gpy + (size_t)u * per * hd,
+                            .m = f->gpm + (size_t)u * per,
+                            .l = f->gpl + (size_t)u * per,
+                            .nsel = (int)(left < j->chunk[i] ? left : j->chunk[i]),
+                            .per = per, .hd = hd, .krow = (int)f->kv_row,
+                            .kv_head = g, .sstride = f->n_kv_heads, .q8 = j->kqd ? 1 : 0,
+                            .exp2 = f->exp2_simd,
+                            .scale = f->attn_scale };
+        qe_attn_walk(&au);
+    }
+}
+
+static void cattn_comb_task(void *vp, int tid, int nthreads) {
+    cattn_job *j = vp;
+    qe_forward *f = j->f;
+    const int nqh = f->n_q_heads, per = nqh / f->n_kv_heads, hd = f->head_dim;
+    const long total = (long)j->nt * nqh;
+    for (;;) {
+        const long w = __atomic_fetch_add(&j->next2, 1, __ATOMIC_RELAXED);
+        if (w >= total)
+            return;
+        const int i = (int)(w / nqh), h = (int)(w % nqh);
+        const int t = j->t0 + i;
+        const int g = h / per, hl = h % per;
+        const long base = (long)j->uoff[i] * per + (long)g * j->nchunks[i] * per;
+        float *y = crow(f->attn_y, (long)hd * nqh, t) + (size_t)h * hd;
+        qe_attn_combine(f->gpy + (base + hl) * hd, (long)per * hd, f->gpm + base + hl,
+                        f->gpl + base + hl, per, j->nchunks[i], hd, y);
+        /* The gate, which the per-token form applies over the whole row afterwards: the
+         * same sigmoid of the same values, one head's slice at a time. */
+        const float *qg = crow(f->qg, 2 * (long)hd * nqh, t) + (size_t)h * 2 * hd + hd;
+        float gt[QE_MAX_HEAD_DIM];
+        qe_sigmoid(qg, gt, hd);
+        for (int k = 0; k < hd; k++)
+            y[k] *= gt[k];
+    }
+}
+
+typedef struct {
+    const qe_layer *L;
+    long pos0, b0;
+    float *krawc, *kpoolc, *kc, *vc, *kvs;
+    int8_t *kvd;
+    size_t NC;
+} qsa_pre_ctx;
+
+static void row_qsa_pre(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const qsa_pre_ctx *px = j->a;
+    const qe_layer *L = px->L;
+    const int hd = f->head_dim, nqh = f->n_q_heads, nkvh = f->n_kv_heads;
+    const int krow = (int)f->kv_row, id = f->idx_dim, nih = f->n_idx_heads;
+    const int rd = f->n_rope < hd ? f->n_rope : hd;
+    const long pos = px->pos0 + t;
+    float cs[QE_MAX_ROPE];
+    float *ikraw = crow(f->ikraw, id, t), *iq = crow(f->iq, (long)id * nih, t);
+    const float *qg = crow(f->qg, 2 * (long)hd * nqh, t);
+    float *kcur = crow(f->kcur, krow, t), *vcur = crow(f->vcur, krow, t);
+    float *qw = f->cqwork + (size_t)t * (size_t)hd * nqh;
+    memcpy(px->krawc + (size_t)pos * (size_t)id, ikraw, (size_t)id * sizeof(float));
+    qe_rms_norm_grouped(iq, f32v(f, L->ixqn), 0, iq, id, nih, f->eps);
+    qe_rope_init(cs, rd, pos, f->theta);
+    qe_rope_apply(iq, nih, id, rd, cs);
+    for (int h = 0; h < nqh; h++)
+        memcpy(qw + (size_t)h * hd, qg + (size_t)h * 2 * hd, (size_t)hd * sizeof(float));
+    qe_rms_norm_grouped(qw, f32v(f, L->aqn), 0, qw, hd, nqh, f->eps);
+    qe_rope_apply(qw, nqh, hd, rd, cs);
+    qe_rms_norm_grouped(kcur, f32v(f, L->akn), 0, kcur, hd, nkvh, f->eps);
+    qe_rope_apply(kcur, nkvh, hd, rd, cs);
+    if (px->kvd) {
+        const size_t NC = px->NC;
+        float *ksc = px->kvs + (size_t)pos * (size_t)nkvh;
+        float *vsc = px->kvs + (NC + (size_t)pos) * (size_t)nkvh;
+        int8_t *kd = px->kvd + (size_t)pos * (size_t)krow;
+        int8_t *vd = px->kvd + (NC + (size_t)pos) * (size_t)krow;
+        for (int g = 0; g < nkvh; g++) {
+            qe_quant_q8_row(kcur + (size_t)g * hd, kd + (size_t)g * hd, ksc + g, hd);
+            qe_quant_q8_row(vcur + (size_t)g * hd, vd + (size_t)g * hd, vsc + g, hd);
+        }
+    } else {
+        memcpy(px->kc + (size_t)pos * (size_t)krow, kcur, (size_t)krow * sizeof(float));
+        memcpy(px->vc + (size_t)pos * (size_t)krow, vcur, (size_t)krow * sizeof(float));
+    }
+}
+
+/* One pooled index key: the mean of a block's raw keys, normed and rotated by its first
+ * cell's angle, written where the per-token form wrote it - in place rather than through a
+ * shared scratch row, the same operations on the same values. */
+static void row_qsa_pool(rows_job *j, int i, int tid) {
+    qe_forward *f = j->f;
+    const qsa_pre_ctx *px = j->a;
+    const int id = f->idx_dim, ratio = f->kpool_ratio, hd = f->head_dim;
+    const int rd = f->n_rope < hd ? f->n_rope : hd;
+    const long b = px->b0 + i;
+    float *dst = px->kpoolc + (size_t)b * (size_t)id;
+    float cs2[QE_MAX_ROPE];
+    for (int c = 0; c < id; c++) {
+        float acc = 0.0f;
+        for (int r = 0; r < ratio; r++)
+            acc += px->krawc[((size_t)b * (size_t)ratio + (size_t)r) * (size_t)id + (size_t)c];
+        dst[c] = acc / (float)ratio;
+    }
+    qe_rms_norm_grouped(dst, f32v(f, px->L->ixkn), 0, dst, id, 1, f->eps);
+    qe_rope_init(cs2, rd, b * ratio, f->theta);
+    qe_rope_apply(dst, 1, id, rd, cs2);
+}
+
+static void qsa_core_chunk(qe_forward *f, const qe_layer *L, int slot, long pos0, int T) {
+    const int nkvh = f->n_kv_heads;
+    const int krow = (int)f->kv_row, id = f->idx_dim, nih = f->n_idx_heads;
+    const int ratio = f->kpool_ratio;
+    const long sub = qsa_sub(f, slot, 0);
+    const size_t NC = f->seq_stride;
+    float *kvc = f->kv ? f->kv + (size_t)sub * 2 * NC * (size_t)krow : NULL;
+    float *kc = kvc, *vc = kvc ? kvc + NC * (size_t)krow : NULL;
+    int8_t *kvd = f->kvd ? f->kvd + (size_t)sub * 2 * NC * (size_t)krow : NULL;
+    float *kvs = f->kvs ? f->kvs + (size_t)sub * 2 * NC * (size_t)nkvh : NULL;
+    float *krawc = f->kraw + (size_t)sub * NC * (size_t)id;
+    float *kpoolc = f->kpool + (size_t)sub * (NC / ratio + 1) * (size_t)id;
+
+    /* The prologue: every token's cache writes, norms and rotations, then the pooled index
+     * key of every block of `ratio` cells this chunk completes - the per-token form ran both
+     * in position order on the master; the second only reads the first's raw keys (§7.33). */
+    qsa_pre_ctx px = { .L = L, .pos0 = pos0, .krawc = krawc, .kpoolc = kpoolc, .kc = kc,
+                       .vc = vc, .kvd = kvd, .kvs = kvs, .NC = NC };
+    {
+        rows_job rj = { .fn = row_qsa_pre, .T = T, .a = &px };
+        rows_run(f, &rj, 0);
+    }
+    {
+        /* blocks whose last cell is in this chunk */
+        const long b_first = (pos0 + ratio) / ratio - 1, b_last = (pos0 + T) / ratio - 1;
+        if (b_last >= b_first) {
+            px.b0 = b_first;
+            rows_job rj = { .fn = row_qsa_pool, .T = (int)(b_last - b_first + 1), .a = &px };
+            rows_run(f, &rj, 0);
+        }
+    }
+    /* Every token's selection, one dispatch. */
+    static csel_job cj; /* 2 KiB of counts: the pass is one per process, as is this */
+    cj = (csel_job){ .f = f, .kpoolc = kpoolc, .pos0 = pos0, .T = T, .id = id, .nih = nih,
+                     .ratio = ratio };
+    qe_pool_run(csel_task, &cj, f->n_threads);
+
+    /* The walks and the combine, a group of tokens at a time so the partials stay small. */
+    for (int t0 = 0; t0 < T; t0 += ATTN_GROUP) {
+        cattn_job aj = { .f = f, .kc = kc, .vc = vc, .kqd = kvd,
+                         .vqd = kvd ? kvd + NC * (size_t)krow : NULL, .kqs = kvs,
+                         .vqs = kvs ? kvs + NC * (size_t)nkvh : NULL, .t0 = t0,
+                         .nt = T - t0 < ATTN_GROUP ? T - t0 : ATTN_GROUP, .nsel = cj.nsel };
+        int u = 0;
+        for (int i = 0; i < aj.nt; i++) {
+            aj.uoff[i] = u;
+            attn_chunking(f, cj.nsel[t0 + i], &aj.chunk[i], &aj.nchunks[i]);
+            u += aj.nchunks[i] * nkvh;
+        }
+        aj.uoff[aj.nt] = u;
+        aj.units = u;
+        qe_pool_run(cattn_walk_task, &aj, f->n_threads);
+        qe_pool_run(cattn_comb_task, &aj, f->n_threads);
+    }
 }
 
 static void qsa_out(qe_forward *f, const qe_layer *L) {
@@ -4210,7 +5186,52 @@ static void ple_block(qe_forward *f, const qe_layer *L, int sq, long pos) {
         f->res[i] += f->pgated[i] + f->pconv[i];
 }
 
+/* A decode step's expert stage in two dispatches instead of seven (ideas.md §7.30).
+ *
+ * The router and the shared expert's gate and up all read the block's mixer output and
+ * nothing else, so they are one dispatch. The top-k and the f32 refine are the master's,
+ * as they always were. Then the routed experts go through the grouped pass with one row -
+ * which is where the one-token int8 walk of §7.22 lives, and which a step never reached
+ * because a step took `qe_moe_layer`'s float walk - beside the shared expert's down
+ * projection, which needs nothing the routed half makes. */
+static void moe_block_step(qe_forward *f, int il, const qe_layer *L, float *out) {
+    qe_moe *m = f->moe[il];
+    gemv_job gj, uj, dj;
+    qe_pool_item it[6];
+    int n = 0;
+    qe_moe_step_router_item(m, f->xn, &it[n++]);
+    int ns = 0;
+    gemv_job_for(f, L->sh_gate, f->xn, f->e640, 0, 0, 1, &gj);
+    step_attach(f, &gj, &ns);
+    it[n++] = (qe_pool_item){ gemv_task, &gj, f->walk_threads, 0 };
+    gemv_job_for(f, L->sh_up, f->xn, f->u640, 0, 0, 1, &uj);
+    step_attach(f, &uj, &ns);
+    it[n++] = (qe_pool_item){ gemv_task, &uj, f->walk_threads, 0 };
+    qe_pool_run_items(it, n);
+    const int rc = qe_moe_step_begin(m, f->xn, f->routes, out);
+    qe_silu_mul(f->e640, f->e640, f->u640, f->n_ff_shexp);
+    gemv_job_for(f, L->sh_down, f->e640, f->sh_out, 0, 0, 1, &dj);
+    ns = 0;
+    step_attach(f, &dj, &ns);
+    n = 0;
+    for (int i = 0; i < rc; i++)
+        qe_moe_step_item(m, i, &it[n++]);
+    it[n++] = (qe_pool_item){ gemv_task, &dj, f->walk_threads, 0 };
+    qe_pool_run_items(it, n);
+    if (f->o.profile)
+        f->walk_mac += (double)L->sh_gate->ne[0] * (double)L->sh_gate->ne[1] +
+                       (double)L->sh_up->ne[0] * (double)L->sh_up->ne[1] +
+                       (double)L->sh_down->ne[0] * (double)L->sh_down->ne[1];
+    float g = qe_dot(f32v(f, L->sh_inp), f->xn, f->K);
+    qe_sigmoid(&g, &g, 1);
+    qe_axpy(out, f->sh_out, g, f->K);
+}
+
 static void moe_block(qe_forward *f, int il, const qe_layer *L, float *out) {
+    if (f->chunk_T == 1 && f->step_fuse) {
+        moe_block_step(f, il, L, out);
+        return;
+    }
     qe_moe_layer(f->moe[il], f->xn, out, f->routes, NULL);
     gemv(f, L->sh_gate, f->xn, f->e640);
     gemv(f, L->sh_up, f->xn, f->u640);
@@ -4221,6 +5242,34 @@ static void moe_block(qe_forward *f, int il, const qe_layer *L, float *out) {
     float g = qe_dot(f32v(f, L->sh_inp), f->xn, f->K);
     qe_sigmoid(&g, &g, 1);
     qe_axpy(out, f->sh_out, g, f->K);
+}
+
+/* The expert stage's per-row loops (§7.33): a row's top-k, the shared expert's silu, and
+ * the shared expert's sigmoid-gated add into the routed output. */
+static void row_moe_select(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    qe_moe *m = (qe_moe *)j->a;
+    const int topk = f->n_experts_active;
+    qe_route *r = f->croutes + (size_t)t * (size_t)topk;
+    int n = qe_moe_select(m, f->cmoe_logit + (size_t)t * (size_t)f->n_experts, r);
+    for (int i = n; i < topk; i++)
+        r[i].expert = -1;
+}
+
+static void row_shared_silu(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const long ns = f->n_ff_shexp;
+    float *g = f->e640 + (size_t)t * (size_t)ns;
+    qe_silu_mul(g, g, f->u640 + (size_t)t * (size_t)ns, ns);
+}
+
+static void row_shared_add(rows_job *j, int t, int tid) {
+    qe_forward *f = j->f;
+    const qe_layer *L = j->a;
+    const float *xn = f->cxn + (size_t)t * (size_t)f->K;
+    float g = qe_dot(f32v(f, L->sh_inp), xn, f->K);
+    qe_sigmoid(&g, &g, 1);
+    qe_axpy(f->cy + (size_t)t * (size_t)f->K, f->sh_out + (size_t)t * (size_t)f->K, g, f->K);
 }
 
 /* The expert stage of a chunk as one dispatch of a stage graph: the grouped routed
@@ -4335,11 +5384,9 @@ static int moe_stage_graph(qe_forward *f, int il, const qe_layer *L, int T) {
     qe_pool_run_items(it, n);
     /* The mixer's scalar for each row, reading the residual as the plain stage does
      * and adding the shared expert's output into the routed one. */
-    for (int t = 0; t < T; t++) {
-        use_row(f, t);
-        float g = qe_dot(f32v(f, L->sh_inp), f->xn, f->K);
-        qe_sigmoid(&g, &g, 1);
-        qe_axpy(crow(f->cy, f->K, t), crow(f->sh_out, f->K, t), g, f->K);
+    {
+        rows_job rj = { .fn = row_shared_add, .T = T, .a = L };
+        rows_run(f, &rj, 0);
     }
     return 1;
 }
@@ -4369,11 +5416,9 @@ static void moe_block_chunk(qe_forward *f, int il, const qe_layer *L, int T) {
      * cheapest saving in the block; the selection stays per row because a top-k
      * is one token's business. */
     qe_moe_router_multi(f->moe[il], f->cxn, f->K, f->cmoe_logit, f->n_experts, T);
-    for (int t = 0; t < T; t++) {
-        qe_route *r = f->croutes + (size_t)t * (size_t)topk;
-        int n = qe_moe_select(f->moe[il], f->cmoe_logit + (size_t)t * (size_t)f->n_experts, r);
-        for (int i = n; i < topk; i++)
-            r[i].expert = -1;
+    {
+        rows_job rj = { .fn = row_moe_select, .T = T, .a = f->moe[il] };
+        rows_run(f, &rj, 0);
     }
     /* And the f32 weights behind those picks, one dispatch for the chunk's rows:
      * a row's ten dots are a few microseconds and 512 rows of them are a
@@ -4407,27 +5452,29 @@ static void moe_block_chunk(qe_forward *f, int il, const qe_layer *L, int T) {
     const long ns = f->n_ff_shexp;
     proj(f, L->sh_gate, f->cxn, f->K, f->e640, ns);
     proj(f, L->sh_up, f->cxn, f->K, f->u640, ns);
-    for (int t = 0; t < T; t++) {
-        float *g = f->e640 + (size_t)t * (size_t)ns;
-        qe_silu_mul(g, g, f->u640 + (size_t)t * (size_t)ns, ns);
+    {
+        rows_job rj = { .fn = row_shared_silu, .T = T };
+        rows_run(f, &rj, 0);
     }
     proj(f, L->sh_down, f->e640, ns, f->sh_out, f->K);
-    for (int t = 0; t < T; t++) {
-        use_row(f, t);
-        float g = qe_dot(f32v(f, L->sh_inp), f->xn, f->K);
-        qe_sigmoid(&g, &g, 1);
-        qe_axpy(f->cy + (size_t)t * (size_t)f->K, f->sh_out + (size_t)t * (size_t)f->K, g,
-                f->K);
+    {
+        rows_job rj = { .fn = row_shared_add, .T = T, .a = L };
+        rows_run(f, &rj, 0);
     }
 }
 
 /* Stage timing is opt-in: 240 clock reads a step is nothing next to a decode,
  * but it is not nothing, and the default build should measure the model rather
  * than the measurement. */
-#define QE_TICK() (f->o.profile ? now() : 0.0)
+#define QE_TICK() (f->o.profile ? (qe_pool_stats_get(&f->pst0), now()) : 0.0)
 #define QE_TALLY(stage, ts)                                                                      \
     do {                                                                                         \
         if (f->o.profile) {                                                                      \
+            qe_pool_stats ps1_;                                                                  \
+            qe_pool_stats_get(&ps1_);                                                            \
+            f->d.stage_disp[stage] += ps1_.dispatches - f->pst0.dispatches;                      \
+            f->d.stage_pool[stage] += ps1_.seconds - f->pst0.seconds;                            \
+            f->d.stage_tail[stage] += ps1_.tail - f->pst0.tail;                                  \
             f->d.stage_seconds[stage] += now() - (ts);                                           \
             f->d.stage_macs[stage] += f->walk_mac - f->mac_mark;                                  \
             f->mac_mark = f->walk_mac;                                                            \
@@ -4755,12 +5802,21 @@ void qe_ckpt_free(qe_ckpt *c) {
  * minimal: the next row's taps read the slots this row just wrote, so the pair is
  * the same moment and one of them without the other is a position with someone
  * else's past. */
+static void state_copy_task(void *vp, int tid, int nthreads);
+
 static void ckpt_slot(qe_forward *f, const qe_ckpt *c, int slot, int b) {
     if (b < 1 || b >= c->rows)
         return;
     char *dst = (char *)c->buf + (size_t)(b - 1) * c->stride;
-    memcpy(dst + (size_t)slot * c->slot_b, (const char *)f->gdn + (size_t)slot * c->slot_b,
-           c->slot_b);
+    /* 3 MiB of one layer's state per boundary, 36 layers a window: on the master alone
+     * that was 11 ms of a 126 ms two-row window, the serial half of its block stage
+     * (ideas.md §7.30). The pool copies it in slices; the bytes are the bytes. */
+    state_copy_job j = { dst + (size_t)slot * c->slot_b,
+                         (const char *)f->gdn + (size_t)slot * c->slot_b, c->slot_b };
+    if (f->n_threads > 1 && qe_pool_size() > 1)
+        qe_pool_run(state_copy_task, &j, f->n_threads);
+    else
+        memcpy(j.dst, j.src, j.n);
     if (c->conv_b)
         memcpy(dst + c->gdn_b + (size_t)slot * c->slot_ring_b,
                (const char *)f->gconv + (size_t)slot * c->slot_ring_b, c->slot_ring_b);
@@ -5033,8 +6089,10 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
         ts = QE_TICK();
         hc_mixer(f, L, 0, 0, T, 1);
         QE_TALLY(QE_ST_HC_ATTN, ts);
-        for (int t = 0; t < T; t++)
-            sweep(f, crow(f->cxn, f->K, t), f->K, &f->d.max_abs_res);
+        {
+            rows_job rj = { .fn = row_sweep_cxn, .T = T };
+            rows_run(f, &rj, 1);
+        }
         /* The projections of a block are walks, not recurrences, so each is one
          * call covering the whole chunk: proj computes every row in flight, and
          * only the core - the conv ring, the delta rule, the cache writes - runs
@@ -5045,7 +6103,11 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
         else
             gdn_proj(f, L);
         QE_TALLY(QE_ST_BLOCK_PROJ, ts);
-        if (L->qsa) {
+        if (L->qsa && T > 1 && f->n_seq == 1 && f->attn_batch && f->attn_fused && f->cqwork) {
+            ts = QE_TICK();
+            qsa_core_chunk(f, L, L->qsa_slot, ppos[0], T);
+            QE_TALLY(QE_ST_BLOCK_CORE, ts);
+        } else if (L->qsa) {
             for (int t = 0; t < T; t++) {
                 use_row(f, t);
                 f->chunk_t = t;
@@ -5091,16 +6153,14 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
         else
             gdn_out(f, L);
         QE_TALLY(QE_ST_BLOCK_PROJ, ts);
-        for (int t = 0; t < T; t++) {
-            use_row(f, t);
+        {
             /* Ablations zero the block's output before it is scattered into the
              * streams, which is exactly the network without that block: the inject
              * weight multiplies a zero, so the residual passes through untouched. */
-            if ((L->qsa && (variant & QE_VARIANT_ABL_ATTN)) ||
-                (!L->qsa && (variant & QE_VARIANT_ABL_GDN)))
-                memset(f->y, 0, (size_t)f->K * sizeof(float));
-            sweep(f, f->y, f->K, &f->d.max_abs_block);
-            hc_combine(f, f->y, f->inj);
+            const int abl = (L->qsa && (variant & QE_VARIANT_ABL_ATTN)) ||
+                            (!L->qsa && (variant & QE_VARIANT_ABL_GDN));
+            rows_job rj = { .fn = row_inject, .T = T, .flags = 1u | (abl ? 4u : 0u) };
+            rows_run(f, &rj, 1);
         }
         ts = QE_TICK();
         hc_mixer(f, L, 1, 0, T, 1);
@@ -5114,18 +6174,25 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
                 moe_block(f, il, L, f->y);
             }
         QE_TALLY(QE_ST_MOE, ts);
-        for (int t = 0; t < T; t++) {
-            use_row(f, t);
-            if (variant & QE_VARIANT_ABL_MOE)
-                memset(f->y, 0, (size_t)f->K * sizeof(float));
-            sweep(f, f->y, f->K, &f->d.max_abs_block);
-            hc_combine(f, f->y, f->inj);
-            sweep(f, f->res, f->hc_dim, &f->d.max_abs_res);
-            if ((flags & STEP_PROBE) && t == last)
+        {
+            rows_job rj = { .fn = row_inject, .T = T,
+                            .flags = 2u | 8u | ((variant & QE_VARIANT_ABL_MOE) ? 4u : 0u) };
+            rows_run(f, &rj, 1);
+            use_row(f, last);
+            if (flags & STEP_PROBE)
                 for (int p = 0; p < f->n_probe; p++)
                     if (f->probe_layers[p] == il)
                         head_probe(f, last, f->probe_buf + (size_t)p * (size_t)f->embd->ne[1]);
         }
+        if (f->d.nonfinite > nf0 && getenv("QE_DEBUG_NF")) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "qe: first non-finite value in layer %d (%s), chunk of %d at %ld\n",
+                        il, L->qsa ? "attention" : "gated delta", T, pos0);
+        }
+        if (f->progress_fine && f->pf_total > 0 && T > 1)
+            f->progress_fine(f->progress_fine_user,
+                             f->pf_base + (long)T * (long)(il + 1) / (long)f->n_layer, f->pf_total);
     }
     /* The draft head, fed the same chunk. It goes here rather than at the end of the
      * pass because it reuses the trunk's chunk scratch, and the mixer below is what
@@ -5480,8 +6547,11 @@ static int prefill_rows(qe_forward *f, int s, const int *tokens, long n, float *
         int T = (int)(n - done < width ? n - done : width);
         const int last = (done + T == n);
         unsigned flags = last ? (STEP_PROBE | (logits_out ? STEP_LOGITS : 0)) : 0;
+        f->pf_base = done;
+        f->pf_total = n;
         int rc = chunk_impl(f, tokens + done, T, (flags & STEP_LOGITS) ? logits_out : NULL,
                             flags, s >= 0 ? rseq : NULL);
+        f->pf_total = 0;
         if (rc)
             return rc;
         done += T;
@@ -5504,6 +6574,13 @@ int qe_forward_prefill_seq(qe_forward *f, int s, const int *tokens, long n, floa
     if (!f || s < 0 || s >= f->n_seq)
         return -1;
     return prefill_rows(f, f->n_seq == 1 ? -1 : s, tokens, n, logits_out);
+}
+
+void qe_forward_set_progress_fine(qe_forward *f, void (*cb)(void *, long, long), void *user) {
+    if (!f)
+        return;
+    f->progress_fine = cb;
+    f->progress_fine_user = user;
 }
 
 void qe_forward_set_progress(qe_forward *f, qe_progress_cb cb, void *user) {
@@ -5530,6 +6607,8 @@ void qe_forward_probe_set(qe_forward *f, const int *layers, int n, float *buf) {
     f->probe_buf = buf;
     f->n_probe = n;
 }
+
+unsigned qe_forward_variant(const qe_forward *f) { return f ? f->o.variant : 0; }
 
 void qe_forward_reconfigure(qe_forward *f, unsigned variant, int profile) {
     if (!f)

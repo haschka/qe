@@ -5,7 +5,13 @@ three rules after it.
 
 ## 0. The bar: 50 tokens/second on ingestion
 
-Ingestion is over the bar, and the bar stays: **61.3 to 63.7 tok/s - 16.3 to 15.7 ms/token at the
+Ingestion is over the bar, and the bar stays. Current reading: **87 to 93 tok/s** (10.7-11.5
+ms/token, `make forward` and `make decode --pp` after ideas.md §7.30-7.35, 0 FAIL), and generation **15.6 tok/s** (64.0
+ms/token) where it was 10.9 - a third of every decode step had been threads waiting at barriers on
+this P+E chip, and rows are now handed out from a cursor (ideas.md §7.30; `make decode` is the
+instrument). Any new walk whose output rows are independent should take its rows from a cursor,
+not `qe_slice`, and any walk that sums per-thread partials must not, or its answer depends on the
+schedule. The figures that follow are the previous cycle's: **61.3 to 63.7 tok/s - 16.3 to 15.7 ms/token at the
 512-row batch the sweep ships**, measured eleven times over eleven loads (`/tmp/f31_wide.log`
 through `/tmp/f41_wide.log`; nine of them had no failing leg, one carried the rewind failure
 ideas.md §7.19 records, one the walk-width default ideas.md §7.26 records and reversed, the
@@ -165,6 +171,9 @@ make batch     # B sequences through one forward step, three arithmetic arms, th
                # the byte-level rewind leg (FUSE=2400; it pays the load)
 make lane      # the same multiplier through the engine's request entry, with --batch N
                # (BATCH=4 FUSE=2400; it pays the load)
+make decode    # where a step's time goes per stage - pool, barrier tail, serial - and a race
+               # of decode switches in one load (ARMS=ship,old,...; bench_decode --nll N prices
+               # each arm in nats, --win 2 a verify window, --pp N an ingestion; FUSE=2400)
 make forward   # the chunk sweep against the checkpoint, one A/B leg per arithmetic switch,
                # plus the width leg that races a step's weight walk against narrower passes
                # (FUSE=2400; minutes, and it pays the load)
