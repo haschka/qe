@@ -20,6 +20,7 @@
 #include "qe.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -164,12 +165,29 @@ static int arm_apply(qe_forward *f, const char *name) {
     return 0;
 }
 
+/* --timeline: one line per landed chunk of the profiled ingestion - where in the prompt,
+ * and that chunk's own rate - so a long prompt's rate can be read as a function of depth. */
+static double tl_last;
+static long tl_prev;
+static int tl_cb(void *user, long done, long total) {
+    (void)user;
+    const double t = now();
+    printf("  chunk to %6ld of %ld: %4ld tokens %7.3f s %6.1f tok/s\n", done, total, done - tl_prev,
+           t - tl_last, (double)(done - tl_prev) / (t - tl_last));
+    fflush(stdout);
+    tl_last = t;
+    tl_prev = done;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *path = "/mnt/data/data/ai-models/llama-cpp/llm/"
                        "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf";
     const char *mtp_path = NULL, *text_path = "README.md";
     const char *arms_arg = "ship";
     int threads = QE_THREADS_AUTO, fuse = 0, prefix = 512, steps = 16, reps = 3, nll_n = 0, pp_n = 0, win = 0;
+    int timeline = 0;
+    const char *depths_arg = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc)
             path = argv[++i];
@@ -185,6 +203,10 @@ int main(int argc, char **argv) {
             win = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pp") && i + 1 < argc)
             pp_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--depths") && i + 1 < argc)
+            depths_arg = argv[++i];
+        else if (!strcmp(argv[i], "--timeline"))
+            timeline = 1;
         else if (!strcmp(argv[i], "--nll") && i + 1 < argc)
             nll_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc)
@@ -198,7 +220,7 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr,
                     "usage: %s [--model P] [--mtp P] [--text F] [--prefix N] [--steps N]"
-                    " [--reps N] [--arms a,b] [--threads N] [--fuse S]\n",
+                    " [--reps N] [--arms a,b] [--threads N] [--fuse S] [--pp N [--timeline]] [--depths a,b,...]\n",
                     argv[0]);
             return 2;
         }
@@ -233,6 +255,16 @@ int main(int argc, char **argv) {
     long need = (long)prefix + (long)(steps > nll_n ? steps : nll_n) + 8 + 2L * 16 * (win > 0);
     if (pp_n + 8 > need)
         need = pp_n + 8;
+    long depths[16];
+    int nd = 0;
+    if (depths_arg) {
+        char *dbuf = strdup(depths_arg);
+        for (char *t = strtok(dbuf, ","); t && nd < 16; t = strtok(NULL, ","))
+            depths[nd++] = atol(t);
+        free(dbuf);
+        if (nd > 0 && depths[nd - 1] + steps + 8 > need)
+            need = depths[nd - 1] + steps + 8;
+    }
     qe_forward_opts fo = { .n_ctx = (int)(need + 64 > 4096 ? need + 64 : 4096),
                            .n_threads = threads,
                            .mtp_model = mh };
@@ -272,6 +304,71 @@ int main(int argc, char **argv) {
             fprintf(stderr, "unknown arm %s\n", arms[a]);
             return 2;
         }
+
+    /* --depths: one growing sequence, read a segment at a time up to each depth and then
+     * `steps` decode steps taken there (the text's own next tokens, so the sequence stays
+     * one text), each half profiled per stage with the attention core split three ways.
+     * What it answers is what a long conversation pays per token as it grows. */
+    if (nd > 0) {
+        arm_apply(f, arms[0]);
+        qe_forward_reset(f);
+        qe_pool_stats_enable(1);
+        qe_forward_reconfigure(f, variant, 1);
+        long pos = 0;
+        for (int k = 0; k < nd; k++) {
+            const long d = depths[k];
+            if (d <= pos)
+                continue;
+            qe_forward_diag d0, d1;
+            qe_forward_diag_of(f, &d0);
+            double t1 = now();
+            if (qe_forward_prefill(f, ids + pos, d - pos, NULL)) {
+                printf("== depth %ld: prefill refused ==\n", d);
+                return 1;
+            }
+            double sec = now() - t1;
+            qe_forward_diag_of(f, &d1);
+            const long nt = d - pos;
+            printf("== depth %ld: read %ld..%ld at %.1f tok/s (%.2f ms a token) ==\n", d, pos, d,
+                   nt / sec, sec * 1e3 / nt);
+            printf("  ingest ms/tok:");
+            for (int st = 0; st < QE_ST_N; st++) {
+                const double v = (d1.stage_seconds[st] - d0.stage_seconds[st]) * 1e3 / nt;
+                if (v >= 0.005)
+                    printf(" %s %.2f", stage_name(st), v);
+            }
+            printf("\n  ingest attention ms/tok: pre %.3f idx %.3f walk %.3f\n",
+                   (d1.attn_pre_seconds - d0.attn_pre_seconds) * 1e3 / nt,
+                   (d1.attn_idx_seconds - d0.attn_idx_seconds) * 1e3 / nt,
+                   (d1.attn_walk_seconds - d0.attn_walk_seconds) * 1e3 / nt);
+            pos = d;
+            qe_forward_diag_of(f, &d0);
+            t1 = now();
+            for (int s2 = 0; s2 < steps; s2++)
+                qe_forward_step(f, ids[pos + s2], lg);
+            sec = (now() - t1) / steps;
+            qe_forward_diag_of(f, &d1);
+            pos += steps;
+            printf("  step at %ld: %.2f ms (%.2f tok/s); ms/step:", d, sec * 1e3, 1.0 / sec);
+            for (int st = 0; st < QE_ST_N; st++) {
+                const double v = (d1.stage_seconds[st] - d0.stage_seconds[st]) * 1e3 / steps;
+                if (v >= 0.005)
+                    printf(" %s %.2f", stage_name(st), v);
+            }
+            uint64_t hsh = 1469598103934665603ull;
+            for (size_t b = 0; b < (size_t)vocab * sizeof *lg; b++)
+                hsh = (hsh ^ ((const unsigned char *)lg)[b]) * 1099511628211ull;
+            printf("\n  logits after the steps: fnv %016llx, argmax %ld", (unsigned long long)hsh,
+                   argmax(lg, vocab));
+            printf("\n  step attention ms: idx %.3f walk %.3f\n",
+                   (d1.attn_idx_seconds - d0.attn_idx_seconds) * 1e3 / steps,
+                   (d1.attn_walk_seconds - d0.attn_walk_seconds) * 1e3 / steps);
+            fflush(stdout);
+        }
+        qe_forward_reconfigure(f, variant, 0);
+        qe_pool_stats_enable(0);
+        return 0;
+    }
 
     /* The profile pass of arm 0 first: per stage, ms a step, dispatches a step, pool
      * ms, barrier tail ms, and serial (outside the pool) ms. */
@@ -445,7 +542,13 @@ int main(int argc, char **argv) {
             qe_pool_stats pp0, pp1;
             qe_pool_stats_get(&pp0);
             const double t1 = now();
+            if (timeline) {
+                tl_last = t1;
+                tl_prev = 0;
+                qe_forward_set_progress(f, tl_cb, NULL);
+            }
             const int prc = qe_forward_prefill(f, ids, pp_n, lg);
+            qe_forward_set_progress(f, NULL, NULL);
             qe_pool_stats_get(&pp1);
             if (prc) {
                 qe_forward_diag dd;

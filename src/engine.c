@@ -988,6 +988,11 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
             e->o.spec_k = 0;
     }
     e->info.spec_k = e->o.spec_k;
+    /* A head nothing will draft from is still walked once per prompt chunk and once per
+     * step to keep its cache warm: one more block on every token, for drafts that never
+     * come. With speculation off, it is resident and idle; --spec-k N brings it back. */
+    if (head_drafts && e->o.spec_k <= 0)
+        qe_forward_set_mtp_warm(e->fw, 0);
     char specnote[640];
     if (e->o.spec_k > 0)
         snprintf(specnote, sizeof specnote,

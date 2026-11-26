@@ -24,9 +24,9 @@ Measured on this host, default settings, 19 of 20 cores, one sequence:
 | | qe | llama.cpp | |
 |---|---|---|---|
 | **Prompt ingestion**, 512-token batch | **87 - 93 tok/s** (10.7 - 11.5 ms/token) | 51.33 tok/s | **1.7 - 1.8x** |
-| Prompt ingestion at 4,096 tokens of context | 83 tok/s (12.0 ms/token) | | |
+| Prompt ingestion at 32k / 128k tokens of context | 85.6 / 82.1 tok/s | | |
 | **Generation**, greedy | **15.3 - 15.6 tok/s** (64 - 65 ms/token) | 7.65 tok/s (130.7 ms) | **2.0x** |
-| Generation at 4,096 tokens of context | 15.0 tok/s (66.5 ms/token) | | |
+| Generation at 32k / 128k tokens of context | 14.9 / 14.5 tok/s (67.0 / 68.8 ms/token) | | |
 | **Throughput**, eight sequences in one step (`--batch 8`) | 18.0 tok/s across a wave of eight (measured before §7.30 below) | none | |
 
 llama.cpp is the same checkpoint and the same host: b12359 for ingestion
@@ -151,8 +151,7 @@ MODEL=/path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf ./bin/qe-serve --repor
 #    port stays closed until the engine can actually answer a request. After that
 #    the file is never read again.
 ./bin/qe-serve --port 8097 \
-  --model /path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf \
-  --mtp   /path/to/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+  --model /path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf
 
 # 4. Use it
 curl -s localhost:8097/v1/chat/completions -H 'content-type: application/json' \
@@ -164,6 +163,9 @@ Only volume 1 of a multi-volume checkpoint is named; the rest are found by name.
 Speculation is off unless asked for: `--spec-k 1` with `--mtp` drafts from the nextn
 head, `--spec-k 2` without it from the n-gram hash. At today's step speed neither beats
 the plain loop (ideas.md §7.30), which is why neither is the default.
+Leave `--mtp` off unless you also pass `--spec-k`: with speculation off the head is
+resident (2.6 GiB) and idle. Before ideas.md §7.36 it was still walked on every prompt chunk,
+12 % of ingestion (336 against 296 s on a 23k-token prompt); now it costs nothing but RAM.
 `--stage huge` moves the arena into a reserved hugetlb pool and reuses it across
 restarts. `--ctx N` is a memory setting as much as a token limit. `SIGTERM` closes
 the listener immediately and gives the port back inside its grace period.

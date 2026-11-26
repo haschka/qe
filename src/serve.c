@@ -1528,10 +1528,17 @@ int qe_serve(const qe_serve_opts *opts) {
      * the sentence it repeats instead: which model, how big a window, where the
      * bytes are. A status line that cannot say what it is watching is guesswork. */
     {
-        char head[256];
-        snprintf(head, sizeof head, "%s %s%s%s ctx=%d stage=%s :%d", st.info.id, st.info.arch,
-                 st.info.label[0] ? " " : "", st.info.label, st.info.n_ctx, st.info.stage,
-                 o.port);
+        /* One line of the panel at 80 columns: the id, the model's own name (the
+         * architecture when it has none), the window in k, where the weights are, and
+         * the port, with the panel's separator between them. */
+        char head[256], ctxs[24];
+        if (st.info.n_ctx >= 1024 && st.info.n_ctx % 1024 == 0)
+            snprintf(ctxs, sizeof ctxs, "%dk", st.info.n_ctx / 1024);
+        else
+            snprintf(ctxs, sizeof ctxs, "%d", st.info.n_ctx);
+        snprintf(head, sizeof head, "%s \xc2\xb7 %s \xc2\xb7 %s ctx \xc2\xb7 %s \xc2\xb7 :%d",
+                 st.info.id, st.info.label[0] ? st.info.label : st.info.arch, ctxs,
+                 st.info.stage, o.port);
         qe_ui_start(o.ui, head);
         /* The second row of the panel, and deliberately the file's own name rather
          * than its path: a long path on a status row is a path that gets cut in half

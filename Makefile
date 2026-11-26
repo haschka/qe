@@ -58,6 +58,9 @@ bin/bench_gemv: $(COREOBJ) bench/bench_gemv.c | bin
 bin/bench_walk: $(COREOBJ) bench/bench_walk.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_walk.c $(LDFLAGS)
 
+bin/bench_attn: $(COREOBJ) bench/bench_attn.c | bin
+	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_attn.c $(LDFLAGS)
+
 # Whether the expert walk and the dense walk are limited by different parts of the
 # machine, which is the premise the pipelined-prefill idea in ideas.md 7.8 rests on.
 bin/bench_cosched: $(COREOBJ) bench/bench_cosched.c | bin

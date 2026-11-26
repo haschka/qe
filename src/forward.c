@@ -245,6 +245,7 @@ struct qe_forward {
     int kv_q8;
     float *kraw;    /* qsa_slots x n_ctx x 128, pre-norm indexer keys */
     float *kpool;   /* qsa_slots x ceil(n_ctx/4) x 128, normed and rotated */
+    int idx_f16;    /* QE_IDX_F16: the pooled keys stored as halves (ideas.md §7.37) */
     float *ple_hist;
     uint32_t *seq;  /* the token ids fed so far, PLE-visible (image positions
                      * already substituted) */
@@ -486,6 +487,15 @@ struct qe_forward {
     void (*progress_fine)(void *user, long done, long total);
     void *progress_fine_user;
     long pf_base, pf_total; /* where the prompt in flight is, while one is */
+    /* Each layer's share of the last prompt chunk's time, in tenths of a permille,
+     * cumulative: a progress report after layer il says the chunk is pf_cum[il] done
+     * by time rather than (il + 1) / n_layer by count. Attention layers at depth and
+     * gated-delta layers do not cost the same, and a panel reading a three-second
+     * window off an even split shows a rate that swings with which layers the window
+     * happened to cover (44-80 tok/s on a prompt that ingests at a steady 79). */
+#define PF_LAYERS 128
+    int pf_cum[PF_LAYERS];
+    int pf_have;
     void *progress_user;
 };
 
@@ -563,6 +573,30 @@ static size_t state_gconv_bytes(const qe_forward *f) {
 static size_t state_kpool_bytes(const qe_forward *f) {
     return (size_t)f->qsa_slots * (size_t)f->n_seq *
            (f->seq_stride / (size_t)f->kpool_ratio + 1) * (size_t)f->idx_dim * sizeof(float);
+}
+
+#define QE_IDX_DIM_MAX 512
+/* One sequence's pooled keys, at the element width they are stored in: halves under
+ * QE_IDX_F16, floats otherwise. The buffer is sized for floats either way. */
+static inline void *kpool_seq(const qe_forward *f, long sub) {
+    const size_t esz = f->idx_f16 ? 2 : 4;
+    return (char *)f->kpool +
+           (size_t)sub * (f->seq_stride / (size_t)f->kpool_ratio + 1) * (size_t)f->idx_dim * esz;
+}
+static inline void kpool_put(const qe_forward *f, void *base, long b, const float *src) {
+    const int id = f->idx_dim;
+    if (f->idx_f16) {
+        uint16_t *d = (uint16_t *)base + (size_t)b * (size_t)id;
+        int c = 0;
+#if defined(__x86_64__)
+        for (; c + 8 <= id; c += 8)
+            _mm_storeu_si128((__m128i *)(d + c),
+                             _mm256_cvtps_ph(_mm256_loadu_ps(src + c), _MM_FROUND_TO_NEAREST_INT));
+#endif
+        for (; c < id; c++)
+            d[c] = _cvtss_sh(src[c], _MM_FROUND_TO_NEAREST_INT);
+    } else
+        memcpy((float *)base + (size_t)b * (size_t)id, src, (size_t)id * sizeof(float));
 }
 
 static size_t state_kraw_bytes(const qe_forward *f) {
@@ -2806,6 +2840,16 @@ qe_forward *qe_forward_open(qe_model *m, const qe_forward_opts *opts, char *err,
     f->eps = dim_float(m, "qwen4exp.attention.layer_norm_rms_epsilon", 1e-6f);
     f->n_idx_heads = dim_int(m, "qwen4exp.attention.indexer.head_count", 4);
     f->idx_dim = dim_int(m, "qwen4exp.attention.indexer.key_length", 128);
+    if (f->idx_dim < 1 || f->idx_dim > QE_IDX_DIM_MAX) {
+        snprintf(err, errn, "indexer key_length %d: the pooled-key row is a stack row of at most %d",
+                 f->idx_dim, QE_IDX_DIM_MAX);
+        free(f);
+        return NULL;
+    }
+    {
+        const char *e = getenv("QE_IDX_F16");
+        f->idx_f16 = e && *e ? atoi(e) != 0 : 0;
+    }
     /* The pooling factor is per layer, and the caches are sized for one number,
      * so the array is read and checked rather than assumed: a checkpoint that
      * mixed ratios would otherwise get a KV cache with the wrong stride and no
@@ -4319,6 +4363,102 @@ static long top_blocks(const float *sc, long n, long k, int *blocks, float *heap
     return m;
 }
 
+/* The same set as top_blocks, found by threshold instead of by heap (QE_TOPK_RADIX, on).
+ *
+ * The heap is serial on one thread per token per layer, and on scores that rise with
+ * position - the recent past outscoring the distant one, which is what these scores do -
+ * nearly every block displaces the root: ~1 ms a layer at 32k blocks. A score is a sum of
+ * rectified dots times a positive scale, so it is never negative and its IEEE bits order
+ * as unsigned integers; three histogram passes find the k-th largest bit pattern, and the
+ * blocks at or above it are the answer. That is the heap's set exactly whenever the
+ * threshold value is not tied across the boundary - every block above it is in both, and
+ * so is every block equal to it - so when the copies of the k-th value do not all fit the
+ * function returns -1 and the caller asks the heap, whose tie order is its own. The
+ * blocks come back ascending; every caller hands them to a bitmap, so order is moot. */
+static int topk_radix_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("QE_TOPK_RADIX");
+        cached = e && *e ? atoi(e) != 0 : 1;
+    }
+    return cached;
+}
+
+static long topk_radix(const float *sc, long n, long k, int *blocks) {
+    static __thread uint32_t *cand;
+    static __thread long cand_n;
+    if (cand_n < n) {
+        free(cand);
+        cand = malloc((size_t)n * sizeof *cand);
+        cand_n = cand ? n : 0;
+        if (!cand)
+            return -1;
+    }
+    const uint32_t *u = (const uint32_t *)sc;
+    uint32_t hist[4096];
+    /* pass 1: the top twelve bits of every score */
+    memset(hist, 0, sizeof hist);
+    for (long i = 0; i < n; i++) {
+        if (u[i] & 0x80000000u)
+            return -1; /* a negative or NaN score is not this function's to order */
+        hist[u[i] >> 20]++;
+    }
+    long need = k, b1 = 4095;
+    for (; b1 >= 0; b1--) {
+        if (hist[b1] >= (uint32_t)need)
+            break;
+        need -= hist[b1];
+    }
+    if (b1 < 0)
+        return -1;
+    long nc = 0;
+    for (long i = 0; i < n; i++)
+        if ((u[i] >> 20) == (uint32_t)b1)
+            cand[nc++] = u[i];
+    /* pass 2: the next twelve, among the boundary bucket */
+    memset(hist, 0, sizeof hist);
+    for (long i = 0; i < nc; i++)
+        hist[(cand[i] >> 8) & 0xfffu]++;
+    long b2 = 4095;
+    for (; b2 >= 0; b2--) {
+        if (hist[b2] >= (uint32_t)need)
+            break;
+        need -= hist[b2];
+    }
+    long nc2 = 0;
+    for (long i = 0; i < nc; i++)
+        if (((cand[i] >> 8) & 0xfffu) == (uint32_t)b2)
+            cand[nc2++] = cand[i];
+    /* pass 3: the last eight */
+    memset(hist, 0, 256 * sizeof hist[0]);
+    for (long i = 0; i < nc2; i++)
+        hist[cand[i] & 0xffu]++;
+    long b3 = 255;
+    for (; b3 >= 0; b3--) {
+        if (hist[b3] >= (uint32_t)need)
+            break;
+        need -= hist[b3];
+    }
+    if (hist[b3] != (uint32_t)need)
+        return -1; /* the k-th value is tied across the boundary: the heap decides */
+    const uint32_t tau = ((uint32_t)b1 << 20) | ((uint32_t)b2 << 8) | (uint32_t)b3;
+    long m = 0;
+    for (long i = 0; i < n; i++)
+        if (u[i] >= tau)
+            blocks[m++] = (int)i;
+    return m == k ? m : -1;
+}
+
+static long select_blocks(const float *sc, long n, long k, int *blocks, float *heap_s,
+                          int *heap_b) {
+    if (topk_radix_env()) {
+        const long m = topk_radix(sc, n, k, blocks);
+        if (m >= 0)
+            return m;
+    }
+    return top_blocks(sc, n, k, blocks, heap_s, heap_b);
+}
+
 /* Softmax over the selected cells only, in the order the indexer's heap produced
  * them. Work is split by query head, which is the split that reads a KV group's
  * rows `per` times over: the 24 heads share 2 KV heads twelve ways, so a head's
@@ -4539,7 +4679,8 @@ static void qsa_proj(qe_forward *f, const qe_layer *L) {
  * which is why the arithmetic lives in exactly one function. */
 typedef struct {
     const float *iq;   /* n_idx_heads * idx_dim, already normed and rotated */
-    const float *pool; /* cur pooled index keys of idx_dim */
+    const void *pool;  /* cur pooled index keys of idx_dim, floats or halves */
+    int f16;
     float *iscore;
     long cur;
     float scale;
@@ -4549,16 +4690,11 @@ typedef struct {
 } idx_job;
 
 static void idx_score_rows(const idx_job *j, long lo, long hi) {
-    for (long b = lo; b < hi; b++) {
-        float acc = 0.0f;
-        for (int h = 0; h < j->nih; h++) {
-            float d =
-                qe_dot(j->iq + (size_t)h * (size_t)j->id, j->pool + (size_t)b * (size_t)j->id, j->id);
-            if (d > 0.0f)
-                acc += d; /* rectified and summed unweighted: every head weight is 1 */
-        }
-        j->iscore[b] = acc * j->scale;
-    }
+    /* rectified and summed unweighted: every head weight is 1 */
+    if (j->f16)
+        qe_idx_scores_h(j->iq, j->pool, j->nih, j->id, j->scale, lo, hi, j->iscore);
+    else
+        qe_idx_scores(j->iq, j->pool, j->nih, j->id, j->scale, lo, hi, j->iscore);
 }
 
 /* Blocks handed out from a cursor rather than one fixed slice a thread: a score is a
@@ -4609,12 +4745,13 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
     int8_t *kvd = f->kvd ? f->kvd + (size_t)sub * 2 * NC * (size_t)krow : NULL;
     float *kvs = f->kvs ? f->kvs + (size_t)sub * 2 * NC * (size_t)nkvh : NULL;
     float *krawc = f->kraw + (size_t)sub * NC * (size_t)id;
-    float *kpoolc = f->kpool + (size_t)sub * (NC / ratio + 1) * (size_t)id;
+    void *kpoolc = kpool_seq(f, sub);
     float *ikraw = crow(f->ikraw, id, t), *iq = crow(f->iq, (long)id * nih, t);
     const float *qg = crow(f->qg, 2 * (long)hd * nqh, t);
     float *kcur = crow(f->kcur, krow, t), *vcur = crow(f->vcur, krow, t);
     float *attn_y = crow(f->attn_y, (long)hd * nqh, t);
 
+    const double at0 = f->o.profile ? now() : 0.0;
     /* --- the indexer. Raw keys are cached un-normalised; a block is pooled,
      * then normed, then rotated by its first cell's angle, in that order. */
     memcpy(krawc + (size_t)pos * (size_t)id, ikraw, (size_t)id * sizeof(float));
@@ -4631,7 +4768,7 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
         qe_rms_norm_grouped(f->ipool, f32v(f, L->ixkn), 0, f->ipool, id, 1, f->eps);
         qe_rope_init(cs2, rd, b * ratio, f->theta);
         qe_rope_apply(f->ipool, 1, id, rd, cs2);
-        memcpy(kpoolc + (size_t)b * (size_t)id, f->ipool, (size_t)id * sizeof(float));
+        kpool_put(f, kpoolc, b, f->ipool);
     }
     qe_rms_norm_grouped(iq, f32v(f, L->ixqn), 0, iq, id, nih, f->eps);
     qe_rope_init(cs, rd, pos, f->theta);
@@ -4639,6 +4776,7 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
 
     idx_job ij = { .iq = iq,
                    .pool = kpoolc,
+                   .f16 = f->idx_f16,
                    .iscore = f->iscore,
                    .cur = cur,
                    .scale = f->idx_scale,
@@ -4657,9 +4795,10 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
         for (long b = 0; b < cur; b++)
             f->heap_b[b] = (int)b;
     } else {
-        nblocks = top_blocks(f->iscore, cur, f->idx_topk_blocks, f->heap_b, f->heap_s, f->heap_b);
+        nblocks = select_blocks(f->iscore, cur, f->idx_topk_blocks, f->heap_b, f->heap_s, f->heap_b);
     }
     const int nsel = sel_ascending(f, f->heap_b, nblocks, cur, ratio, pos);
+    const double at1 = f->o.profile ? now() : 0.0;
 
     /* --- the attention itself, over attn_q's [q | gate] rows of 512. */
     for (int h = 0; h < nqh; h++) {
@@ -4769,6 +4908,10 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
     qe_sigmoid(f->qgate, f->qgate, (long)nqh * hd);
     for (long i = 0; i < (long)nqh * hd; i++)
         attn_y[i] *= f->qgate[i];
+    if (f->o.profile) {
+        f->d.attn_idx_seconds += at1 - at0;
+        f->d.attn_walk_seconds += now() - at1;
+    }
 }
 
 /* How a token's selection is cut into chunks for the fused walk: the per-token path's
@@ -4809,7 +4952,7 @@ static void attn_chunking(const qe_forward *f, int nsel, int *chunk_out, int *nc
  * byte. */
 typedef struct {
     qe_forward *f;
-    const float *kpoolc;
+    const void *kpoolc;
     long pos0;
     int T, id, nih, ratio;
     int nsel[QE_CHUNK_MAX];
@@ -4832,6 +4975,7 @@ static void csel_task(void *vp, int tid, int nthreads) {
         const long cur = pos / j->ratio;
         idx_job ij = { .iq = crow(f->iq, (long)j->id * j->nih, (int)t),
                        .pool = j->kpoolc,
+                       .f16 = f->idx_f16,
                        .iscore = isc,
                        .cur = cur,
                        .scale = f->idx_scale,
@@ -4845,7 +4989,7 @@ static void csel_task(void *vp, int tid, int nthreads) {
             for (long b = 0; b < cur; b++)
                 bl[b] = (int)b;
         } else {
-            nblocks = top_blocks(isc, cur, f->idx_topk_blocks, bl, hs, hb);
+            nblocks = select_blocks(isc, cur, f->idx_topk_blocks, bl, hs, hb);
         }
         j->nsel[t] = sel_ascending_to(bits, f->csel + (size_t)t * (size_t)f->sel_cap, bl,
                                       nblocks, cur, j->ratio, pos);
@@ -4926,7 +5070,8 @@ static void cattn_comb_task(void *vp, int tid, int nthreads) {
 typedef struct {
     const qe_layer *L;
     long pos0, b0;
-    float *krawc, *kpoolc, *kc, *vc, *kvs;
+    float *krawc, *kc, *vc, *kvs;
+    void *kpoolc;
     int8_t *kvd;
     size_t NC;
 } qsa_pre_ctx;
@@ -4979,7 +5124,7 @@ static void row_qsa_pool(rows_job *j, int i, int tid) {
     const int id = f->idx_dim, ratio = f->kpool_ratio, hd = f->head_dim;
     const int rd = f->n_rope < hd ? f->n_rope : hd;
     const long b = px->b0 + i;
-    float *dst = px->kpoolc + (size_t)b * (size_t)id;
+    float dst[QE_IDX_DIM_MAX];
     float cs2[QE_MAX_ROPE];
     for (int c = 0; c < id; c++) {
         float acc = 0.0f;
@@ -4990,6 +5135,7 @@ static void row_qsa_pool(rows_job *j, int i, int tid) {
     qe_rms_norm_grouped(dst, f32v(f, px->L->ixkn), 0, dst, id, 1, f->eps);
     qe_rope_init(cs2, rd, b * ratio, f->theta);
     qe_rope_apply(dst, 1, id, rd, cs2);
+    kpool_put(f, px->kpoolc, b, dst);
 }
 
 static void qsa_core_chunk(qe_forward *f, const qe_layer *L, int slot, long pos0, int T) {
@@ -5003,11 +5149,12 @@ static void qsa_core_chunk(qe_forward *f, const qe_layer *L, int slot, long pos0
     int8_t *kvd = f->kvd ? f->kvd + (size_t)sub * 2 * NC * (size_t)krow : NULL;
     float *kvs = f->kvs ? f->kvs + (size_t)sub * 2 * NC * (size_t)nkvh : NULL;
     float *krawc = f->kraw + (size_t)sub * NC * (size_t)id;
-    float *kpoolc = f->kpool + (size_t)sub * (NC / ratio + 1) * (size_t)id;
+    void *kpoolc = kpool_seq(f, sub);
 
     /* The prologue: every token's cache writes, norms and rotations, then the pooled index
      * key of every block of `ratio` cells this chunk completes - the per-token form ran both
      * in position order on the master; the second only reads the first's raw keys (§7.33). */
+    const double at0 = f->o.profile ? now() : 0.0;
     qsa_pre_ctx px = { .L = L, .pos0 = pos0, .krawc = krawc, .kpoolc = kpoolc, .kc = kc,
                        .vc = vc, .kvd = kvd, .kvs = kvs, .NC = NC };
     {
@@ -5023,11 +5170,13 @@ static void qsa_core_chunk(qe_forward *f, const qe_layer *L, int slot, long pos0
             rows_run(f, &rj, 0);
         }
     }
+    const double at1 = f->o.profile ? now() : 0.0;
     /* Every token's selection, one dispatch. */
     static csel_job cj; /* 2 KiB of counts: the pass is one per process, as is this */
     cj = (csel_job){ .f = f, .kpoolc = kpoolc, .pos0 = pos0, .T = T, .id = id, .nih = nih,
                      .ratio = ratio };
     qe_pool_run(csel_task, &cj, f->n_threads);
+    const double at2 = f->o.profile ? now() : 0.0;
 
     /* The walks and the combine, a group of tokens at a time so the partials stay small. */
     for (int t0 = 0; t0 < T; t0 += ATTN_GROUP) {
@@ -5045,6 +5194,12 @@ static void qsa_core_chunk(qe_forward *f, const qe_layer *L, int slot, long pos0
         aj.units = u;
         qe_pool_run(cattn_walk_task, &aj, f->n_threads);
         qe_pool_run(cattn_comb_task, &aj, f->n_threads);
+    }
+    if (f->o.profile) {
+        const double at3 = now();
+        f->d.attn_pre_seconds += at1 - at0;
+        f->d.attn_idx_seconds += at2 - at1;
+        f->d.attn_walk_seconds += at3 - at2;
     }
 }
 
@@ -6068,6 +6223,10 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
     }
     QE_TALLY(QE_ST_EMBED, ts);
 
+    const int pf_on = f->progress_fine && f->pf_total > 0 && T > 1 && f->n_layer <= PF_LAYERS;
+    double pf_t[PF_LAYERS + 1];
+    if (pf_on)
+        pf_t[0] = now();
     for (int il = 0; il < f->n_layer; il++) {
         qe_layer *L = &f->L[il];
         for (int t = 0; t < T; t++) {
@@ -6190,9 +6349,21 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
                 fprintf(stderr, "qe: first non-finite value in layer %d (%s), chunk of %d at %ld\n",
                         il, L->qsa ? "attention" : "gated delta", T, pos0);
         }
-        if (f->progress_fine && f->pf_total > 0 && T > 1)
-            f->progress_fine(f->progress_fine_user,
-                             f->pf_base + (long)T * (long)(il + 1) / (long)f->n_layer, f->pf_total);
+        if (pf_on) {
+            pf_t[il + 1] = now();
+            const long part = f->pf_have ? (long)T * f->pf_cum[il] / 10000
+                                         : (long)T * (long)(il + 1) / (long)f->n_layer;
+            f->progress_fine(f->progress_fine_user, f->pf_base + part, f->pf_total);
+        }
+    }
+    if (pf_on) {
+        const double span = pf_t[f->n_layer] - pf_t[0];
+        if (span > 0.0) {
+            for (int il = 0; il < f->n_layer; il++)
+                f->pf_cum[il] = (int)(10000.0 * (pf_t[il + 1] - pf_t[0]) / span + 0.5);
+            f->pf_cum[f->n_layer - 1] = 10000;
+            f->pf_have = 1;
+        }
     }
     /* The draft head, fed the same chunk. It goes here rather than at the end of the
      * pass because it reuses the trunk's chunk scratch, and the mixer below is what
@@ -6339,9 +6510,9 @@ int qe_forward_reset_seq(qe_forward *f, int s) {
             memset(f->kraw + (size_t)q * NC * (size_t)f->idx_dim, 0,
                    NC * (size_t)f->idx_dim * sizeof(float));
         if (f->kpool)
-            memset(f->kpool + (size_t)q * (NC / (size_t)f->kpool_ratio + 1) *
-                                  (size_t)f->idx_dim,
-                   0, (NC / (size_t)f->kpool_ratio + 1) * (size_t)f->idx_dim * sizeof(float));
+            memset(kpool_seq(f, q), 0,
+                   (NC / (size_t)f->kpool_ratio + 1) * (size_t)f->idx_dim *
+                       (f->idx_f16 ? 2 : sizeof(float)));
     }
     if (f->ple_hist)
         memset(seq_ple_hist(f, s), 0, (size_t)f->ple_lag * (size_t)f->hc_dim * sizeof(float));

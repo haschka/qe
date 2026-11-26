@@ -33,7 +33,9 @@ gap" turned out to be, and a prompt chunk's attention stopped being three dispat
 `make decode` is the instrument both were found with. Speculation is off by default since then
 (row 30 is why, and what would bring it back). §7.32 is the ranked list of everything left on
 this machine, the integrated GPU included (rows 32-38). §7.33-7.35 then took ingestion from 15.85
-to 11.50 ms an ingested token (63 → 87 tok/s) on the CPU alone.
+to 11.50 ms an ingested token (63 → 87 tok/s) on the CPU alone, and §7.36 found it flat at
+78-80 tok/s from 2.5k to 20k tokens through the real server once `--mtp` stopped costing 12 %. §7.37 measured
+the curve to 128k and took its two big terms byte for byte: 82.1 tok/s and 68.8 ms a step at 128k.
 
 ## 0. How to read this
 
@@ -123,7 +125,7 @@ gap is epilogue and shape rather than the bus.
 | 33 | **Superseded by §7.34 (eight rows at a time, block_core 3.15 → 1.65 ms, 1.11x of ingestion, nll unmoved); the chunkwise form stays open for what is left of it.** The delta rule in chunkwise-parallel (WY/UT) form for a prompt chunk | ingestion arithmetic | ~1.5-2.5 of ~3 ms, ~1.1-1.2x, nats-gated (§7.32.2 I2) | P1 |
 | 34 | **Counters and cursors done (§7.35): 79 % busy → `moe_ffn` 7.72 → 6.60 ms, 1.08x; the IQ3_S repack is withdrawn for ingestion (`make moe`: Q8_0 is 0.73-0.80x of the codebooks at equal MACs, so the codebook is not the cost); decode-once-per-bucket tiles are what is left, and what would make wider chunks pay.** The expert stage on the CPU: per-item busy counters first, then the lossless IQ3_S 4-bit repack (+6.9 GiB, bit-identical), then decode-once-per-bucket int8 tiles | ingestion, and a step's gate/up | ~1.1-1.25x of ingestion together (§7.32.2 I3) | P1 |
 | 35 | The integrated GPU (64 EUs, DP4a, zero-copy host memory) for ingestion's expert stage, two chunks pipelined | ingestion, a second device | **probed and parked**: the device does 2.96 TMAC/s and reads host memory at 49 GB/s, a correct expert kernel reached 110 GMAC/s (21.4 ms a token against the CPU's 7.2), and an active iGPU drops the cores from ~4-4.8 GHz to ~2 GHz, costing a CPU ingestion ~30 % - so ~1.1x now and ~1.4-1.5x at best with a 3x kernel. Reopen on a firmware power-balance change (§7.32.4, `make probe-igpu`) | parked |
-| 36 | Long context: the 8k/32k/128k curve, the twelve attention layers' selection agreement, then selection reuse across layers | decode and ingestion at long context | grows with the context; 10.7 of a 70.6 ms step at 8k is the indexer and attention (§7.32.3 D4) | P0 for an agent workload |
+| 36 | **Curve measured and the two big terms taken (§7.37): blocked attention walk 2.2x, radix top-k 2.4x on the indexer, both byte-identical; 128k is 82.1 tok/s ingestion (was 74.2) and 68.8 ms a step (was 72.8).** Left: the ingestion indexer as a tile, the step's histogram inside the scoring pass, then selection agreement across the twelve attention layers and reuse | decode and ingestion at long context | ~1 % a doubling of context now (§7.37) | P1 |
 | 37 | A step's last ~10 %: the expert stage at 60 of 80 GB/s, 4.7 ms of serial work, the mixers' row shape | decode | 64 → 57-60 ms (§7.32.3 D1-D3) | P2 |
 | 38 | Speculative sampling at temperature > 0, on top of row 30 | decode, sampled requests | ~1.0-1.08x; measure the head's acceptance at temp 1 first (§7.32.5) | P3 |
 
@@ -3408,6 +3410,105 @@ an int8 tile in L2 - and it is the item that would make width pay. The cap is ba
 an ingested token, 63 → 87 tok/s (1.38x)**; 83 tok/s at 4,096 tokens; `make forward`'s 598-token
 prompt 14.8 → 10.7 ms (93 tok/s). Left: experts 6.6 ms (57 %, now the walk itself), dense
 projections 1.85 (issue-rate ceiling), `block_core` 1.7, mixers 0.94, PLE 0.38.
+
+## 7.36 A long prompt through the real server: the rate is flat with depth, the head was 12 % of it, and the panel was measuring layers rather than time.
+
+Reported from use: crush feeding a ~20k-token prompt, the panel reading anywhere from 44 to 80
+tok/s. Three measurements, one host, checkpoint from `/x-data/llm`:
+
+- **The engine is flat with depth.** `bench_decode --pp 20480 --timeline` prints each landed
+  chunk's own rate: 93.4 tok/s for the first 512 tokens, then **78.4-80.1 tok/s for every chunk from
+  2.5k to 20k** (12.53 ms an ingested token over the whole prompt; `block_core` grows from 1.7 to
+  2.8 ms as attention deepens, nothing else moves). Long prompts are not a second regime.
+- **`--mtp` was 12 % of ingestion for nothing.** With speculation off by default (§7.30) the head
+  drafts nothing, but `QE_MTP_WARM` still walked it once per prompt chunk and once per step to keep
+  its cache warm. Real server, `--ctx 262144`, 23,463-token prompt: **336 s (69.8 tok/s) with the
+  head, 296 s (79.2) without**. The engine now turns warming off when the resolved draft length is
+  0; with the fix the same `--mtp` server reads **298 s**. `--spec-k N` turns it back on. A request
+  that asks for `qe_spec_k` on an engine that resolved 0 drafts from a cold head - correct output,
+  lower acceptance.
+- **The panel's live rate assumed every layer costs the same.** The per-layer progress hook
+  (§7.33's fine bar) reported `(il + 1) / n_layer` of a chunk, and the 3 s window the rate is read
+  over is half a 6.5 s chunk, so the figure swung with which layers the window covered - and the
+  head's walk, after the last layer, was a stretch of chunk with no progress at all. Progress is
+  now each layer's measured share of the previous chunk's time (`pf_cum`, cumulative, in 1/10000).
+  On a pty at 80 columns, same 23k prompt with `--mtp`: 469 distinct readings, almost all
+  **77-81 tok/s**, extremes 71 and 84, and 66-69 only on the last partial chunk. The 44 itself was
+  not re-captured on the old build, so which of the two carried it is not separated; both are gone.
+
+## 7.37 Long context, measured to 128k: the walk was half the attention, the top-k was the indexer, and both came back byte for byte.
+
+`bench_decode --depths 2048,...,131072` reads one growing text a segment at a time and takes
+eight decode steps at each depth (the text's own next tokens, so it stays one sequence),
+profiling both halves per stage, with the attention core split three ways: prologue, indexer
+(block scores plus the top-k selection) and the walk over the selected cells
+(`qe_forward_diag.attn_*_seconds`). The FNV hash of the logits after the steps is printed so
+two runs can be compared byte for byte.
+
+**Where it stood** (`/tmp/depth_base.log`): ingestion 87.8 tok/s at 2k, 79.4 at 8k, 77.9 at 32k,
+74.2 at 128k; a step 68.2 ms at 2k, 69.9 at 32k, 72.8 at 128k. Two terms:
+
+- **The walk**, 2.3 ms an ingested token and 3.3-3.5 ms a step from 8k on (constant: the
+  indexer caps the selection at 2051 cells). `qe_attn_walk` re-widened a cell's int8 key row
+  for each of the twelve query heads that share it, reduced each head's dot through a store
+  and eight scalar adds, and re-widened the value row and loaded and stored each head's
+  256-float accumulator once per cell.
+- **The indexer**, growing with the context: 0.2 ms a step at 2k, 2.3 at 32k, 5.2 at 128k.
+  Not the dots and not the bus (48 MB of pooled keys at 32k is 0.6 ms at the read ceiling):
+  the serial top-512 heap on the master, on scores that rise with position, so nearly every
+  block displaces the root - ~1 ms a layer at 32k blocks in isolation.
+
+**What changed, all three byte-identical:**
+
+1. `qe_attn_walk` blocked (`QE_ATTN_BLK`, on): a key row widened once per three heads with the
+   three heads' qe_dot_q8 accumulators in registers; the softmax bookkeeping per cell and per
+   head exactly as before; eight cells' value rows widened once into L1 and each head's
+   accumulator held in a register across them, rescales applied in cell order. Every output
+   element sees the same operations in the same order. `bench_attn`: 1.47x on a P-core, 1.55x
+   on an E-core, y/m/l byte-identical; in the engine 2.29 → 1.04 ms an ingested token and
+   3.31 → 1.65 ms a step at 32k (2.2x and 2.0x: the units are many and short, so the per-cell
+   overhead was a larger share than in the bench).
+2. `qe_idx_scores` (`QE_IDX_FAST`, on): four heads against two blocks, a block row loaded once
+   per two heads, the eight lane sums as one transpose and seven vector adds in qe_dot's order.
+   1.26-1.46x single-threaded, byte-identical; in the engine it is a small part of the indexer.
+3. `topk_radix` (`QE_TOPK_RADIX`, on): the k-th largest score by three histogram passes over
+   the score bits (a score is never negative, so its bits order as integers), then every block
+   at or above it. That is the heap's set exactly unless the k-th value is tied across the
+   boundary, in which case it returns -1 and the heap decides. Isolated, 1,020 → 74 us at 32k
+   rising scores, same set on iid and rising, declined on ties. In the engine the logits after
+   each depth's steps hash the same with it on and off at 2k, 8k, 16k and 32k (`/tmp/d_r0.log`
+   against `/tmp/depth3.log`), and the indexer is 2.32 → 0.97 ms a step at 32k, 5.30 → 3.16 at 128k.
+
+`make forward` after (1) and (2): 0 FAIL, 61 ok (`/tmp/qf_attn.log`).
+
+**Where it stands** (`/tmp/depth_radix.log`):
+
+| depth | ingestion before → after | a step before → after |
+|---|---|---|
+| 2k | 87.8 → 90.2 tok/s | 68.2 → 66.5 ms |
+| 8k | 79.4 → 86.5 | 68.5 → 66.0 |
+| 32k | 77.9 → 85.6 | 69.9 → 67.0 |
+| 64k | 76.8 → 84.4 | 71.8 → 67.4 |
+| 128k | 74.2 → **82.1** | 72.8 → **68.8** |
+
+A long conversation now costs ~1 % a doubling of context on both halves instead of ~2-3 %.
+What is left at 128k: the indexer's scoring, 3.2 ms a step and 0.55 ms an ingested token, which
+is the pooled keys streamed once a step (decode) and once per token per chunk (ingestion).
+
+**Halves for the pooled keys, measured and left off** (`QE_IDX_F16=1`): the keys stored as IEEE
+halves and widened with F16C in the same kernel. Next-token loss over 512 teacher-forced
+positions at 16k of context: 1.9438 against 1.9342 nats (+0.0096; `/tmp/nll_f16.log`), because
+rounding a key moves near-tied blocks across the selection boundary. What it buys (`/tmp/depth_f16.log`): the
+indexer 0.97 → 0.70 ms a step at 32k and 3.16 → 2.04 at 128k, 0.55 → 0.41 ms an ingested token at
+128k - about 1.5 % of a step at the deepest point, inside run-to-run noise of the whole step
+(69.2 against 68.8 ms in that load). Not worth a hundredth of a nat by default; the switch stays
+for an agent session that lives past 128k.
+
+**What is next here**, in order: the ingestion indexer as a tile (a chunk's 512 queries against
+one L2-resident run of pooled keys, instead of each token streaming the whole array: 0.55 ms at
+128k, growing); the step's scoring on its threshold histogram built inside the parallel scoring
+pass; then the selection-agreement measurement across the twelve attention layers, which is what
+selection reuse would need.
 
 ## 8. Sequences, state and concurrency
 

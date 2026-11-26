@@ -43,6 +43,7 @@
 #include "kern.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__x86_64__)
@@ -312,6 +313,172 @@ float qe_dot(const float *restrict a, const float *restrict b, long n) {
     return r;
 }
 
+/* The indexer's block scores, four heads against two blocks at a time: every dot is
+ * qe_dot's (four accumulators over runs of 32, (a0 + a1) + (a2 + a3), then the eight lanes
+ * summed left to right), so every score is the same float; the eight lane sums are done as
+ * one transpose and seven vector adds in that same order instead of eight stores and 56
+ * scalar adds, and a block's row is loaded once per two heads instead of once per head.
+ * Shapes other than four heads of a multiple of 32 go through qe_dot. */
+static int idx_fast_cached = -1;
+void qe_idx_set_fast(int on) { idx_fast_cached = on ? 1 : 0; }
+static int idx_fast(void) {
+    if (idx_fast_cached < 0) {
+        const char *e = getenv("QE_IDX_FAST");
+        idx_fast_cached = e && *e ? atoi(e) != 0 : 1;
+    }
+    return idx_fast_cached;
+}
+
+#if defined(__x86_64__)
+static inline void tr8_sum(const __m256 v[8], float out[8]) {
+    const __m256 t0 = _mm256_unpacklo_ps(v[0], v[1]), t1 = _mm256_unpackhi_ps(v[0], v[1]);
+    const __m256 t2 = _mm256_unpacklo_ps(v[2], v[3]), t3 = _mm256_unpackhi_ps(v[2], v[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(v[4], v[5]), t5 = _mm256_unpackhi_ps(v[4], v[5]);
+    const __m256 t6 = _mm256_unpacklo_ps(v[6], v[7]), t7 = _mm256_unpackhi_ps(v[6], v[7]);
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44), u1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    const __m256 u2 = _mm256_shuffle_ps(t1, t3, 0x44), u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44), u5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    const __m256 u6 = _mm256_shuffle_ps(t5, t7, 0x44), u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    /* lane j of every input: L0..L7 */
+    const __m256 L0 = _mm256_permute2f128_ps(u0, u4, 0x20), L4 = _mm256_permute2f128_ps(u0, u4, 0x31);
+    const __m256 L1 = _mm256_permute2f128_ps(u1, u5, 0x20), L5 = _mm256_permute2f128_ps(u1, u5, 0x31);
+    const __m256 L2 = _mm256_permute2f128_ps(u2, u6, 0x20), L6 = _mm256_permute2f128_ps(u2, u6, 0x31);
+    const __m256 L3 = _mm256_permute2f128_ps(u3, u7, 0x20), L7 = _mm256_permute2f128_ps(u3, u7, 0x31);
+    __m256 r = _mm256_add_ps(L0, L1);
+    r = _mm256_add_ps(r, L2);
+    r = _mm256_add_ps(r, L3);
+    r = _mm256_add_ps(r, L4);
+    r = _mm256_add_ps(r, L5);
+    r = _mm256_add_ps(r, L6);
+    r = _mm256_add_ps(r, L7);
+    _mm256_storeu_ps(out, r);
+}
+
+/* Two heads against one row: qe_dot's accumulators for each. */
+static inline void dot2_rows(const float *q0, const float *q1, const float *row, long n,
+                             __m256 *s0, __m256 *s1) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    __m256 b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    for (long i = 0; i < n; i += 32) {
+        const __m256 r0 = _mm256_loadu_ps(row + i), r1 = _mm256_loadu_ps(row + i + 8);
+        const __m256 r2 = _mm256_loadu_ps(row + i + 16), r3 = _mm256_loadu_ps(row + i + 24);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i), r0, a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 8), r1, a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 16), r2, a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 24), r3, a3);
+        b0 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i), r0, b0);
+        b1 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 8), r1, b1);
+        b2 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 16), r2, b2);
+        b3 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 24), r3, b3);
+    }
+    *s0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    *s1 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+}
+#endif
+
+void qe_idx_scores(const float *iq, const float *pool, int nih, int id, float scale, long lo,
+                   long hi, float *out) {
+    long b = lo;
+#if defined(__x86_64__)
+    if (nih == 4 && id % 32 == 0 && idx_fast()) {
+        const float *q0 = iq, *q1 = iq + id, *q2 = iq + 2 * (size_t)id, *q3 = iq + 3 * (size_t)id;
+        for (; b + 2 <= hi; b += 2) {
+            __m256 v[8];
+            float d[8];
+            const float *r0 = pool + (size_t)b * (size_t)id, *r1 = r0 + id;
+            dot2_rows(q0, q1, r0, id, &v[0], &v[1]);
+            dot2_rows(q2, q3, r0, id, &v[2], &v[3]);
+            dot2_rows(q0, q1, r1, id, &v[4], &v[5]);
+            dot2_rows(q2, q3, r1, id, &v[6], &v[7]);
+            tr8_sum(v, d);
+            for (int k = 0; k < 2; k++) {
+                float acc = 0.0f;
+                for (int h = 0; h < 4; h++)
+                    if (d[4 * k + h] > 0.0f)
+                        acc += d[4 * k + h];
+                out[b + k] = acc * scale;
+            }
+        }
+    }
+#endif
+    for (; b < hi; b++) {
+        float acc = 0.0f;
+        for (int h = 0; h < nih; h++) {
+            float d = qe_dot(iq + (size_t)h * (size_t)id, pool + (size_t)b * (size_t)id, id);
+            if (d > 0.0f)
+                acc += d;
+        }
+        out[b] = acc * scale;
+    }
+}
+
+/* The same scores over pooled keys stored as halves (QE_IDX_F16): each row widened with
+ * F16C and walked exactly as qe_idx_scores walks a float row. */
+#if defined(__x86_64__)
+static inline void dot2_rows_h(const float *q0, const float *q1, const uint16_t *row, long n,
+                               __m256 *s0, __m256 *s1) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    __m256 b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    for (long i = 0; i < n; i += 32) {
+        const __m256 r0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i)));
+        const __m256 r1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i + 8)));
+        const __m256 r2 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i + 16)));
+        const __m256 r3 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i + 24)));
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i), r0, a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 8), r1, a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 16), r2, a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + i + 24), r3, a3);
+        b0 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i), r0, b0);
+        b1 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 8), r1, b1);
+        b2 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 16), r2, b2);
+        b3 = _mm256_fmadd_ps(_mm256_loadu_ps(q1 + i + 24), r3, b3);
+    }
+    *s0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    *s1 = _mm256_add_ps(_mm256_add_ps(b0, b1), _mm256_add_ps(b2, b3));
+}
+#endif
+
+void qe_idx_scores_h(const float *iq, const void *poolv, int nih, int id, float scale, long lo,
+                     long hi, float *out) {
+    const uint16_t *pool = poolv;
+    long b = lo;
+#if defined(__x86_64__)
+    if (nih == 4 && id % 32 == 0) {
+        const float *q0 = iq, *q1 = iq + id, *q2 = iq + 2 * (size_t)id, *q3 = iq + 3 * (size_t)id;
+        for (; b + 2 <= hi; b += 2) {
+            __m256 v[8];
+            float d[8];
+            const uint16_t *r0 = pool + (size_t)b * (size_t)id, *r1 = r0 + id;
+            dot2_rows_h(q0, q1, r0, id, &v[0], &v[1]);
+            dot2_rows_h(q2, q3, r0, id, &v[2], &v[3]);
+            dot2_rows_h(q0, q1, r1, id, &v[4], &v[5]);
+            dot2_rows_h(q2, q3, r1, id, &v[6], &v[7]);
+            tr8_sum(v, d);
+            for (int k = 0; k < 2; k++) {
+                float acc = 0.0f;
+                for (int h = 0; h < 4; h++)
+                    if (d[4 * k + h] > 0.0f)
+                        acc += d[4 * k + h];
+                out[b + k] = acc * scale;
+            }
+        }
+    }
+#endif
+    for (; b < hi; b++) {
+        float acc = 0.0f;
+        for (int h = 0; h < nih; h++) {
+            const float *q = iq + (size_t)h * (size_t)id;
+            const uint16_t *r = pool + (size_t)b * (size_t)id;
+            float d = 0.0f;
+            for (int c = 0; c < id; c++)
+                d += q[c] * _cvtsh_ss(r[c]);
+            if (d > 0.0f)
+                acc += d;
+        }
+        out[b] = acc * scale;
+    }
+}
+
 void qe_axpy(float *restrict y, const float *restrict x, float a, long n) {
     long i = 0;
 #if defined(__x86_64__)
@@ -458,8 +625,168 @@ static inline void qe_scale_row(float *restrict y, float a, long n) {
  * and degrades to a head at a time for a checkpoint whose group is wider. */
 #define QE_ATTN_SIMD_MAX 16
 
+/* The same walk, blocked (QE_ATTN_BLK, on): the floating-point operations every output
+ * element sees are the ones qe_attn_walk performs, in the same order, so the result is
+ * the same bytes; what changes is how often the operands are fetched and widened.
+ *
+ *  - a key row is widened once per three heads instead of once per head, the three
+ *    heads' four accumulators each living in registers across the row (qe_dot_q8's own
+ *    accumulator layout, so the same sums);
+ *  - the softmax bookkeeping runs per cell and per head exactly as before, scalar, and
+ *    records each cell's weight and any rescale;
+ *  - eight cells' value rows are widened once into L1, and each head's accumulator is
+ *    loaded once per eight-float slice, receives the eight cells' rescales and FMAs in
+ *    cell order in a register, and is stored once, where qe_axpy_q8 loaded and stored
+ *    it per cell per head. */
+#define ATTN_BLK 8
+#if defined(__x86_64__)
+static inline float hsum8_seq(__m256 s) {
+    float t[8];
+    _mm256_storeu_ps(t, s);
+    return t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+}
+
+/* One cell's key row against `nh` (1..3) heads: qe_dot_q8 per head, bit for bit. */
+static inline void dot3_q8(const float *q, long hd, int nh, const int8_t *k, float *out) {
+    __m256 a[3][4];
+    for (int h = 0; h < 3; h++)
+        for (int r = 0; r < 4; r++)
+            a[h][r] = _mm256_setzero_ps();
+    for (long i = 0; i < hd; i += 32) {
+        const __m256 f0 = q_i8x8(k + i), f1 = q_i8x8(k + i + 8);
+        const __m256 f2 = q_i8x8(k + i + 16), f3 = q_i8x8(k + i + 24);
+        for (int h = 0; h < 3; h++) {
+            if (h >= nh)
+                break;
+            const float *qh = q + (size_t)h * hd + i;
+            a[h][0] = _mm256_fmadd_ps(_mm256_loadu_ps(qh), f0, a[h][0]);
+            a[h][1] = _mm256_fmadd_ps(_mm256_loadu_ps(qh + 8), f1, a[h][1]);
+            a[h][2] = _mm256_fmadd_ps(_mm256_loadu_ps(qh + 16), f2, a[h][2]);
+            a[h][3] = _mm256_fmadd_ps(_mm256_loadu_ps(qh + 24), f3, a[h][3]);
+        }
+    }
+    for (int h = 0; h < nh; h++)
+        out[h] = hsum8_seq(_mm256_add_ps(_mm256_add_ps(a[h][0], a[h][1]),
+                                         _mm256_add_ps(a[h][2], a[h][3])));
+}
+
+static void qe_attn_walk_blk(const qe_attn_unit *u) {
+    const long hd = u->hd;
+    const int per = u->per;
+    for (int h = 0; h < per; h++) {
+        u->m[h] = -1e30f;
+        u->l[h] = 0.0f;
+        memset(u->y + (size_t)h * hd, 0, (size_t)hd * sizeof(float));
+    }
+    float vf[ATTN_BLK][256] __attribute__((aligned(32)));
+    float wv[ATTN_BLK][QE_ATTN_SIMD_MAX]; /* weight times the cell's value scale */
+    float al[ATTN_BLK][QE_ATTN_SIMD_MAX]; /* rescale factor, 1 when none */
+    unsigned char rs[ATTN_BLK][QE_ATTN_SIMD_MAX];
+    for (int c0 = 0; c0 < u->nsel; c0 += ATTN_BLK) {
+        const int nc = u->nsel - c0 < ATTN_BLK ? u->nsel - c0 : ATTN_BLK;
+        int any_rs = 0;
+        for (int c = 0; c < nc; c++) {
+            const long cell = u->sel[c0 + c];
+            const int8_t *kq = u->kd + (size_t)cell * u->krow + (size_t)u->kv_head * hd;
+            const int8_t *vq = u->vd + (size_t)cell * u->krow + (size_t)u->kv_head * hd;
+            const float ks = u->ks[(size_t)cell * u->sstride + u->kv_head];
+            const float vs = u->vs[(size_t)cell * u->sstride + u->kv_head];
+            float sc[QE_ATTN_SIMD_MAX], d[QE_ATTN_SIMD_MAX], w[QE_ATTN_SIMD_MAX];
+            for (int h0 = 0; h0 < per; h0 += 3)
+                dot3_q8(u->q + (size_t)h0 * hd, hd, per - h0 < 3 ? per - h0 : 3, kq, sc + h0);
+            for (int h = 0; h < per; h++) {
+                float s = sc[h] * ks;
+                s *= u->scale;
+                float m = u->m[h];
+                if (s - m > QE_ATTN_RESCALE_NATS) {
+                    const float alpha = expf(m - s);
+                    u->m[h] = s;
+                    u->l[h] *= alpha;
+                    al[c][h] = alpha;
+                    rs[c][h] = 1;
+                    any_rs = 1;
+                    d[h] = 0.0f;
+                } else {
+                    rs[c][h] = 0;
+                    d[h] = s - m;
+                }
+            }
+            if (u->exp2)
+                qe_exp2v(d, w, per);
+            else
+                for (int h = 0; h < per; h++)
+                    w[h] = expf(d[h]);
+            for (int h = 0; h < per; h++) {
+                u->l[h] += w[h];
+                wv[c][h] = w[h] * vs;
+            }
+            for (long i = 0; i < hd; i += 8)
+                _mm256_store_ps(&vf[c][i], q_i8x8(vq + i));
+        }
+        for (int h = 0; h < per; h++) {
+            float *y = u->y + (size_t)h * hd;
+            __m256 wb[ATTN_BLK], ab[ATTN_BLK];
+            int hr = 0;
+            for (int c = 0; c < nc; c++) {
+                wb[c] = _mm256_set1_ps(wv[c][h]);
+                ab[c] = _mm256_set1_ps(rs[c][h] ? al[c][h] : 1.0f);
+                hr |= any_rs && rs[c][h];
+            }
+            /* Four slices in flight: one slice's eight FMAs are a dependent chain, and
+             * a chain at a time is the FMA latency, not its throughput. */
+            for (long i = 0; i < hd; i += 32) {
+                __m256 a0 = _mm256_loadu_ps(y + i), a1 = _mm256_loadu_ps(y + i + 8);
+                __m256 a2 = _mm256_loadu_ps(y + i + 16), a3 = _mm256_loadu_ps(y + i + 24);
+                if (hr) {
+                    for (int c = 0; c < nc; c++) {
+                        if (rs[c][h]) {
+                            a0 = _mm256_mul_ps(ab[c], a0);
+                            a1 = _mm256_mul_ps(ab[c], a1);
+                            a2 = _mm256_mul_ps(ab[c], a2);
+                            a3 = _mm256_mul_ps(ab[c], a3);
+                        }
+                        a0 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i]), a0);
+                        a1 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 8]), a1);
+                        a2 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 16]), a2);
+                        a3 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 24]), a3);
+                    }
+                } else {
+                    for (int c = 0; c < nc; c++) {
+                        a0 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i]), a0);
+                        a1 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 8]), a1);
+                        a2 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 16]), a2);
+                        a3 = _mm256_fmadd_ps(wb[c], _mm256_load_ps(&vf[c][i + 24]), a3);
+                    }
+                }
+                _mm256_storeu_ps(y + i, a0);
+                _mm256_storeu_ps(y + i + 8, a1);
+                _mm256_storeu_ps(y + i + 16, a2);
+                _mm256_storeu_ps(y + i + 24, a3);
+            }
+        }
+    }
+}
+#endif
+
+static int attn_blk_cached = -1;
+static int attn_blk_env(void) {
+    if (attn_blk_cached < 0) {
+        const char *e = getenv("QE_ATTN_BLK");
+        attn_blk_cached = e && *e ? atoi(e) != 0 : 1;
+    }
+    return attn_blk_cached;
+}
+void qe_attn_set_blk(int on) { attn_blk_cached = on ? 1 : 0; }
+int qe_attn_get_blk(void) { return attn_blk_env(); }
+
 void qe_attn_walk(const qe_attn_unit *u) {
     const long hd = u->hd;
+#if defined(__x86_64__)
+    if (u->q8 && hd % 32 == 0 && hd <= 256 && u->per <= QE_ATTN_SIMD_MAX && attn_blk_env()) {
+        qe_attn_walk_blk(u);
+        return;
+    }
+#endif
     for (int h = 0; h < u->per; h++) {
         u->m[h] = -1e30f; /* the floor the score loop has always carried */
         u->l[h] = 0.0f;

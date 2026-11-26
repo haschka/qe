@@ -6,7 +6,9 @@ three rules after it.
 ## 0. The bar: 50 tokens/second on ingestion
 
 Ingestion is over the bar, and the bar stays. Current reading: **87 to 93 tok/s** (10.7-11.5
-ms/token, `make forward` and `make decode --pp` after ideas.md §7.30-7.35, 0 FAIL), and generation **15.6 tok/s** (64.0
+ms/token, `make forward` and `make decode --pp` after ideas.md §7.30-7.35, 0 FAIL; 78-80 tok/s
+from 2.5k to 20k tokens, `make decode` with `--pp 20480 --timeline`, ideas.md §7.36; 82.1 tok/s and
+68.8 ms a step at 128k of context, `bench_decode --depths`, ideas.md §7.37), and generation **15.6 tok/s** (64.0
 ms/token) where it was 10.9 - a third of every decode step had been threads waiting at barriers on
 this P+E chip, and rows are now handed out from a cursor (ideas.md §7.30; `make decode` is the
 instrument). Any new walk whose output rows are independent should take its rows from a cursor,

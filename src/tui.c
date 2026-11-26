@@ -114,7 +114,11 @@ void qe_ui_head(const char *head, const char *sub) {
 
 void qe_ui_request(const char *kind, const char *id) {
     pthread_mutex_lock(&lk);
-    snprintf(cur_req, sizeof cur_req, "%s %s", kind ? kind : "request", id ? id : "-");
+    /* The id's last six characters, as the history rows carry it: a chat id is
+     * thirty columns of which only the tail tells two requests apart. */
+    const char *idv = id ? id : "-";
+    const size_t il = strlen(idv);
+    snprintf(cur_req, sizeof cur_req, "%s %s", kind ? kind : "request", il > 6 ? idv + il - 6 : idv);
     pthread_mutex_unlock(&lk);
 }
 
@@ -274,10 +278,89 @@ static void short_count(char *dst, size_t n, long long v) {
 /* The two phase labels keep their letters in the same columns, because the question
  * the panel exists to answer is "which of these two is it doing right now", and a
  * label that moves is a label that has to be re-read. */
-enum { ST_PLAIN = 0, ST_HEAD, ST_DIM, ST_LABEL, ST_BAR, ST_HOT, ST_N };
-static const char *sgr[ST_N] = {
-    "", "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m",
+enum {
+    ST_PLAIN = 0,
+    ST_HEAD,   /* bold */
+    ST_DIM,    /* secondary text: separators, units, inactive labels */
+    ST_LABEL,  /* a section label at rest */
+    ST_BAR,    /* the prompt's bar, filled, while it is being read: #66CCFF */
+    ST_HOT,    /* the answer's colour: warm amber, the blue's complement */
+    ST_IN,     /* the INGEST label while ingesting: the bar's blue, bold */
+    ST_OUT,    /* the EMIT label while emitting: the amber, bold */
+    ST_BARDIM, /* the bar once its prompt has been read: the same blue, muted */
+    ST_TRACK,  /* the bar's empty cells */
+    ST_PART,   /* the one partly filled cell: blue on the track */
+    ST_PARTDIM,
+    ST_INTXT,  /* ingestion figures in the history rows */
+    ST_OK,     /* a request that finished the way it meant to */
+    ST_BAD,    /* one that did not */
+    ST_HOTDIM, /* the amber, muted: the trend's older answer seconds */
+    ST_N
 };
+/* Composed at start for the terminal's colour depth: 24-bit where the terminal says so
+ * (or is an xterm, which has taken direct colour since 2012), the 256-colour cube where
+ * TERM asks for it, and the sixteen ANSI colours otherwise. The palette is one accent,
+ * #66CCFF, for everything about reading a prompt, and its warm complement for everything
+ * about writing an answer; the rest is grey. */
+static char sgr[ST_N][48];
+static int track_bg; /* the track is a background (a solid band) rather than a glyph */
+
+static void palette_init(void) {
+    const char *ct = getenv("COLORTERM"), *term = getenv("TERM");
+    const int truec = (ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) ||
+                      (term && !strncmp(term, "xterm", 5) && !getenv("QE_UI_256"));
+    const int c256 = truec || (term && strstr(term, "256"));
+    snprintf(sgr[ST_HEAD], sizeof sgr[0], "\033[1m");
+    if (truec) {
+        snprintf(sgr[ST_DIM], sizeof sgr[0], "\033[38;2;122;133;144m");
+        snprintf(sgr[ST_LABEL], sizeof sgr[0], "\033[38;2;150;160;170m");
+        snprintf(sgr[ST_BAR], sizeof sgr[0], "\033[38;2;102;204;255m");
+        snprintf(sgr[ST_HOT], sizeof sgr[0], "\033[38;2;255;204;102m");
+        snprintf(sgr[ST_IN], sizeof sgr[0], "\033[1;38;2;102;204;255m");
+        snprintf(sgr[ST_OUT], sizeof sgr[0], "\033[1;38;2;255;204;102m");
+        snprintf(sgr[ST_BARDIM], sizeof sgr[0], "\033[38;2;58;122;153m");
+        snprintf(sgr[ST_TRACK], sizeof sgr[0], "\033[48;2;34;48;58m");
+        snprintf(sgr[ST_PART], sizeof sgr[0], "\033[38;2;102;204;255;48;2;34;48;58m");
+        snprintf(sgr[ST_PARTDIM], sizeof sgr[0], "\033[38;2;58;122;153;48;2;34;48;58m");
+        snprintf(sgr[ST_INTXT], sizeof sgr[0], "\033[38;2;102;204;255m");
+        snprintf(sgr[ST_OK], sizeof sgr[0], "\033[38;2;119;221;153m");
+        snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[38;2;255;110;110m");
+        snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[38;2;166;133;66m");
+        track_bg = 1;
+    } else if (c256) {
+        snprintf(sgr[ST_DIM], sizeof sgr[0], "\033[38;5;245m");
+        snprintf(sgr[ST_LABEL], sizeof sgr[0], "\033[38;5;248m");
+        snprintf(sgr[ST_BAR], sizeof sgr[0], "\033[38;5;81m");
+        snprintf(sgr[ST_HOT], sizeof sgr[0], "\033[38;5;221m");
+        snprintf(sgr[ST_IN], sizeof sgr[0], "\033[1;38;5;81m");
+        snprintf(sgr[ST_OUT], sizeof sgr[0], "\033[1;38;5;221m");
+        snprintf(sgr[ST_BARDIM], sizeof sgr[0], "\033[38;5;67m");
+        snprintf(sgr[ST_TRACK], sizeof sgr[0], "\033[48;5;236m");
+        snprintf(sgr[ST_PART], sizeof sgr[0], "\033[38;5;81;48;5;236m");
+        snprintf(sgr[ST_PARTDIM], sizeof sgr[0], "\033[38;5;67;48;5;236m");
+        snprintf(sgr[ST_INTXT], sizeof sgr[0], "\033[38;5;81m");
+        snprintf(sgr[ST_OK], sizeof sgr[0], "\033[38;5;114m");
+        snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[38;5;203m");
+        snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[38;5;136m");
+        track_bg = 1;
+    } else {
+        snprintf(sgr[ST_DIM], sizeof sgr[0], "\033[90m");
+        snprintf(sgr[ST_LABEL], sizeof sgr[0], "\033[37m");
+        snprintf(sgr[ST_BAR], sizeof sgr[0], "\033[96m");
+        snprintf(sgr[ST_HOT], sizeof sgr[0], "\033[93m");
+        snprintf(sgr[ST_IN], sizeof sgr[0], "\033[1;96m");
+        snprintf(sgr[ST_OUT], sizeof sgr[0], "\033[1;93m");
+        snprintf(sgr[ST_BARDIM], sizeof sgr[0], "\033[36m");
+        snprintf(sgr[ST_TRACK], sizeof sgr[0], "\033[90m");
+        snprintf(sgr[ST_PART], sizeof sgr[0], "\033[96m");
+        snprintf(sgr[ST_PARTDIM], sizeof sgr[0], "\033[36m");
+        snprintf(sgr[ST_INTXT], sizeof sgr[0], "\033[96m");
+        snprintf(sgr[ST_OK], sizeof sgr[0], "\033[92m");
+        snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[91m");
+        snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[33m");
+        track_bg = 0;
+    }
+}
 
 static int tty;  /* stdout is a terminal: it is measured, styled and synchronised */
 static int color;
@@ -407,7 +490,14 @@ static void ln_rule(ln *l, const char *glyph) {
  * uglier on purpose and correct on every terminal. */
 static struct {
     const char *rule, *full, *empty, *arrow, *sep;
-} g = { "-", "#", ".", "|", " - " };
+    const char *part[8];  /* a cell filled to i eighths, i = 1..7 (0 unused) */
+    const char *spark[9]; /* a sparkline column at height 0..8 */
+    const char *spin[10];
+    int nspin;
+} g = { "-", "#", ".", ">", " - ",
+        { "", "#", "#", "#", "#", "#", "#", "#" },
+        { " ", "_", "_", ".", ".", "-", "-", "=", "#" },
+        { "|", "/", "-", "\\" }, 4 };
 
 static void glyphs_init(void) {
     static const char *env[] = { "LC_ALL", "LC_CTYPE", "LANG", NULL };
@@ -422,6 +512,27 @@ static void glyphs_init(void) {
                 g.empty = "░";
                 g.arrow = "▸";
                 g.sep = " · ";
+                static const char *eighths[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
+                static const char *bars[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+                /* The Linux console's font has the block elements and not braille. */
+                const char *term = getenv("TERM");
+                const int console = term && !strcmp(term, "linux");
+                static const char *braille[10] = { "⠋", "⠙", "⠹", "⠸", "⠼",
+                                                   "⠴", "⠦", "⠧", "⠇", "⠏" };
+                static const char *quad[4] = { "▖", "▘", "▝", "▗" };
+                for (int k = 0; k < 8; k++)
+                    g.part[k] = console ? (k >= 4 ? "▌" : "") : eighths[k];
+                for (int k = 0; k < 9; k++)
+                    g.spark[k] = bars[k];
+                if (console) {
+                    for (int k = 0; k < 4; k++)
+                        g.spin[k] = quad[k];
+                    g.nspin = 4;
+                } else {
+                    for (int k = 0; k < 10; k++)
+                        g.spin[k] = braille[k];
+                    g.nspin = 10;
+                }
                 return;
             }
     }
@@ -456,26 +567,209 @@ static int height_of(void) {
     return 24;
 }
 
-static void bar(char *dst, size_t n, int width, long done, long total) {
-    int fill = 0;
+/* The prompt's bar: `width` cells, filled to the eighth of a cell, so a 68-cell bar has
+ * 544 positions and moves with the per-layer progress instead of in chunk-sized jumps.
+ * Filled cells are one run of one style, the partial cell its own, the track one run:
+ * three escapes a row however long the bar, and a row that differs from the last frame
+ * only when the bar has actually moved an eighth. */
+static void ln_bar(ln *l, int width, long done, long total, int active) {
+    long eighths = 0;
     if (total > 0) {
         double f = (double)done / (double)total;
         if (f < 0)
             f = 0;
         if (f > 1)
             f = 1;
-        fill = (int)(f * width + 0.5);
+        eighths = (long)(f * width * 8 + 0.5);
     }
-    if (fill > width)
-        fill = width;
+    if (eighths > (long)width * 8)
+        eighths = (long)width * 8;
+    int full = (int)(eighths / 8), rem = (int)(eighths % 8);
+    if (rem && !g.part[rem][0])
+        rem = 0; /* a font with no partial cells rounds down */
+    char run[68 * 4 * 4 + 8];
     size_t o = 0;
-    for (int i = 0; i < width && o + 8 < n; i++) {
-        const char *cell = i < fill ? g.full : g.empty;
-        size_t l = strlen(cell);
-        memcpy(dst + o, cell, l);
-        o += l;
+    for (int i = 0; i < full && o + 5 < sizeof run; i++) {
+        size_t gl = strlen(g.full);
+        memcpy(run + o, g.full, gl);
+        o += gl;
     }
-    dst[o] = 0;
+    run[o] = 0;
+    if (full)
+        ln_put(l, run, active ? ST_BAR : ST_BARDIM);
+    int used = full;
+    if (rem && used < width) {
+        ln_put(l, g.part[rem], color ? (active ? ST_PART : ST_PARTDIM) : ST_PLAIN);
+        used++;
+    }
+    o = 0;
+    const char *empty = color && track_bg ? " " : g.empty;
+    for (int i = used; i < width && o + 5 < sizeof run; i++) {
+        size_t gl = strlen(empty);
+        memcpy(run + o, empty, gl);
+        o += gl;
+    }
+    run[o] = 0;
+    if (used < width)
+        ln_put(l, run, color ? ST_TRACK : ST_PLAIN);
+}
+
+/* The last minute of work, one column a second: a column is the second's rate, blue for
+ * a second spent reading a prompt and amber for one spent writing an answer, each scaled
+ * to its own kind's peak in the window (a prompt is read five times faster than an answer
+ * is written, and one scale would flatten every answer). Sampled by the render thread
+ * from the counters it already reads; seconds with nothing in hand are not recorded, so
+ * an idle panel is a still one. */
+#define SPARK_N 128
+static struct {
+    unsigned char kind[SPARK_N]; /* 1 ingest, 2 emit */
+    float rate[SPARK_N];
+    int n, head;
+    long sec;           /* the second the last column closed on */
+    double req;         /* the request the baselines belong to */
+    long d0, e0;        /* counters when the current second opened */
+    double t0;
+    /* The last three seconds' raw deltas: a column is their average, the same three
+     * seconds the live figure is read over, because a second on its own lands one or
+     * two layers of a chunk either side and draws a steady rate as a saw. */
+    double rd[3], re[3], rt[3];
+    int rn;
+    unsigned char lk; /* the kind of the last column */
+} sp;
+
+static void spark_sample(double tnow, double req, long phase, long done, long emit) {
+    if (req != sp.req) {
+        sp.req = req;
+        sp.d0 = done;
+        sp.e0 = emit;
+        sp.t0 = tnow;
+        sp.sec = (long)tnow;
+        sp.rn = 0;
+        return;
+    }
+    if ((long)tnow == sp.sec)
+        return;
+    const double dt = tnow - sp.t0;
+    const long dd = done - sp.d0, de = emit - sp.e0;
+    if (dt > 0.2 && (phase != IDLE || dd > 0 || de > 0)) {
+        unsigned char k = de > 0 || phase == EMITTING ? 2 : 1;
+        if (dd > 0 && de == 0)
+            k = 1;
+        if (k != sp.lk)
+            sp.rn = 0; /* a prompt's seconds say nothing about an answer's rate */
+        sp.lk = k;
+        for (int q = 2; q > 0; q--) {
+            sp.rd[q] = sp.rd[q - 1];
+            sp.re[q] = sp.re[q - 1];
+            sp.rt[q] = sp.rt[q - 1];
+        }
+        sp.rd[0] = (double)dd;
+        sp.re[0] = (double)de;
+        sp.rt[0] = dt;
+        if (sp.rn < 3)
+            sp.rn++;
+        double sd = 0, se = 0, st = 0;
+        for (int q = 0; q < sp.rn; q++) {
+            sd += sp.rd[q];
+            se += sp.re[q];
+            st += sp.rt[q];
+        }
+        const int at = (sp.head + sp.n) % SPARK_N;
+        sp.kind[at] = k;
+        sp.rate[at] = (float)((k == 1 ? sd : se) / st);
+        if (sp.n < SPARK_N)
+            sp.n++;
+        else
+            sp.head = (sp.head + 1) % SPARK_N;
+    }
+    sp.sec = (long)tnow;
+    sp.d0 = done;
+    sp.e0 = emit;
+    sp.t0 = tnow;
+}
+
+/* The last `width` columns, right-aligned so the newest second is at the right edge. */
+static void ln_spark(ln *l, int width, float *pin, float *pout) {
+    const int nshow = sp.n < width ? sp.n : width;
+    const int first = sp.n - nshow;
+    float mi = 0, mo = 0;
+    for (int i = 0; i < nshow; i++) {
+        const int at = (sp.head + first + i) % SPARK_N;
+        if (sp.kind[at] == 1 && sp.rate[at] > mi)
+            mi = sp.rate[at];
+        if (sp.kind[at] == 2 && sp.rate[at] > mo)
+            mo = sp.rate[at];
+    }
+    *pin = mi;
+    *pout = mo;
+    if (nshow < width) {
+        char pad[LINE_CHARS];
+        int k = 0;
+        for (; k < width - nshow && k < (int)sizeof pad - 1; k++)
+            pad[k] = ' ';
+        pad[k] = 0;
+        ln_put(l, pad, ST_PLAIN);
+    }
+    /* Scaled so a kind's peak is seven eighths of the row: a steady rate reads as a
+     * line with room above it rather than as a solid block that repeats the bar. Older
+     * seconds are muted and the newest is in full colour, so the eye lands on now. */
+    char run[SPARK_N * 4 + 8];
+    size_t o = 0;
+    int kind = 0;
+    for (int i = 0; i < nshow; i++) {
+        const int at = (sp.head + first + i) % SPARK_N;
+        const int k = sp.kind[at];
+        const int last = i == nshow - 1;
+        if ((k != kind || last) && o) {
+            run[o] = 0;
+            ln_put(l, run, kind == 1 ? ST_BARDIM : ST_HOTDIM);
+            o = 0;
+        }
+        kind = k;
+        const float m = k == 1 ? mi : mo;
+        int h = m > 0 ? (int)(sp.rate[at] / m * 7.0f + 0.5f) : 0;
+        if (h < 1 && sp.rate[at] > 0)
+            h = 1;
+        if (h > 8)
+            h = 8;
+        const char *gl = g.spark[h];
+        if (last) {
+            ln_put(l, gl, k == 1 ? ST_BAR : ST_HOT);
+            continue;
+        }
+        size_t n = strlen(gl);
+        memcpy(run + o, gl, n);
+        o += n;
+    }
+}
+
+/* One finished request, styled by part: who and when in grey, the prompt half in the
+ * blue, the answer half in the amber, and how it ended green or red. A line that does
+ * not have the shape serve.c gives it (a warning, say) is drawn whole, and a warning in
+ * red. */
+static void ln_hist(ln *l, const char *h) {
+    if (!strncmp(h, "qe: WARN", 8)) {
+        ln_addf(l, ST_BAD, "%s", h);
+        return;
+    }
+    const char *pi = strstr(h, "  in "), *po = pi ? strstr(pi, "  out ") : NULL;
+    const char *pf = po ? strstr(po + 6, "  ") : NULL;
+    if (!pi || !po || !pf) {
+        ln_addf(l, ST_DIM, "%s", h);
+        return;
+    }
+    char a[LINE_CHARS];
+    snprintf(a, sizeof a, "%.*s", (int)(pi - h), h);
+    ln_addf(l, ST_DIM, "%s", a);
+    snprintf(a, sizeof a, "%.*s", (int)(po - pi), pi);
+    ln_addf(l, ST_INTXT, "%s", a);
+    snprintf(a, sizeof a, "%.*s", (int)(pf - po), po);
+    ln_addf(l, ST_HOT, "%s", a);
+    const char *fin = pf + 2;
+    const int good = !strncmp(fin, "stop", 4) || !strncmp(fin, "tool", 4);
+    const int warn = !strncmp(fin, "length", 6);
+    ln_put(l, "  ", ST_PLAIN);
+    ln_addf(l, good ? ST_OK : warn ? ST_HOT : ST_BAD, "%s", fin);
 }
 
 /* Seconds, at the granularity that line is worth changing for. The uptime used to be
@@ -545,7 +839,21 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     char who[LINE_CHARS], head[LINE_CHARS], sub[LINE_CHARS], hist[LOG_LINES][LINE_CHARS];
     pthread_mutex_lock(&lk);
     snprintf(who, sizeof who, "%s", cur_req[0] ? cur_req : "idle");
-    snprintf(head, sizeof head, "%s", hdr[0]);
+    /* The header may carry the separator glyph; a terminal that cannot decode it gets
+     * the ASCII one the rest of the panel already uses. */
+    {
+        const int utf = g.sep[1] != '-';
+        size_t o = 0;
+        for (const char *q = hdr[0]; *q && o + 2 < sizeof head; q++) {
+            if (!utf && (unsigned char)q[0] == 0xc2 && (unsigned char)q[1] == 0xb7) {
+                head[o++] = '-';
+                q++;
+                continue;
+            }
+            head[o++] = *q;
+        }
+        head[o] = 0;
+    }
     snprintf(sub, sizeof sub, "%s", hdr[1]);
     int nl = nlog;
     for (int i = 0; i < nl; i++) {
@@ -616,11 +924,11 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
             if (phase == INGESTING && total > done) {
                 char eta[16];
                 hms(eta, sizeof eta, (double)(total - done) / ir);
-                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s %6s left", ir, eta);
+                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s%s%s left", ir, g.sep, eta);
             } else {
                 char d[16];
                 hms(d, sizeof d, ing_secs);
-                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s %6s", ir, d);
+                snprintf(s_ing, sizeof s_ing, "%5.1f tok/s%sin %s", ir, g.sep, d);
             }
         } else if (total > 0 && base >= total) {
             snprintf(s_ing, sizeof s_ing, "all cached");
@@ -634,7 +942,11 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     char up[32], elh[32], a[24], b[24], h2[24], u[24], e2[24], s2[24], cb[24];
     hms(up, sizeof up, now_s() - started);
     secs10(elh, sizeof elh, el);
-    comma(a, sizeof a, done);
+    /* A prompt whose reading is closed is shown whole: its last token goes through the
+     * answer's first step, not the prompt pass, so the counter stops one short of it
+     * and a finished prompt would otherwise sit at 99 % for the whole answer. */
+    const long shown = it1 > 0.0 && total > 0 && done < total ? total : done;
+    comma(a, sizeof a, shown);
     comma(b, sizeof b, total);
     comma(h2, sizeof h2, emit);
     short_count(u, sizeof u, ing);
@@ -642,14 +954,35 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     short_count(s2, sizeof s2, saved);
     comma(cb, sizeof cb, cbytes / 1048576);
 
-    /* The frame is header, sub-header when there is one, rule, ingest, emit, rule,
-     * total, cache, and then whatever history the screen has room for. The rules and
-     * the last two lines go first when the terminal is short, because the two
-     * counters are the answer to the question the panel was written for. */
+    spark_sample(tnow, t0, phase, done, emit);
+
+    /* The frame, top to bottom, at 80x25:
+     *
+     *    qe  <engine, arch, ctx, stage, port>                           up 3h12m
+     *    <draft head, when there is one>
+     *    ─────────────────────────────────────────────────────────────────────
+     *    INGEST ⠹  12,288/23,463 tok   52%              85.6 tok/s  2m14s left
+     *              ████████████████████████████▋░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+     *    EMIT   ▸   1,234 tok · 15.6 tok/s · 12.4 s               chat 3f9a1c
+     *    trend  ▸         ▂▃▅▇▇▇▇▇▇▆▆▆▆▅▂▂▂▂▂▂▂▂▂▂▂   peak 91 in · 15.7 out
+     *    ─────────────────────────────────────────────────────────────────────
+     *    total    <counters since start>
+     *    cache    <rewind points>
+     *    ── recent ───────────────────────────────────────────────────────────
+     *    qe: chat ...                     (as many as the screen has room for)
+     *
+     * Twelve rows and five of history: seventeen of the twenty-four a 25-row terminal
+     * leaves the panel. A shorter screen gives up, in this order, the history, the
+     * rules, the trend, the bar and the two counter rows; the header and the two phase
+     * rows are what the panel is for and they always stay. */
     int show_sub = sub[0] != '\0';
-    int show_rules = budget >= 7;
-    int show_tail = budget >= 5;
-    int max_log = budget - (show_tail ? (show_rules ? 7 : 5) : 3) - (show_sub ? 1 : 0);
+    int left = budget - 3 - (show_sub ? 1 : 0);
+    const int show_bar = left >= 1 && (left -= 1, 1);
+    const int show_tail = left >= 2 && (left -= 2, 1);
+    const int show_rules = left >= 2 && (left -= 2, 1);
+    const int show_trend = left >= 1 && (left -= 1, 1);
+    const int show_recent = show_rules && nl > 0 && left >= 2 && (left -= 1, 1);
+    int max_log = left;
     if (max_log < 0)
         max_log = 0;
     if (max_log > LOG_LINES)
@@ -657,75 +990,78 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
 
     int n = 0;
     ln l;
+    const int spin = (int)(tnow * 10.0) % g.nspin;
+    const int ARG = 11; /* the column every figure after a label starts in */
 
+    /* Header: the wordmark, the engine, and the uptime pinned right. */
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
+    ln_addf(&l, ST_IN, "qe");
+    ln_put(&l, "  ", ST_PLAIN);
     {
-        /* The header gives way to the uptime, never the other way round. */
+        /* The header gives way to the uptime, never the other way round. The engine's
+         * id is the first word and the one in bold; the rest is grey. */
         char hc[LINE_CHARS];
-        int room = width - vwidth(up) - 3;
+        int room = width - vwidth(up) - 3 - l.used - 3;
         if (room < 8)
             room = 8;
         int cut = vwidth(head) > room ? clip_cols(hc, sizeof hc, head, room - 2) : 0;
-        ln_addf(&l, ST_HEAD, "%s", cut ? hc : head);
+        const char *h = cut ? hc : head;
+        const char *sp1 = strchr(h, ' ');
+        if (sp1) {
+            char first[LINE_CHARS];
+            snprintf(first, sizeof first, "%.*s", (int)(sp1 - h), h);
+            ln_addf(&l, ST_HEAD, "%s", first);
+            ln_addf(&l, ST_DIM, "%s", sp1);
+        } else {
+            ln_addf(&l, ST_HEAD, "%s", h);
+        }
         if (cut)
-            ln_addf(&l, ST_LABEL, "..");
+            ln_addf(&l, ST_DIM, "..");
     }
-    ln_to(&l, width - vwidth(up) < l.used ? l.used : width - vwidth(up));
-    ln_addf(&l, ST_DIM, "%s", up);
+    ln_to(&l, width - vwidth(up) - 3 < l.used ? l.used : width - vwidth(up) - 3);
+    ln_addf(&l, ST_DIM, "up ");
+    ln_addf(&l, ST_LABEL, "%s", up);
     n++;
 
     /* The second row: the file the engine is reading that the header has no room
-     * for, in half a column of text. Cut to the terminal and marked as cut, because
-     * a row that stops in the middle of a name is read as a name that ended there. */
+     * for. Cut to the terminal and marked as cut, because a row that stops in the
+     * middle of a name is read as a name that ended there. */
     if (show_sub) {
         char cut[LINE_CHARS];
-        int room = width - 3; /* the leading space and the two columns of the marker */
+        int room = width - 7; /* the five-column indent and the two of the marker */
         int truncated = vwidth(sub) > room ? clip_cols(cut, sizeof cut, sub, room) : 0;
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
+        ln_put(&l, "     ", ST_PLAIN);
         ln_addf(&l, ST_DIM, "%s", truncated ? cut : sub);
         if (truncated)
-            ln_addf(&l, ST_LABEL, "..");
+            ln_addf(&l, ST_DIM, "..");
         n++;
     }
 
     if (show_rules) {
         ln_open(&l, out[n++], LINE_CHARS, width);
+        ln_put(&l, " ", ST_PLAIN);
         ln_rule(&l, g.rule);
     }
 
-    /* INGEST: the bar, how far through the prompt, and how fast it is being read.
-     *
-     *   INGEST ▸ ██████████████░░░░░░░░░░  12,288/20,480   61.2 tok/s  2m14s left
-     *
-     * The tail is measured and right-aligned on the last column, so the bar takes what
-     * the terminal has left and the numbers never slide sideways as they change. */
+    /* INGEST: how far through the prompt, the percentage, and how fast it is read, with
+     * the bar on the row below at the full width the figures leave. */
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, phase == INGESTING ? ST_LABEL : ST_DIM, "%-7s%s", "INGEST", g.arrow);
-    ln_put(&l, " ", ST_PLAIN);
+    ln_addf(&l, phase == INGESTING ? ST_IN : ST_LABEL, "%-7s", "INGEST");
+    ln_addf(&l, phase == INGESTING ? ST_IN : ST_DIM, "%s",
+            phase == INGESTING ? g.spin[spin] : g.arrow);
+    ln_to(&l, ARG);
     if (total > 0) {
-        char cnt[64];
         char pad[24];
         snprintf(pad, sizeof pad, "%*s", vwidth(b) - vwidth(a) > 0 ? vwidth(b) - vwidth(a) : 0, "");
-        snprintf(cnt, sizeof cnt, "%s%s/%s", pad, a, b);
-        const int tail = 2 + vwidth(cnt) + 2 + vwidth(s_ing);
-        int bw = width - l.used - tail;
-        if (bw > 48)
-            bw = 48;
-        if (bw >= 6) {
-            char cells[48 * 4 + 8];
-            bar(cells, sizeof cells, bw, done, total);
-            /* Not "%.*s" with bw: the precision of printf is bytes, and a byte precision
-             * that lands inside a three-byte block cell both shortens the bar and hands
-             * ln_put half a character. bw cells is bw columns; the count lives in bar(). */
-            ln_addf(&l, ST_BAR, "%s", cells);
-        }
-        ln_to(&l, width - tail + 2);
         ln_addf(&l, ST_PLAIN, "%s", pad);
-        ln_addf(&l, ST_PLAIN, "%s", a);
-        ln_addf(&l, ST_DIM, "/%s", b);
+        ln_addf(&l, phase == INGESTING ? ST_HEAD : ST_PLAIN, "%s", a);
+        ln_addf(&l, ST_DIM, "/%s tok", b);
+        const long pct = total > 0 ? (long)(100.0 * (double)shown / (double)total + 1e-9) : 0;
+        ln_put(&l, "  ", ST_PLAIN);
+        ln_raddf(&l, 4, phase == INGESTING ? ST_BAR : ST_DIM, "%ld%%", pct > 100 ? 100 : pct);
         ln_to(&l, width - vwidth(s_ing));
         ln_addf(&l, phase == INGESTING ? ST_PLAIN : ST_DIM, "%s", s_ing);
     } else {
@@ -733,19 +1069,30 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     }
     n++;
 
-    /* EMIT: the answer so far, how fast it is coming, for how long, and for whom.
-     *
-     *   EMIT   ▸ 1,234 tok   15.6 tok/s   12s                         chat 3f9a1c */
+    if (show_bar) {
+        ln_open(&l, out[n], LINE_CHARS, width);
+        ln_to(&l, ARG);
+        int bw = width - l.used;
+        if (bw > 68)
+            bw = 68;
+        if (bw >= 6)
+            ln_bar(&l, bw, total > 0 ? shown : 0, total > 0 ? total : 1, phase == INGESTING);
+        n++;
+    }
+
+    /* EMIT: the answer so far, how fast it is coming, for how long, and for whom. */
     ln_open(&l, out[n], LINE_CHARS, width);
     ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, phase == EMITTING ? ST_LABEL : ST_DIM, "%-7s%s", "EMIT", g.arrow);
-    ln_put(&l, " ", ST_PLAIN);
-    ln_raddf(&l, 6, emit > 0 ? ST_HOT : ST_PLAIN, "%s", h2);
-    ln_addf(&l, ST_PLAIN, " tok");
+    ln_addf(&l, phase == EMITTING ? ST_OUT : ST_LABEL, "%-7s", "EMIT");
+    ln_addf(&l, phase == EMITTING ? ST_OUT : ST_DIM, "%s",
+            phase == EMITTING ? g.spin[spin] : g.arrow);
+    ln_to(&l, ARG);
+    ln_raddf(&l, 6, emit > 0 ? (phase == EMITTING ? ST_OUT : ST_HOT) : ST_PLAIN, "%s", h2);
+    ln_addf(&l, ST_DIM, " tok");
     ln_addf(&l, ST_DIM, "%s", g.sep);
     ln_addf(&l, phase == EMITTING ? ST_PLAIN : ST_DIM, "%s", s_emit);
     ln_addf(&l, ST_DIM, "%s", g.sep);
-    ln_addf(&l, ST_PLAIN, "%s", elh);
+    ln_addf(&l, phase == IDLE ? ST_DIM : ST_PLAIN, "%s", elh);
     {
         /* The request id is the right-hand end of the row and the first thing to go. */
         char wc[LINE_CHARS];
@@ -758,40 +1105,87 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     }
     n++;
 
+    /* trend: the last minute, and the peaks it is scaled to. */
+    if (show_trend) {
+        ln_open(&l, out[n], LINE_CHARS, width);
+        ln_put(&l, " ", ST_PLAIN);
+        ln_addf(&l, ST_LABEL, "%-7s", "trend");
+        ln_addf(&l, ST_DIM, "%s", g.arrow);
+        ln_to(&l, ARG);
+        const int tailw = 24;
+        int sw = width - l.used - tailw;
+        float pin = 0, pout = 0;
+        if (sw >= 8)
+            ln_spark(&l, sw, &pin, &pout);
+        if (pin > 0 || pout > 0) {
+            char ti[16] = "", to[16] = "";
+            if (pin > 0)
+                snprintf(ti, sizeof ti, "%.0f", pin);
+            if (pout > 0)
+                snprintf(to, sizeof to, "%.1f", pout);
+            const int need = 5 + (pin > 0 ? (int)strlen(ti) + 3 : 0) +
+                             (pout > 0 ? (int)strlen(to) + 4 : 0) + (pin > 0 && pout > 0 ? 3 : 0);
+            ln_to(&l, width - need);
+            ln_addf(&l, ST_DIM, "peak ");
+            if (pin > 0) {
+                ln_addf(&l, ST_BAR, "%s", ti);
+                ln_addf(&l, ST_DIM, " in");
+            }
+            if (pin > 0 && pout > 0)
+                ln_addf(&l, ST_DIM, "%s", g.sep);
+            if (pout > 0) {
+                ln_addf(&l, ST_HOT, "%s", to);
+                ln_addf(&l, ST_DIM, " out");
+            }
+        } else if (sw >= 8) {
+            ln_to(&l, width - 14);
+            ln_addf(&l, ST_DIM, "one col a sec");
+        }
+        n++;
+    }
+
     if (show_rules) {
         ln_open(&l, out[n++], LINE_CHARS, width);
+        ln_put(&l, " ", ST_PLAIN);
         ln_rule(&l, g.rule);
     }
 
     if (show_tail) {
         ln_open(&l, out[n], LINE_CHARS, width);
         ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_LABEL, "%-9s", "total");
-        ln_addf(&l, ST_PLAIN, "%s ingested", u);
-        ln_addf(&l, ST_DIM, "%s", g.sep);
-        ln_addf(&l, ST_PLAIN, "%s emitted", e2);
-        ln_addf(&l, ST_DIM, "%s", g.sep);
-        ln_addf(&l, ST_PLAIN, "%ld request%s", reqs, reqs == 1 ? "" : "s");
-        ln_addf(&l, ST_DIM, "%s", g.sep);
-        ln_addf(&l, ST_PLAIN, "%s reused", s2);
+        ln_addf(&l, ST_LABEL, "%-10s", "total");
+        ln_addf(&l, ST_INTXT, "%s", u);
+        ln_addf(&l, ST_DIM, " ingested%s", g.sep);
+        ln_addf(&l, ST_HOT, "%s", e2);
+        ln_addf(&l, ST_DIM, " emitted%s", g.sep);
+        ln_addf(&l, ST_PLAIN, "%ld", reqs);
+        ln_addf(&l, ST_DIM, " request%s%s", reqs == 1 ? "" : "s", g.sep);
+        ln_addf(&l, saved > 0 ? ST_OK : ST_PLAIN, "%s", s2);
+        ln_addf(&l, ST_DIM, " reused");
         n++;
 
         ln_open(&l, out[n], LINE_CHARS, width);
         ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_LABEL, "%-9s", "cache");
+        ln_addf(&l, ST_LABEL, "%-10s", "cache");
         if (slots > 0) {
-            ln_addf(&l, held > 0 ? ST_PLAIN : ST_DIM, "%ld of %ld rewind point%s", held, slots,
-                    held == 1 ? "" : "s");
-            ln_addf(&l, ST_DIM, "%s", g.sep);
-            ln_addf(&l, ST_PLAIN, "%s MiB", cb);
-            ln_addf(&l, ST_DIM, "%s", g.sep);
-            ln_addf(&l, hits > 0 ? ST_HOT : ST_PLAIN, "%ld hit%s", hits, hits == 1 ? "" : "s");
-            ln_addf(&l, ST_DIM, "%s", g.sep);
+            ln_addf(&l, held > 0 ? ST_PLAIN : ST_DIM, "%ld", held);
+            ln_addf(&l, ST_DIM, " of %ld rewind point%s%s", slots, slots == 1 ? "" : "s", g.sep);
+            ln_addf(&l, ST_PLAIN, "%s", cb);
+            ln_addf(&l, ST_DIM, " MiB%s", g.sep);
+            ln_addf(&l, hits > 0 ? ST_OK : ST_PLAIN, "%ld", hits);
+            ln_addf(&l, ST_DIM, " hit%s%s", hits == 1 ? "" : "s", g.sep);
             ln_addf(&l, ST_DIM, "snapshot %.1f ms", (double)sus / 1000.0);
         } else {
             ln_addf(&l, ST_DIM, "no rewind points (--turn-cache)");
         }
         n++;
+    }
+
+    if (show_recent) {
+        ln_open(&l, out[n++], LINE_CHARS, width);
+        ln_put(&l, " ", ST_PLAIN);
+        ln_addf(&l, ST_DIM, "%s%s recent ", g.rule, g.rule);
+        ln_rule(&l, g.rule);
     }
 
     /* Clamped at zero: with fewer finished requests than the panel has room for, a
@@ -802,7 +1196,7 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
             break;
         ln_open(&l, out[n], LINE_CHARS, width);
         ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_DIM, "%s", hist[i]);
+        ln_hist(&l, hist[i]);
         n++;
     }
     return n;
@@ -918,6 +1312,8 @@ void qe_ui_start(int want, const char *head) {
      * panel's bytes as text: styles are for terminals that were asked for. */
     const char *term = getenv("TERM");
     color = tty && term && strcmp(term, "dumb") && !getenv("NO_COLOR");
+    if (color)
+        palette_init();
     cols = width_of();
     rows = height_of();
     started = now_s();

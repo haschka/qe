@@ -658,6 +658,20 @@ typedef struct {
 } qe_attn_unit;
 
 void qe_attn_walk(const qe_attn_unit *u);
+/* The blocked form of the same walk (QE_ATTN_BLK, default on): the same operations on every
+ * output element in the same order, so the same bytes, with key and value rows widened once
+ * per three heads and once per eight cells instead of once per head (ideas.md §7.37). */
+/* The indexer's rectified block scores for blocks [lo, hi): out[b] = scale * sum over heads
+ * of max(0, qe_dot(iq_h, pool_b)), the same floats as that loop, four heads against two
+ * blocks at a time (QE_IDX_FAST, default on). */
+void qe_idx_scores(const float *iq, const float *pool, int nih, int id, float scale, long lo,
+                   long hi, float *out);
+void qe_idx_set_fast(int on);
+/* The same over pooled keys stored as IEEE halves (QE_IDX_F16). */
+void qe_idx_scores_h(const float *iq, const void *pool, int nih, int id, float scale, long lo,
+                     long hi, float *out);
+void qe_attn_set_blk(int on);
+int qe_attn_get_blk(void);
 
 /* Fold a head's chunk partials into its output: out = sum(y_i * exp(m_i - M)) /
  * sum(l_i * exp(m_i - M)) with M the highest of the partials' exponent bases.
@@ -1288,6 +1302,11 @@ typedef struct {
     long stage_disp[QE_ST_N];
     double stage_pool[QE_ST_N];
     double stage_tail[QE_ST_N];
+    /* The attention layers' core, split (same condition): the prologue (cache writes,
+     * norms, rotations, pooled index keys), the indexer (block scores and the top-k
+     * selection) and the walk over the selected cells with its combine. The indexer is
+     * the part that grows with the context (ideas.md §7.37). */
+    double attn_pre_seconds, attn_idx_seconds, attn_walk_seconds;
 } qe_forward_diag;
 
 /* Reads the checkpoint's shape and every tensor the pass needs, and refuses
