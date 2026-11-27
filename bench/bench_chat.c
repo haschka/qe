@@ -89,7 +89,7 @@ static void show(const char *tag, const char *s) {
 typedef struct {
     qe_str content, reasoning, args;
     qe_str names, ids;
-    int n_calls, n_stops;
+    int n_calls, n_stops, n_drops;
     const char *finish;
     int order[64];
     int n_order;
@@ -120,6 +120,9 @@ static int cap_cb(void *vp, const qe_turn_ev *ev) {
     case QE_TURN_STOP:
         c->n_stops++;
         c->finish = ev->finish;
+        break;
+    case QE_TURN_CALL_DROPPED:
+        c->n_drops++;
         break;
     default: break;
     }
@@ -502,8 +505,28 @@ static void test_parser(void) {
         cleared();
     }
 
-    /* A request block with nothing parsable in it is dropped, and the turn goes
-     * on answering afterwards. */
+    /* The family's other spelling of a call, a JSON object in the same block, is a call
+     * and not a dropped block: name and arguments, the arguments as strict JSON, whether
+     * they arrived as an object or as a string holding one. */
+    f_tok(&f, QE_MARK_TOOL_OPEN);
+    f_text(&f, "\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\", \"timeout\": 01}}\n");
+    f_tok(&f, QE_MARK_TOOL_CLOSE);
+    f_tok(&f, QE_MARK_TOOL_OPEN);
+    f_text(&f, "{\"name\":\"view\",\"arguments\":\"{\\\"file_path\\\":\\\"/tmp/a.png\\\"}\"}");
+    f_tok(&f, QE_MARK_TOOL_CLOSE);
+    f_tok(&f, QE_MARK_TURN_CLOSE);
+    f_feed(&f, &c, 0);
+    CHECK(c.n_calls == 2 && c.n_drops == 0, "json calls: %d calls, %d dropped", c.n_calls,
+          c.n_drops);
+    CHECK_STR(c.names.p, "bash|view|", "json call names");
+    CHECK_STR(c.args.p, "{\"command\":\"ls -la\",\"timeout\":1}|{\"file_path\":\"/tmp/a.png\"}|",
+              "json call arguments");
+    CHECK_STR(c.finish, "tool_calls", "json calls finish");
+    cap_free(&c);
+    cleared();
+
+    /* A request block with nothing parsable in it is dropped - reported as dropped, so
+     * the server can say so - and the turn goes on answering afterwards. */
     f_tok(&f, QE_MARK_TOOL_OPEN);
     f_text(&f, "no tags at all");
     f_tok(&f, QE_MARK_TOOL_CLOSE);
@@ -511,6 +534,7 @@ static void test_parser(void) {
     f_tok(&f, QE_MARK_TURN_CLOSE);
     f_feed(&f, &c, 0);
     CHECK(c.n_calls == 0, "malformed call reported");
+    CHECK(c.n_drops == 1, "a dropped block was not reported as dropped (%d)", c.n_drops);
     CHECK_STR(c.content.p, "recovered", "recovered after malformed request");
     CHECK_STR(c.finish, "stop", "malformed finish");
     cap_free(&c);
@@ -843,6 +867,43 @@ static void test_render(qe_tok *t) {
         qe_str_free(&big);
     }
 
+    /* The bytes the model's own template writes, as transformers and llama.cpp apply it
+     * (checked against a Jinja rendering of the checkpoint's template, byte for byte):
+     * every tool as json.dumps writes it - keys in the order sent, ", " and ": ", the
+     * characters themselves rather than escapes, Python's float spelling - and a call
+     * that follows a reasoning block directly, with no newline in between, when the
+     * turn wrote no text first. Both used to differ, on every prompt an agent sends. */
+    {
+        qe_json *b = body(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},"
+            "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"r\","
+            "\"tool_calls\":[{\"id\":\"1\",\"type\":\"function\",\"function\":{\"name\":"
+            "\"grep\",\"arguments\":\"{\\\"opts\\\":{\\\"deep\\\":true,\\\"n\\\":1.0}}\"}}]},"
+            "{\"role\":\"tool\",\"tool_call_id\":\"1\",\"content\":\"x\"}],"
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"grep\","
+            "\"description\":\"a & b <c> caf\\u00e9 'q'\",\"parameters\":{\"type\":\"object\","
+            "\"properties\":{\"r\":{\"type\":\"number\",\"default\":1.0,\"minimum\":1e-05,"
+            "\"maximum\":2.5e16,\"limit\":1000000000000}}}}}]}");
+        qe_chat r = { 0 };
+        qe_chat_opts o = { .enable_thinking = 1, .effort_xhigh = 1, .preserve_thinking = 1 };
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render template bytes: %s", err);
+        const char *tool_line =
+            "{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": "
+            "\"a & b <c> caf\xc3\xa9 'q'\", \"parameters\": {\"type\": \"object\", \"properties\": "
+            "{\"r\": {\"type\": \"number\", \"default\": 1.0, \"minimum\": 1e-05, "
+            "\"maximum\": 2.5e+16, \"limit\": 1000000000000}}}}}";
+        CHECK(r.prompt.p && strstr(r.prompt.p, tool_line) != NULL,
+              "the tool is not written as json.dumps writes it");
+        char want[256];
+        snprintf(want, sizeof want, "%s\n\n%s\n", m_rc, mark_text[2]);
+        CHECK(r.prompt.p && strstr(r.prompt.p, want) != NULL,
+              "a call does not follow the reasoning block directly");
+        CHECK(r.prompt.p && strstr(r.prompt.p, "{\"deep\": true, \"n\": 1.0}") != NULL,
+              "a non-string argument is not written as json.dumps writes it");
+        qe_chat_free(&r);
+        qe_json_free(b);
+    }
+
     /* Thinking off: no effort sentence, and an empty reasoning block instead of
      * an opened one. */
     {
@@ -919,10 +980,11 @@ static void test_render(qe_tok *t) {
         /* The format instructions the preamble carries hold two example requests
          * and no example result; nothing else in this prompt is a request. */
         check_markers(t, &r, "tools", 3, 2, 2, 2, 0, 0, 1, 0);
-        /* Keys sorted, as the template's own filter sorts them, and the tool
-         * object compact on one line. */
-        CHECK(strstr(r.prompt.p, "{\"function\":{\"description\":") != NULL,
-              "tool schema keys should be sorted and compact");
+        /* Keys in the order the client sent them, with Python's separators: the
+         * template's tojson as transformers and llama.cpp apply it. This line used to
+         * assert sorted, compact keys - Jinja's own filter, which the model never saw. */
+        CHECK(strstr(r.prompt.p, "{\"type\": \"function\", \"function\": {\"name\": \"bash\"") != NULL,
+              "tool schema should keep the client's key order, as json.dumps writes it");
         qe_chat_free(&r);
         qe_json_free(b);
     }

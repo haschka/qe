@@ -16,8 +16,10 @@
      - the reasoning-effort instruction that is prepended to that turn when
        thinking is on (xhigh is the default, high means xhigh, medium adds no
        sentence, low adds its own)
-     - the tools preamble: a schema block of one compact-JSON tool object per
-       line followed by the fixed instruction block that spells out the call
+     - the tools preamble: a schema block of one tool object per line, written
+       as the template's tojson is applied by transformers and llama.cpp
+       (json.dumps: the client's key order, ", " and ": ", characters rather than
+       escapes), followed by the fixed instruction block that spells out the call
        format, with the schema block going first and the caller's own system
        text after it
      - user, assistant and tool turns, including tool requests inside an
@@ -195,7 +197,12 @@ enum {
     QE_TURN_CALL_OPEN, /* a tool request started; index, name, id are set */
     QE_TURN_CALL_ARGS, /* the request's arguments as one JSON object string */
     QE_TURN_CALL_CLOSE,
-    QE_TURN_STOP /* the assistant turn ended */
+    QE_TURN_STOP, /* the assistant turn ended */
+    /* A request block closed with nothing in it that reads as a call, and was dropped.
+     * `utf8`/`nbytes` are its text. Reported so the server can say so: a dropped block
+     * reaches a client as the text before it and a plain stop - a turn that looks like
+     * the model simply ended it. */
+    QE_TURN_CALL_DROPPED
 };
 
 typedef struct {

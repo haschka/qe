@@ -897,9 +897,6 @@ static char ftitle[MAX_ROWS][32];
 static char hdr_r[LINE_CHARS]; /* the header's right half: status and uptime */
 static int hdr_rw, hdr_lw;     /* columns of each half */
 static int boxed;              /* this frame is drawn in its box */
-/* Where the cursor waits between frames while a phase is running: the cell after that
- * phase's label. -1 when nothing is running, and the cursor is hidden then. */
-static int park_row = -1, park_col;
 
 /* Builds one frame into `out` and returns how many lines it filled. `budget` is the
  * tallest panel the screen will take without scrolling the banner off the top. */
@@ -1089,7 +1086,6 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
 
     int n = 0;
     ln l;
-    park_row = -1;
     for (int i = 0; i < MAX_ROWS; i++) {
         fkind[i] = K_TEXT;
         ftitle[i][0] = 0;
@@ -1177,20 +1173,12 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         fkind[n++] = K_SEP;
     }
 
-    /* The phase cell: where the blinking cursor sits while that phase is the one
-     * running. A terminal blinks its own cursor for nothing, so a busy panel costs no
-     * bytes a second to look alive - the spinner it replaces redrew a glyph ten times a
-     * second. Without a terminal there is no cursor, and the cell is an arrow. */
-#define PHASE_CELL(active, st)                                                            \
-    do {                                                                                  \
-        if ((active) && tty) {                                                            \
-            park_row = n;                                                                 \
-            park_col = l.used;                                                            \
-            ln_put(&l, " ", ST_PLAIN);                                                    \
-        } else {                                                                          \
-            ln_addf(&l, (active) ? (st) : ST_DIM, "%s", g.arrow);                         \
-        }                                                                                 \
-    } while (0)
+    /* The phase cell: an arrow, in the phase's colour while it is the one running and
+     * grey otherwise. Nothing in it moves. A spinner redrew a glyph ten times a second,
+     * and the terminal's own blinking cursor parked here blinked at whatever rate the
+     * redraws of the figures beside it reset its timer to - and was a hollow square in
+     * a window without focus. What is running is the header's status. */
+#define PHASE_CELL(active, st) ln_addf(&l, (active) ? (st) : ST_DIM, "%s", g.arrow)
 
     /* INGEST: how far through the prompt, the percentage, and how fast it is read, with
      * the bar on the row below at the full width the figures leave. While the vision
@@ -1475,8 +1463,6 @@ static void box_rows(char out[][LINE_CHARS], int n, int width) {
         }
         snprintf(out[i], LINE_CHARS, "%s", tmp);
     }
-    if (park_row >= 0)
-        park_col += 2; /* the side and its space */
 }
 
 /* The row of the panel the cursor is believed to be on. Every frame ends with the
@@ -1493,8 +1479,8 @@ static void move_to(int row) {
     } else if (d == -1) {
         /* One row down is a newline, not a cursor move: at the bottom of the screen a
          * newline scrolls and stays coherent, while a cursor-down is clamped and
-         * writes the new row over the one beneath the panel. The carriage return is
-         * for a cursor that was parked mid-row (park below). */
+         * writes the new row over the one beneath the panel. The carriage return makes
+         * the column zero without relying on the terminal's own newline translation. */
         fputs("\r\n", stdout);
         cursor_row = row;
         return;
@@ -1505,23 +1491,8 @@ static void move_to(int row) {
     cursor_row = row;
 }
 
-/* The cursor to a cell inside rows already drawn: cursor up or down, never a newline,
- * because a newline into a row is a write to it as far as the screen is concerned. */
-static void park_at(int row, int col) {
-    int d = cursor_row - row;
-    if (d > 0)
-        fprintf(stdout, "\033[%dA", d);
-    else if (d < 0)
-        fprintf(stdout, "\033[%dB", -d);
-    fprintf(stdout, "\033[%dG", col + 1);
-    cursor_row = row;
-}
-
-static int cursor_shown;
-
 static void draw(void) {
     static char out[MAX_ROWS][LINE_CHARS];
-    static int parked_row = -2, parked_col = -2;
     int w = width_of(), h = height_of();
     if (w != cols || h != rows) {
         /* A resize moves the panel's own rows under a reflowing terminal, so where the
@@ -1545,16 +1516,13 @@ static void draw(void) {
     int n = frame(out, cols - 1, budget);
     if (boxed)
         box_rows(out, n, cols - 1);
-    const int want_row = tty ? park_row : -1;
 
-    /* Rule 1: a frame that says the same thing writes nothing at all - and while a
-     * phase runs, that includes the indicator, which is the terminal's own blinking
-     * cursor waiting in the phase's cell rather than a glyph redrawn on a timer. */
+    /* Rule 1: a frame that says the same thing writes nothing at all. */
     int changed = n != prev_n;
     for (int i = 0; i < n && !changed; i++)
         if (i >= prev_n || strcmp(prev[i], out[i]))
             changed = 1;
-    if (!changed && want_row == parked_row && (want_row < 0 || park_col == parked_col)) {
+    if (!changed) {
         fflush(stdout);
         return;
     }
@@ -1577,21 +1545,7 @@ static void draw(void) {
         move_to(i);
         fputs("\033[K", stdout);
     }
-    if (want_row >= 0 && want_row < n) {
-        park_at(want_row, park_col);
-        if (!cursor_shown) {
-            fputs("\033[?25h", stdout);
-            cursor_shown = 1;
-        }
-    } else {
-        if (cursor_shown) {
-            fputs("\033[?25l", stdout);
-            cursor_shown = 0;
-        }
-        move_to(n > 0 ? n - 1 : 0);
-    }
-    parked_row = want_row;
-    parked_col = park_col;
+    move_to(n > 0 ? n - 1 : 0);
     if (tty)
         fputs("\033[?2026l", stdout);
     fflush(stdout);
@@ -1635,11 +1589,7 @@ void qe_ui_start(int want, const char *head) {
     if (pthread_create(&th, NULL, render, NULL))
         return;
     running = 1;
-    /* The panel owns the screen while it is up. The cursor is hidden until a phase
-     * runs, and then it is a blinking block parked on that phase's row. */
-    fputs("\033[?25l", stdout);
-    if (tty)
-        fputs("\033[1 q", stdout);
+    fputs("\033[?25l", stdout); /* the panel owns the screen while it is up */
     fflush(stdout);
 }
 
@@ -1652,10 +1602,6 @@ void qe_ui_stop(void) {
     /* Leave the frame on the screen and put the cursor below it, so that whatever
      * the shell prints next starts on a clean line. The synchronise markers are off
      * by then because the last frame flushed them; nothing else is owed. */
-    if (prev_n > 0 && cursor_row != prev_n - 1)
-        park_at(prev_n - 1, 0);
-    if (tty)
-        fputs("\033[0 q", stdout); /* the terminal's own cursor shape again */
     fputs("\r\033[?25h\n", stdout);
     fflush(stdout);
 }

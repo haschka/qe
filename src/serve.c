@@ -244,6 +244,9 @@ typedef struct {
      * off it: the stream path keeps no copy of what it already sent, and the
      * request line still has to say whether the turn held anything to show. */
     long content_bytes;
+    /* Request blocks the parser could not read as a call and dropped. */
+    int dropped_calls;
+    long dropped_bytes;
 } sink;
 
 /* What a reply held on to while it was being written. The stream path sends each
@@ -475,6 +478,47 @@ static void sink_call_args(sink *k, const qe_turn_ev *ev) {
     k->n_calls++;
 }
 
+/* A request block the parser dropped. The log line says only that it happened and how
+ * big it was - no model text goes in a log line - and QE_DUMP_DROPPED names a file the
+ * block itself is appended to, for whoever is finding out why a turn stopped where it
+ * should have called something. Off unless asked for. */
+static void sink_dropped(sink *k, const qe_turn_ev *ev) {
+    k->dropped_calls++;
+    k->dropped_bytes += ev->nbytes > 0 ? ev->nbytes : 0;
+    const char *path = getenv("QE_DUMP_DROPPED");
+    if (!path || !*path)
+        return;
+    static pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mx);
+    FILE *f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "=== %s dropped request block, %d bytes\n", k->id, ev->nbytes);
+        if (ev->nbytes > 0)
+            fwrite(ev->utf8, 1, (size_t)ev->nbytes, f);
+        fputs("\n=== end\n", f);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&mx);
+}
+
+/* Said beside the request line, in the same place, for the reason that line exists: a
+ * dropped request reaches the client as the text before it and a plain stop, which is
+ * indistinguishable there from a model that chose to stop. */
+static void log_dropped(const char *id, const sink *k) {
+    if (!k->dropped_calls)
+        return;
+    char line[320];
+    snprintf(line, sizeof line,
+             "qe: WARN chat %s dropped %d request block%s it could not read as a call (%ld "
+             "bytes); the client saw the turn end without it%s",
+             id, k->dropped_calls, k->dropped_calls == 1 ? "" : "s", k->dropped_bytes,
+             getenv("QE_DUMP_DROPPED") ? "" : " (QE_DUMP_DROPPED=file keeps the block)");
+    if (qe_ui_on())
+        qe_ui_log(line);
+    else
+        fprintf(stderr, "%s\n", line);
+}
+
 /* One event from the turn parser. Returning non-zero stops the decode, which is
  * how a client that hung up stops 5 GiB of DRAM traffic per step. */
 static int chat_event(void *vp, const qe_turn_ev *ev) {
@@ -486,6 +530,7 @@ static int chat_event(void *vp, const qe_turn_ev *ev) {
     case QE_TURN_CALL_ARGS: sink_call_args(k, ev); break;
     case QE_TURN_CALL_CLOSE: break;
     case QE_TURN_STOP:      k->finish = ev->finish; break;
+    case QE_TURN_CALL_DROPPED: sink_dropped(k, ev); break;
     }
     return k->chunk_failed;
 }
@@ -1086,6 +1131,7 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
         qe_http_sse_done(c);
         request_log("chat", id, prompt_tokens, &gs, finish, 1, k.chunk_failed, k.content_bytes,
                     (long)k.reasoning.len, k.n_calls);
+        log_dropped(id, &k);
         sink_free(&k);
         qe_turn_free(k.turn);
         free(id);
@@ -1167,6 +1213,7 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
     int rc2 = qe_http_json(c, 200, s.p ? s.p : "{}");
     request_log("chat", id, prompt_tokens, &gs, finish, 0, k.chunk_failed, k.content_bytes,
                 (long)k.reasoning.len, k.n_calls);
+    log_dropped(id, &k);
     qe_str_free(&s);
     sink_free(&k);
     qe_turn_free(k.turn);

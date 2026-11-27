@@ -106,15 +106,13 @@ static void put_tag_value(qe_str *o, const char *name, const char *val) {
     qe_str_puts(o, t);
 }
 
-/* ------------------------------------------------------- the tojson filter
+/* ------------------------------------------------- JSON a client is handed
  *
- * The template renders each tool with a filter that compacts it to one line,
- * sorts object keys, escapes non-ASCII as escape sequences, and then rewrites
- * four characters so the result is safe to embed in HTML. Reproducing all four
- * is the difference between the schema block the model was served during
- * training and one that merely means the same thing, and tool calling is
- * precisely the kind of learned format where "merely means the same" is paid
- * for in accuracy. */
+ * The argument object of a tool request, as it leaves for the client: ASCII only, with
+ * < > & ' escaped as well, which is valid JSON any parser takes and safe in any
+ * transport. It is not what the prompt uses - the model was trained on Python's
+ * json.dumps, which py_jvalue below reproduces - and the two were once one function,
+ * which put a schema block in every prompt that the model had never seen. */
 
 static void put_jstr(qe_str *o, const char *p, size_t n) {
     putc1(o, '"');
@@ -178,36 +176,6 @@ static void put_jstr(qe_str *o, const char *p, size_t n) {
     putc1(o, '"');
 }
 
-static void put_jvalue(qe_str *o, const qe_json *v);
-
-static int key_cmp(const void *a, const void *b) {
-    const qe_json *x = *(const qe_json *const *)a, *y = *(const qe_json *const *)b;
-    return strcmp(x->key ? x->key : "", y->key ? y->key : "");
-}
-
-static void put_jobj(qe_str *o, const qe_json *v) {
-    size_t n = v->n_child;
-    const qe_json **kids = n ? malloc(n * sizeof *kids) : NULL;
-    if (n && !kids) {
-        o->err = 1;
-        return;
-    }
-    size_t i = 0;
-    for (const qe_json *k = v->child; k; k = k->next)
-        kids[i++] = k;
-    qsort(kids, n, sizeof *kids, key_cmp);
-    putc1(o, '{');
-    for (size_t j = 0; j < n; j++) {
-        if (j)
-            putc1(o, ',');
-        put_jstr(o, kids[j]->key ? kids[j]->key : "", kids[j]->key ? strlen(kids[j]->key) : 0);
-        putc1(o, ':');
-        put_jvalue(o, kids[j]);
-    }
-    putc1(o, '}');
-    free(kids);
-}
-
 static void put_num(qe_str *o, double d) {
     char t[40];
     if (d != d || d > 1e308 || d < -1e308) {
@@ -226,7 +194,110 @@ static void put_num(qe_str *o, double d) {
     qe_str_puts(o, t);
 }
 
-static void put_jvalue(qe_str *o, const qe_json *v) {
+/* ------------------------------------------- the tojson the model was trained with
+ *
+ * The template writes every tool, and every non-string argument of a replayed call, with
+ * `tojson`. Which `tojson` decides the bytes, and the one that matters is the one the
+ * training data was rendered with: transformers replaces Jinja's own filter with
+ * json.dumps(x, ensure_ascii=False) - keys in the order they came, ", " and ": " between
+ * them, non-ASCII and < > & ' as themselves - and llama.cpp's renderer does the same.
+ * Jinja's stock filter (sorted keys, everything escaped, no spaces) is what put_jvalue
+ * above reproduces, and it is a schema block the model never saw: every key moved,
+ * every space gone, on the one part of every prompt that teaches it its tools. */
+
+static void py_jstr(qe_str *o, const char *p, size_t n) {
+    putc1(o, '"');
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)p[i];
+        switch (c) {
+        case '"': qe_str_puts(o, "\\\""); continue;
+        case '\\': qe_str_puts(o, "\\\\"); continue;
+        case '\n': qe_str_puts(o, "\\n"); continue;
+        case '\r': qe_str_puts(o, "\\r"); continue;
+        case '\t': qe_str_puts(o, "\\t"); continue;
+        case '\b': qe_str_puts(o, "\\b"); continue;
+        case '\f': qe_str_puts(o, "\\f"); continue;
+        default: break;
+        }
+        if (c < 0x20)
+            qe_str_appendf(o, "\\u%04x", c);
+        else
+            putc1(o, (char)c);
+    }
+    putc1(o, '"');
+}
+
+/* Python's repr of a float, which is what json.dumps writes: the shortest digits that
+ * read back as the same double, fixed between 1e-4 and 1e16 with a ".0" when the value
+ * is whole, and an exponent of at least two digits outside that range. */
+static void py_float(qe_str *o, double d) {
+    char t[40], m[40];
+    if (d != d || d > 1.7976931348623157e308 || d < -1.7976931348623157e308) {
+        qe_str_puts(o, d != d ? "NaN" : d > 0 ? "Infinity" : "-Infinity");
+        return;
+    }
+    int p = 1;
+    for (; p <= 17; p++) {
+        snprintf(t, sizeof t, "%.*e", p - 1, d);
+        if (strtod(t, NULL) == d)
+            break;
+    }
+    /* t is d.ddde±XX with p significant digits */
+    const char *e = strchr(t, 'e');
+    const int exp10 = atoi(e + 1);
+    size_t nd = 0;
+    const int neg = t[0] == '-';
+    for (const char *q = t + neg; q < e; q++)
+        if (*q != '.')
+            m[nd++] = *q;
+    m[nd] = 0;
+    if (exp10 < -4 || exp10 >= 16) {
+        qe_str_appendf(o, "%s%c", neg ? "-" : "", m[0]);
+        if (nd > 1)
+            qe_str_appendf(o, ".%s", m + 1);
+        qe_str_appendf(o, "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+        return;
+    }
+    if (neg)
+        putc1(o, '-');
+    if (exp10 < 0) {
+        qe_str_puts(o, "0.");
+        for (int k = 0; k < -exp10 - 1; k++)
+            putc1(o, '0');
+        qe_str_puts(o, m);
+        return;
+    }
+    for (int k = 0; k <= exp10; k++)
+        putc1(o, k < (int)nd ? m[k] : '0');
+    putc1(o, '.');
+    if ((int)nd > exp10 + 1)
+        qe_str_puts(o, m + exp10 + 1);
+    else
+        putc1(o, '0');
+}
+
+/* A JSON number the way Python reads and writes it back: a literal without a fraction or
+ * an exponent is an int and stays its digits; anything else is a float. */
+static void py_num(qe_str *o, const qe_json *v) {
+    const char *lit = v->str;
+    if (lit && !strpbrk(lit, ".eE")) {
+        const char *q = lit;
+        int neg = 0;
+        if (*q == '-') {
+            neg = 1;
+            q++;
+        }
+        while (q[0] == '0' && q[1])
+            q++;
+        if (neg && !(q[0] == '0' && !q[1]))
+            putc1(o, '-');
+        qe_str_puts(o, q);
+        return;
+    }
+    py_float(o, v->num);
+}
+
+static void py_jvalue(qe_str *o, const qe_json *v) {
     if (!v) {
         qe_str_puts(o, "null");
         return;
@@ -234,19 +305,28 @@ static void put_jvalue(qe_str *o, const qe_json *v) {
     switch (v->kind) {
     case QE_JSON_NULL: qe_str_puts(o, "null"); break;
     case QE_JSON_BOOL: qe_str_puts(o, v->boolean ? "true" : "false"); break;
-    case QE_JSON_NUM: put_num(o, v->num); break;
-    case QE_JSON_STR: put_jstr(o, v->str ? v->str : "", v->str_len); break;
-    case QE_JSON_ARR: {
+    case QE_JSON_NUM: py_num(o, v); break;
+    case QE_JSON_STR: py_jstr(o, v->str ? v->str : "", v->str_len); break;
+    case QE_JSON_ARR:
         putc1(o, '[');
         for (const qe_json *k = v->child; k; k = k->next) {
             if (k != v->child)
-                putc1(o, ',');
-            put_jvalue(o, k);
+                qe_str_puts(o, ", ");
+            py_jvalue(o, k);
         }
         putc1(o, ']');
         break;
-    }
-    case QE_JSON_OBJ: put_jobj(o, v); break;
+    case QE_JSON_OBJ:
+        putc1(o, '{');
+        for (const qe_json *k = v->child; k; k = k->next) {
+            if (k != v->child)
+                qe_str_puts(o, ", ");
+            py_jstr(o, k->key ? k->key : "", k->key ? strlen(k->key) : 0);
+            qe_str_puts(o, ": ");
+            py_jvalue(o, k);
+        }
+        putc1(o, '}');
+        break;
     }
 }
 
@@ -397,6 +477,8 @@ int qe_chat_opts_from_body(const qe_json *body, qe_chat_opts *o, char *why, size
     o->effort_low = 0;
     o->preserve_thinking = 1;
     o->empty_thinking_blocks = 0; /* the server's switch, never the body's */
+    o->vision = 0;                /* and so are these two */
+    o->vision_batched = 0;
     o->enable_thinking = 1;
     int spoken = 0; /* the request said something about reasoning in a field */
 
@@ -612,7 +694,7 @@ static void put_parameter(qe_str *o, const char *name, const qe_json *value) {
     if (value && value->kind == QE_JSON_STR)
         put_slice(o, (slice){ value->str, value->str_len });
     else
-        put_jvalue(o, value);
+        py_jvalue(o, value);
     qe_str_puts(o, "\n");
     put_tag(o, "parameter", 1);
     qe_str_puts(o, "\n");
@@ -636,9 +718,13 @@ static int put_tool_calls(qe_str *o, const qe_json *m, const marks *mk, size_t c
             snprintf(why, whyn, "tool call is missing a function name");
             return -1;
         }
-        /* The first request is separated from the answer text by a blank line,
-         * later ones by a single newline, exactly as the template does. */
-        qe_str_puts(o, c == calls->child ? (content_len ? "\n\n" : "\n") : "\n");
+        /* The first request is separated from the answer text by a blank line and
+         * follows the reasoning block directly when there is no answer text, later ones
+         * by a single newline - the template's `if content|trim`. It used to put a
+         * newline there in the empty case too, which is every replayed tool turn of an
+         * agent that writes no text before its calls: "\n\n\n" after the reasoning,
+         * dozens of times a prompt, where the model was trained on "\n\n". */
+        qe_str_puts(o, c == calls->child ? (content_len ? "\n\n" : "") : "\n");
         qe_str_puts(o, mk->tool_open);
         qe_str_puts(o, "\n");
         put_tag_value(o, "function", name);
@@ -787,7 +873,7 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
         put_tag(&r->prompt, "tools", 0);
         for (const qe_json *tool = tools->child; tool; tool = tool->next) {
             qe_str_puts(&r->prompt, "\n");
-            put_jvalue(&r->prompt, tool);
+            py_jvalue(&r->prompt, tool);
         }
         qe_str_puts(&r->prompt, "\n");
         put_tag(&r->prompt, "tools", 1);
@@ -1338,31 +1424,122 @@ static void put_arg_value(qe_str *o, const char *raw, size_t rawn, int kind) {
  * (finish_turn), which is what keeps a client from running a call nobody finished
  * writing: fantasy, for one, fills in {} and dispatches any call it was opened on
  * unless the reply says it was truncated. */
+static const char *new_call_id(qe_turn *t);
+
 static int announce_call(qe_turn *t) {
     slice fname;
     size_t after = 0;
     if (t->announced ||
         find_open(t->block.p, t->block.len, 0, "function", &fname, NULL, &after) || !fname.n)
         return 0;
-    char *id = malloc(64);
-    char **grown = id ? realloc(t->ids, (size_t)(t->calls + 1) * sizeof *t->ids) : NULL;
-    if (!id || !grown) {
-        free(id);
+    const char *id = new_call_id(t);
+    if (!id)
         return 0;
-    }
-    t->ids = grown;
-    snprintf(id, 64, "%s-%d", t->id_prefix, t->calls);
-    t->ids[t->calls] = id;
     t->announced = 1;
     qe_turn_ev ev = { .kind = QE_TURN_CALL_OPEN, .index = t->calls, .name = fname.p,
                       .name_len = (int)fname.n, .call_id = id };
     return emit(t, &ev);
 }
 
+/* A call id for the request about to be opened: index t->calls, built on the stem. */
+static const char *new_call_id(qe_turn *t) {
+    char *id = malloc(64);
+    char **grown = id ? realloc(t->ids, (size_t)(t->calls + 1) * sizeof *t->ids) : NULL;
+    if (!id || !grown) {
+        free(id);
+        return NULL;
+    }
+    t->ids = grown;
+    snprintf(id, 64, "%s-%d", t->id_prefix, t->calls);
+    t->ids[t->calls] = id;
+    return id;
+}
+
+/* The other spelling of a call. This template teaches the XML form, but the family is
+ * also trained on a JSON object inside the same block - {"name": ..., "arguments":
+ * {...}}, the form of its other templates - and a model deep in a long session writes it
+ * now and then. Read the way llama.cpp's and vLLM's parsers for this family read it,
+ * instead of being dropped: a dropped request is a turn that, to the client, simply
+ * stopped. The arguments go out re-serialised, so they are strict JSON whatever the
+ * model's spelling of them was. */
+static int emit_json_call(qe_turn *t) {
+    slice b = trim_slice(t->block.p, t->block.len);
+    if (!b.n || b.p[0] != '{')
+        return -1;
+    qe_json *v = qe_json_parse(b.p, b.n, NULL, 0);
+    const qe_json *src = v && v->kind == QE_JSON_OBJ ? v : NULL;
+    const qe_json *fn = src ? qe_json_at(src, "function") : NULL;
+    if (fn && fn->kind == QE_JSON_OBJ)
+        src = fn;
+    const char *name = src ? qe_json_str_at(src, "name", NULL) : NULL;
+    if (!name || !*name) {
+        qe_json_free(v);
+        return -1;
+    }
+    const qe_json *a = qe_json_at(src, "arguments");
+    if (!a)
+        a = qe_json_at(src, "parameters");
+    qe_json *parsed = NULL;
+    if (a && a->kind == QE_JSON_STR) {
+        parsed = qe_json_parse(a->str, a->str_len, NULL, 0);
+        a = parsed;
+    }
+    if (a && a->kind != QE_JSON_OBJ) {
+        qe_json_free(parsed);
+        qe_json_free(v);
+        return -1;
+    }
+    char *args = NULL;
+    long need = a ? qe_json_write(a, NULL, 0) : 2;
+    args = need >= 0 ? malloc((size_t)need + 1) : NULL;
+    if (args && a)
+        qe_json_write(a, args, (size_t)need + 1);
+    else if (args)
+        memcpy(args, "{}", 3);
+    const char *id = args ? new_call_id(t) : NULL;
+    int rc = -1;
+    if (id) {
+        qe_turn_ev ev = { .kind = QE_TURN_CALL_OPEN, .index = t->calls, .name = name,
+                          .name_len = (int)strlen(name), .call_id = id };
+        rc = emit(t, &ev);
+        if (!rc) {
+            ev.kind = QE_TURN_CALL_ARGS;
+            ev.name = NULL;
+            ev.name_len = 0;
+            ev.utf8 = args;
+            ev.nbytes = (int)need;
+            rc = emit(t, &ev);
+        }
+        if (!rc) {
+            ev.kind = QE_TURN_CALL_CLOSE;
+            ev.utf8 = NULL;
+            ev.nbytes = 0;
+            rc = emit(t, &ev);
+        }
+        t->calls++;
+        rc = rc ? 1 : 0;
+    }
+    free(args);
+    qe_json_free(parsed);
+    qe_json_free(v);
+    return rc;
+}
+
 static int emit_call(qe_turn *t) {
     int rc = announce_call(t);
-    if (rc || !t->announced)
-        return rc; /* nothing that names a function: dropped, as it always was */
+    if (rc)
+        return rc;
+    if (!t->announced) {
+        /* Nothing that names a function the template's way. The JSON way, then; and
+         * failing that it is dropped - and said to have been, because to the client it
+         * is a turn that just stopped. */
+        rc = emit_json_call(t);
+        if (rc >= 0)
+            return rc;
+        qe_turn_ev ev = { .kind = QE_TURN_CALL_DROPPED, .utf8 = t->block.p ? t->block.p : "",
+                          .nbytes = (int)t->block.len };
+        return emit(t, &ev);
+    }
     const char *p = t->block.p;
     size_t n = t->block.len;
     size_t after = 0;

@@ -565,6 +565,19 @@ Three things the client's own log said, and what changed for each
 - `dropping empty assistant message` by the hundred: the same reasoning-only turns,
   dropped from every later prompt. They no longer occur once the answer is rescued.
 
+The prompt is now the model's own template, byte for byte. `qe` renders the chat
+template by hand, and a Jinja rendering of the checkpoint's template (applied the way
+transformers and llama.cpp apply it) found two differences on every crush prompt: the
+tool schemas were written with Jinja's stock `tojson` - keys sorted, no spaces,
+`& < > '` and non-ASCII escaped - where training used `json.dumps` (the client's key
+order, `", "` and `": "`, the characters themselves); and every replayed tool call
+that followed a reasoning block with no text was preceded by one newline too many.
+Both are fixed, a 49,312-character crush prompt from a real session now renders
+identically to the template, and `bench_chat` holds the bytes. The one remaining
+deliberate difference is `--empty-thinking-blocks`: an assistant turn sent with no
+reasoning renders no block unless that switch is on, where the template always writes
+an empty one; crush sends reasoning with every turn, so it does not meet it.
+
 A tool call is opened to the client as soon as the model has written its function's
 name, and its arguments follow, whole and schema-typed, when its block closes. crush
 draws the call when it opens, so a `write` of a 44-line file shows at 3.3 s instead of

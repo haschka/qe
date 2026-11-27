@@ -386,6 +386,13 @@ static qe_json *parse_value(struct pstate *p) {
         if (!v)
             return NULL;
         v->num = d;
+        /* The literal as written, because 1.0 and 1 are one double and two different
+         * things to a serialiser that has to reproduce Python's (src/chat.c). */
+        v->str = malloc(len + 1);
+        if (v->str) {
+            memcpy(v->str, tmp, len + 1);
+            v->str_len = len;
+        }
         return v;
     }
     perr(p, "unexpected character");

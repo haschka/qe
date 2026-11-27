@@ -28,7 +28,8 @@ typedef struct qe_json {
     char *key; /* set when this value is a member of an object */
     double num;
     int boolean;
-    char *str; /* unescaped, NUL-terminated; str_len excludes the NUL */
+    char *str; /* unescaped, NUL-terminated; str_len excludes the NUL. For a number,
+                * the literal as it was written. */
     size_t str_len;
     struct qe_json *child, *next;
     size_t n_child;
