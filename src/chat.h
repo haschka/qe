@@ -59,16 +59,23 @@
 #define QE_CHAT_MAX_IMAGES 32
 #define QE_CHAT_MIME_MAX 64
 #define QE_CHAT_MAX_IMAGE_BYTES (32u << 20)
-/* What the transcript says where an image was. There is no vision encoder in this
- * build, and "[image 1: image/png, 253154 bytes]" alone was read by the model as an
- * image it had been shown: it answered a view of a PNG with "Now I can see the
- * pattern much better!" and described what it imagined. So the placeholder says what
- * the model can and cannot know, and an agent can go on to inspect the file with the
- * tools it does have. */
+/* What the transcript says where an image was when it cannot be shown. A bare
+ * "[image 1: image/png, 253154 bytes]" was read by the model as an image it had been
+ * shown: it answered a view of a PNG with "Now I can see the pattern much better!" and
+ * described what it imagined. So the placeholder says what the model can and cannot
+ * know, and why, in words it can hand to the user - the model is the only channel to
+ * the user there is, because refusing the request instead would fail every later turn
+ * of a conversation whose client resends its history. Two reasons, two sentences:
+ * there is no tower, or there is one and the server runs batched (an encode needs the
+ * whole thread pool, which the batched lane's driver shares). */
 #define QE_CHAT_IMAGE_NOTE                                                                   \
-    "The image content is not visible to you: this server has no vision encoder. Do not "  \
-    "describe or guess what it shows; say you cannot see it, or inspect the file with "     \
-    "other tools"
+    "The image content is not visible to you: this server was started without a vision "  \
+    "encoder (--mmproj). Do not describe or guess what it shows; tell the user you cannot " \
+    "see it, or inspect the file with other tools"
+#define QE_CHAT_IMAGE_NOTE_BATCH                                                             \
+    "The image content is not visible to you: this server runs several conversations at "  \
+    "once (--batch) and shows images only when started with --batch 1. Do not describe or " \
+    "guess what it shows; tell the user so, or inspect the file with other tools"
 
 /* Vocabulary ids of the control tokens this model was trained with, as the
  * checkpoint's token_type array marks them. Kept as numbers so that no literal
@@ -115,6 +122,7 @@ typedef struct {
      * vocabulary has the markers. `image_mark` is their text, from the vocabulary. */
     int vision;
     char image_mark[160];
+    const char *image_note; /* the sentence an unseen image gets */
 } qe_chat;
 
 /* What the caller asked for, after the request's own spellings are reconciled.
@@ -137,6 +145,9 @@ typedef struct {
      * that will turn each image's position into the image's rows. Off, an image is a
      * sentence that says it cannot be seen. */
     int vision;
+    /* Set with vision off when the engine has a tower and the server runs batched, so
+     * the note says that rather than that there is no tower. */
+    int vision_batched;
 } qe_chat_opts;
 
 /* Fills o from a request body: enable_thinking (also accepted inside
@@ -171,11 +182,13 @@ int qe_chat_record_image(qe_chat *r, const char *url, char *why, size_t whyn);
  * are all delimited by ids, and nothing a model writes inside the answer can be
  * mistaken for one of them.
  *
- * Tool calls are reported when their block closes, not as they stream. The
- * block is delimited by control tokens and its contents are structure rather
- * than text, so buffering it costs a little latency on a path where the client
- * cannot act on a partial argument list and buys an exactly-parsed name and
- * argument object instead. */
+ * A tool call is opened as soon as its function's name is whole, so a client can
+ * draw it while the model is still writing it - a file write is minutes of
+ * arguments - and its arguments follow, whole, when its block closes: the block
+ * is structure rather than text, and an exactly-parsed argument object is worth
+ * more than a partial one no client can act on. A call that was opened and never
+ * closed makes the turn's finish "length", because a client that was told a
+ * call exists runs it on any other finish, with whatever arguments it has. */
 enum {
     QE_TURN_CONTENT,   /* answer text */
     QE_TURN_REASONING, /* reasoning text */
@@ -246,5 +259,8 @@ int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes);
  * suppressed by the client anyway. */
 int qe_turn_end(qe_turn *t);
 long qe_turn_reasoning_bytes(const qe_turn *t);
+/* A call was opened to the client and its block never closed. The reply's finish has
+ * to say "length" then, whatever else ended it. */
+int qe_turn_aborted(const qe_turn *t);
 
 #endif /* QE_CHAT_H */

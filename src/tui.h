@@ -48,6 +48,9 @@ void qe_ui_log(const char *line);
  * ingested/cached are the deltas to add to the process totals. */
 void qe_ui_gen_begin(long prompt_tokens, long already);
 void qe_ui_ingest(long done, long total);
+/* The vision tower is encoding image `image` of `images`, `done` of its `total` blocks
+ * through. The prompt rows show the image until ingestion reports again. */
+void qe_ui_vision(int image, int images, long done, long total);
 void qe_ui_ingested(long tokens);
 void qe_ui_cached(long tokens);
 void qe_ui_emit(void);

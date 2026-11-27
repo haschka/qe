@@ -184,7 +184,10 @@ the listener immediately and gives the port back inside its grace period.
 Routes: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and
 SSE streaming. A request with no `temperature` samples at the checkpoint's own
 (`general.sampling.temp`, 1.0) unless `--temp` says otherwise; send `"temperature": 0`
-for a greedy, byte-for-byte repeatable answer. What the engine is doing stays visible while it does it: `/health`
+for a greedy, byte-for-byte repeatable answer. `presence_penalty` and
+`frequency_penalty` are OpenAI's (over the answer so far, -2 to 2, a 400 outside it),
+and `reasoning_effort` takes `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and
+`max` - the last three are this model's top setting. What the engine is doing stays visible while it does it: `/health`
 reports the draft head, the draft length and the turn-cache counters, and `--ui`
 opens the terminal panel with the per-stage timings of the request in flight
 (`make ui` shows that panel on a pty and asserts it never draws into a log).
@@ -232,7 +235,10 @@ What happens to the image, all of it in this tree (`src/vision.c`, docs/DESIGN.m
 
 Up to 32 images a request; past that the oldest are left out, because an agent
 resends its history and the image it is asking about is the newest. With `--batch N`
-images are described in text instead, because an encode needs the whole thread pool.
+images are described in text instead, because an encode needs the whole thread pool;
+the model is told why, in a sentence that names `--batch 1`, so what reaches the user
+is the setting that fixes it. The request itself is not refused: an agent resends its
+history, and one screenshot would fail every later turn of the conversation.
 
 ## Pointing Crush at it
 

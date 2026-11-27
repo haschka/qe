@@ -2190,6 +2190,12 @@ typedef struct {
     int top_k;
     float top_p;
     float min_p;
+    /* OpenAI's two penalties over the answer so far: every token that has appeared in
+     * it has its logit lowered by presence_penalty, and by frequency_penalty once more
+     * for each time it appeared. 0 is off; negative encourages repetition. Either one
+     * set turns speculation off for the request, because a draft is checked against
+     * the unpenalised distribution. */
+    float presence_penalty, frequency_penalty;
     unsigned seed;
     int spec_k;  /* draft length; 0 disables speculation */
     int eos;     /* vocabulary id that ends generation, or -1 */

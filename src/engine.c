@@ -84,6 +84,57 @@ typedef struct {
  * in the sense that matters - written by the requester before the lane is armed and
  * read only by the driver afterwards, so a request queued behind a full batch is never
  * holding a buffer the driver has to wait for. */
+/* The penalties of one request: a count per token of the answer so far, and the list
+ * of tokens that have a count, which is what a step walks - a few hundred entries, not
+ * the vocabulary. They are applied to a copy of the logits, never to the logits
+ * themselves: those are the pass's own, and the last of them is kept as the tail a
+ * later request that ends where this one did reads instead of taking a pass. */
+typedef struct {
+    float pres, freq;
+    int *cnt, *seen;
+    long nseen;
+    float *buf;
+} penal;
+
+static int penal_init(penal *pn, const qe_gen_opts *o, long vocab) {
+    memset(pn, 0, sizeof *pn);
+    pn->pres = o->presence_penalty;
+    pn->freq = o->frequency_penalty;
+    if (pn->pres == 0.0f && pn->freq == 0.0f)
+        return 0;
+    pn->cnt = calloc((size_t)vocab, sizeof *pn->cnt);
+    pn->seen = malloc((size_t)vocab * sizeof *pn->seen);
+    pn->buf = malloc((size_t)vocab * sizeof *pn->buf);
+    return pn->cnt && pn->seen && pn->buf ? 0 : -1;
+}
+
+static int penal_on(const penal *pn) { return pn->cnt != NULL; }
+
+static const float *penal_apply(penal *pn, const float *logits, long vocab) {
+    if (!pn->cnt || !pn->nseen)
+        return logits;
+    memcpy(pn->buf, logits, (size_t)vocab * sizeof *pn->buf);
+    for (long i = 0; i < pn->nseen; i++) {
+        const int id = pn->seen[i];
+        pn->buf[id] -= pn->pres + pn->freq * (float)pn->cnt[id];
+    }
+    return pn->buf;
+}
+
+static void penal_note(penal *pn, int id, long vocab) {
+    if (!pn->cnt || id < 0 || id >= vocab)
+        return;
+    if (!pn->cnt[id]++)
+        pn->seen[pn->nseen++] = id;
+}
+
+static void penal_free(penal *pn) {
+    free(pn->cnt);
+    free(pn->seen);
+    free(pn->buf);
+    memset(pn, 0, sizeof *pn);
+}
+
 typedef struct {
     int used;        /* a request owns this sequence */
     int admitted;    /* its prompt is through the network; it takes part in steps */
@@ -100,6 +151,7 @@ typedef struct {
     int eos;
     int dropped;  /* the prompt had to lose its front to fit the window */
     qe_sampler_opts so;
+    penal pen;    /* this request's presence and frequency penalties */
     uint64_t rng;
     qe_token_cb cb;
     void *user;
@@ -116,6 +168,7 @@ struct qe_engine {
     qe_model *mm;     /* checkpoint metadata, mapped read-only */
     qe_model *mmproj; /* vision projector, resident like the weights */
     qe_vision *vision; /* its tower, NULL when there is none to drive */
+    int vis_k, vis_n;  /* the image being encoded, of how many, for the panel */
     qe_model *mtp;    /* draft head, in its own GGUF, resident like the weights */
     qe_tok *tok;       /* real BPE tokenizer, NULL if the file's is unusable */
     char tok_err[256]; /* why tok is NULL, for --report and /v1/models */
@@ -1771,6 +1824,7 @@ static void mm_positions(mm_prompt *m, long np) {
 
 static int vision_progress(void *vp, long done, long total) {
     qe_engine *e = vp;
+    qe_ui_vision(e->vis_k, e->vis_n, done, total);
     /* The request's own hook only: it is what writes a keepalive on the stream and
      * what says the client left, and a large image is a minute of neither otherwise. */
     return e->user_progress ? e->user_progress(e->user_progress_user, done, total) : 0;
@@ -1783,12 +1837,22 @@ static int mm_encode(qe_engine *e, mm_prompt *m, long from, long to, qe_gen_stat
                      char *why, size_t whyn) {
     const int D = qe_vision_dim(e->vision);
     const double t0 = now();
+    /* How many will be encoded, so the panel can say "image 2 of 3" of these. */
+    int todo = 0, done_imgs = 0;
+    for (int k = 0; k < m->n; k++)
+        for (long i = from; i < to; i++)
+            if (m->irow[i] >= 0 && (m->irow[i] >> 20) == k) {
+                todo++;
+                break;
+            }
     for (int k = 0; k < m->n; k++) {
         int needed = 0;
         for (long i = from; i < to && !needed; i++)
             needed = m->irow[i] >= 0 && (m->irow[i] >> 20) == k;
         if (!needed)
             continue;
+        e->vis_k = ++done_imgs;
+        e->vis_n = todo;
         const long rows = (long)m->nx[k] * m->ny[k];
         m->emb[k] = malloc((size_t)rows * (size_t)D * sizeof(float));
         if (!m->emb[k]) {
@@ -1825,6 +1889,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
     float *logits = NULL;
     mm_prompt mm = { 0 };
     int has_mm = 0;
+    penal pen = { 0 };
     if (!e->tok) {
         /* Without the file's tokenizer there is no honest way to turn text into
          * ids, and inventing an encoding is worse than refusing. */
@@ -1907,6 +1972,10 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         mm_positions(&mm, np);
 
     qe_sampler_opts so = samp_for(e, o);
+    if (penal_init(&pen, o, vocab)) {
+        errno = ENOMEM;
+        goto done;
+    }
     uint64_t rng =
         o->seed ? (uint64_t)o->seed : (uint64_t)(t0 * 1e9) ^ 0x853c49e6748fea9bull;
 
@@ -1989,7 +2058,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
     /* Not with images: a draft row is a token, and the drafter indexes the transcript,
      * where an image's rows are tags that are no token at all. */
     if (o->spec_k > 0 && so.temp <= 0.0f && mt > 0 && reuse != np && np >= 2 && ctx > 0 &&
-        mt <= (long)ctx - np - o->spec_k && !has_mm)
+        mt <= (long)ctx - np - o->spec_k && !has_mm && !penal_on(&pen))
         sp = spec_get(e, o->spec_k + 1, vocab);
     if (sp) {
         feed_to = np - 1;
@@ -2069,9 +2138,10 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
      * The arithmetic that ships is the other one, and it costs byte equality rather
      * than tokens: see the speculation section of qe.h. */
     for (long i = 0; !sp && i < mt; i++) {
-        int id = qe_sample(logits, vocab, &so, &rng);
+        int id = qe_sample(penal_apply(&pen, logits, vocab), vocab, &so, &rng);
         if (id < 0)
             break;
+        penal_note(&pen, id, vocab);
         /* Every token is reported, control tokens included, and the caller
          * decides what a turn boundary means. Dropping them silently is what
          * made a reasoning model look like it never reasoned: the block
@@ -2202,6 +2272,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
     }
 done:
     mm_free(&mm);
+    penal_free(&pen);
     /* Also on the way out of a failure: a panel left saying "ingesting" because a
      * request died is a panel that teaches people to ignore it. */
     qe_ui_gen_end();
@@ -2327,6 +2398,7 @@ static void lane_retire(qe_engine *e, int i) {
     }
     qe_forward_reset_seq(e->fw, i);
     free(L->ids);
+    penal_free(&L->pen);
     memset(L, 0, sizeof *L);
     e->lane_live--;
     qe_ui_gen_end();
@@ -2343,7 +2415,9 @@ static void lane_retire(qe_engine *e, int i) {
  * too: a sink writes one connection's bytes and only ever one thread is doing that. */
 static void lane_say(qe_engine *e, lane *L, const float *lg) {
     const long vocab = qe_forward_vocab(e->fw);
-    int id = qe_sample(lg, vocab, &L->so, &L->rng);
+    int id = qe_sample(penal_apply(&L->pen, lg, vocab), vocab, &L->so, &L->rng);
+    if (id >= 0)
+        penal_note(&L->pen, id, vocab);
     if (id < 0) {
         L->stop = 1; /* the sampler had nothing to choose from */
         return;
@@ -2531,6 +2605,15 @@ static long gen_batched(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
         np = keep;
         dropped = 1;
     }
+    /* Made before the lane is taken, so a request that cannot have its counts is
+     * refused without a lane ever being armed for it. */
+    penal pen;
+    if (penal_init(&pen, o, qe_forward_vocab(e->fw))) {
+        penal_free(&pen);
+        free(ids);
+        errno = ENOMEM;
+        return -1;
+    }
 
     lane_wait w = { 0, 0, 0 };
     pthread_mutex_lock(&e->lock);
@@ -2551,6 +2634,7 @@ static long gen_batched(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
     L->eos = o->eos >= 0 ? o->eos : qe_tok_eos(e->tok);
     L->dropped = dropped;
     L->so = samp_for(e, o);
+    L->pen = pen;
     L->rng = o->seed ? (uint64_t)o->seed
                      : ((uint64_t)(now() * 1e9) ^ 0x853c49e6748fea9bull);
     L->cb = cb;

@@ -548,14 +548,29 @@ for bad, why in (
     ({"top_k": 1.5}, "non-integer top_k"),
     ({"top_k": "auto"}, "string top_k"),
     ({"temperature": -1.0}, "negative temperature"),
+    ({"temperature": "hot"}, "string temperature"),
+    ({"presence_penalty": 2.5}, "presence_penalty above 2"),
+    ({"frequency_penalty": -3}, "frequency_penalty below -2"),
+    ({"frequency_penalty": "lots"}, "string frequency_penalty"),
 ):
     stx, ctx, bx = req("POST", "/v1/chat/completions",
                        dict(CRUSH, max_tokens=8, **bad))
     msg = json.loads(bx)["error"]["message"]
     print(f"   {why} -> {stx} {msg}")
     check(stx == 400, f"400 on {why}")
-    check("top_" in msg or "min_p" in msg or "temperature" in msg,
+    check("top_" in msg or "min_p" in msg or "temperature" in msg or "penalty" in msg,
           f"the {why} message names the knob")
+
+# Accepted rather than refused or ignored: both penalties inside OpenAI's range (and
+# null, which is absent), and "max", the top of the effort scale in crush's library.
+for good, why in (
+    ({"presence_penalty": 1.5, "frequency_penalty": -0.5}, "penalties in range"),
+    ({"presence_penalty": None, "frequency_penalty": 0}, "null and zero penalties"),
+    ({"reasoning_effort": "max"}, "reasoning_effort max"),
+):
+    stx, ctx, bx = req("POST", "/v1/chat/completions", dict(CRUSH, max_tokens=8, **good))
+    print(f"   {why} -> {stx}")
+    check(stx == 200, f"200 on {why}")
 
 # The off spellings have to be accepted, not clamped: -1 for top_k and 1 for
 # top_p are what a client sends when it wants the whole distribution.

@@ -424,7 +424,11 @@ int qe_chat_opts_from_body(const qe_json *body, qe_chat_opts *o, char *why, size
     const qe_json *eff = lookup_any(body, "reasoning_effort");
     if (eff && eff->kind == QE_JSON_STR && eff->str && *eff->str) {
         spoken = 1;
-        if (!strcmp(eff->str, "high") || !strcmp(eff->str, "xhigh")) {
+        /* "max" is the newest client spelling of the top of the scale (fantasy has it,
+         * so crush can send it); this model's top is xhigh, so that is what it gets
+         * rather than a refusal of the whole turn. */
+        if (!strcmp(eff->str, "high") || !strcmp(eff->str, "xhigh") ||
+            !strcmp(eff->str, "max")) {
             o->effort_xhigh = 1;
         } else if (!strcmp(eff->str, "medium")) {
             o->effort_xhigh = 0;
@@ -438,8 +442,8 @@ int qe_chat_opts_from_body(const qe_json *body, qe_chat_opts *o, char *why, size
             o->enable_thinking = 0;
         } else {
             snprintf(why, whyn,
-                     "reasoning_effort '%s' is not supported; this model takes xhigh (default), "
-                     "medium, low, minimal, and none",
+                     "reasoning_effort '%s' is not supported; this model takes xhigh (default; "
+                     "high and max mean the same), medium, low, minimal, and none",
                      eff->str);
             return -1;
         }
@@ -584,9 +588,9 @@ static int put_content(qe_str *o, const qe_json *m, qe_chat *r, char *why, size_
             if (r->vision)
                 qe_str_puts(o, r->image_mark);
             else
-                qe_str_appendf(o, "[image %d: %s, %zu bytes. " QE_CHAT_IMAGE_NOTE "]",
-                               r->n_images, r->image_mime[r->n_images - 1],
-                               r->images[r->n_images - 1].len);
+                qe_str_appendf(o, "[image %d: %s, %zu bytes. %s]", r->n_images,
+                               r->image_mime[r->n_images - 1], r->images[r->n_images - 1].len,
+                               r->image_note ? r->image_note : QE_CHAT_IMAGE_NOTE);
             continue;
         }
         if (!strcmp(type, "video") || !strcmp(type, "video_url")) {
@@ -708,6 +712,7 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
     }
     r->chat = 1;
     r->n_messages = (long)nm;
+    r->image_note = o->vision_batched ? QE_CHAT_IMAGE_NOTE_BATCH : QE_CHAT_IMAGE_NOTE;
     if (o->vision) {
         char vo[MARK_MAX], vc[MARK_MAX], vp[MARK_MAX];
         if (!mark_text(t, QE_MARK_VISION_OPEN, vo, sizeof vo) &&
@@ -999,6 +1004,8 @@ struct qe_turn {
     const qe_json *tools; /* the request's tools[], borrowed; types the arguments */
     qe_str reasoning;     /* the reasoning text, kept for the rescue at the close */
     long content_bytes;   /* answer text reported so far */
+    int announced; /* the request in the block has been opened to the client */
+    int aborted;   /* one was opened and its block never closed */
 };
 
 qe_turn *qe_turn_new(qe_turn_cb cb, void *user, int starts_in_reasoning) {
@@ -1323,13 +1330,44 @@ static void put_arg_value(qe_str *o, const char *raw, size_t rawn, int kind) {
  * Malformed structure is dropped rather than forwarded: a call the model did
  * not ask for, executed against a real filesystem, is the one failure mode here
  * that cannot be undone. */
+/* The request in the block, opened to the client as soon as its function's name is
+ * whole: a client draws the call when it opens, and the arguments of a file write are
+ * a minute of decoding that would otherwise show nothing at all. Only the name is
+ * sent early. The arguments still go once the block has closed, because only then is
+ * it known what they are - and a request that never closes is reported as cut off
+ * (finish_turn), which is what keeps a client from running a call nobody finished
+ * writing: fantasy, for one, fills in {} and dispatches any call it was opened on
+ * unless the reply says it was truncated. */
+static int announce_call(qe_turn *t) {
+    slice fname;
+    size_t after = 0;
+    if (t->announced ||
+        find_open(t->block.p, t->block.len, 0, "function", &fname, NULL, &after) || !fname.n)
+        return 0;
+    char *id = malloc(64);
+    char **grown = id ? realloc(t->ids, (size_t)(t->calls + 1) * sizeof *t->ids) : NULL;
+    if (!id || !grown) {
+        free(id);
+        return 0;
+    }
+    t->ids = grown;
+    snprintf(id, 64, "%s-%d", t->id_prefix, t->calls);
+    t->ids[t->calls] = id;
+    t->announced = 1;
+    qe_turn_ev ev = { .kind = QE_TURN_CALL_OPEN, .index = t->calls, .name = fname.p,
+                      .name_len = (int)fname.n, .call_id = id };
+    return emit(t, &ev);
+}
+
 static int emit_call(qe_turn *t) {
+    int rc = announce_call(t);
+    if (rc || !t->announced)
+        return rc; /* nothing that names a function: dropped, as it always was */
     const char *p = t->block.p;
     size_t n = t->block.len;
     size_t after = 0;
     slice fname;
-    if (find_open(p, n, 0, "function", &fname, NULL, &after) || !fname.n)
-        return 0;
+    find_open(p, n, 0, "function", &fname, NULL, &after);
 
     qe_str args = { 0 };
     putc1(&args, '{');
@@ -1363,33 +1401,14 @@ static int emit_call(qe_turn *t) {
         pos = cafter;
     }
     putc1(&args, '}');
-    if (!first && args.err) {
-        qe_str_free(&args);
-        return 0;
-    }
+    /* The call is open on the client's side, so it gets an argument object whatever
+     * happens here; an allocation that failed half way is an empty one. */
+    const int bad = args.err;
 
-    char *id = malloc(64);
-    char **grown = id ? realloc(t->ids, (size_t)(t->calls + 1) * sizeof *t->ids) : NULL;
-    if (!id || !grown) {
-        free(id);
-        qe_str_free(&args);
-        return 0;
-    }
-    t->ids = grown;
-    snprintf(id, 64, "%s-%d", t->id_prefix, t->calls);
-    t->ids[t->calls] = id;
-
-    qe_turn_ev ev = { .kind = QE_TURN_CALL_OPEN, .index = t->calls, .name = fname.p,
-                      .name_len = (int)fname.n, .call_id = id };
-    int rc = emit(t, &ev);
-    if (!rc) {
-        ev.kind = QE_TURN_CALL_ARGS;
-        ev.name = NULL;
-        ev.name_len = 0;
-        ev.utf8 = args.p ? args.p : "";
-        ev.nbytes = (int)args.len;
-        rc = emit(t, &ev);
-    }
+    qe_turn_ev ev = { .kind = QE_TURN_CALL_ARGS, .index = t->calls, .call_id = t->ids[t->calls],
+                      .utf8 = bad || !args.p ? "{}" : args.p,
+                      .nbytes = bad || !args.p ? 2 : (int)args.len };
+    rc = emit(t, &ev);
     if (!rc) {
         ev.kind = QE_TURN_CALL_CLOSE;
         ev.utf8 = NULL;
@@ -1397,6 +1416,7 @@ static int emit_call(qe_turn *t) {
         rc = emit(t, &ev);
     }
     t->calls++;
+    t->announced = 0;
     qe_str_free(&args);
     return rc;
 }
@@ -1417,7 +1437,8 @@ static int rescue_answer(qe_turn *t) {
 /* The close of an assistant turn. A reply that asked for something ended with a
  * tool call; anything else is a stop. */
 static int finish_turn(qe_turn *t) {
-    qe_turn_ev ev = { .kind = QE_TURN_STOP, .finish = t->calls ? "tool_calls" : "stop" };
+    qe_turn_ev ev = { .kind = QE_TURN_STOP,
+                      .finish = t->aborted ? "length" : t->calls ? "tool_calls" : "stop" };
     t->finished = 1;
     t->state = ST_ANSWER;
     return emit(t, &ev);
@@ -1436,6 +1457,9 @@ int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes) {
         t->state = ST_ANSWER;
         return flush_blank(t, 1);
     case QE_MARK_TOOL_OPEN:
+        if (t->announced) /* a second opening inside an open request: the first is cut off */
+            t->aborted = 1;
+        t->announced = 0;
         t->state = ST_BLOCK;
         t->block.len = 0; /* keep the capacity; blocks repeat within a turn */
         t->blank.len = 0; /* the empty line before a request belongs to neither side */
@@ -1458,8 +1482,12 @@ int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes) {
             t->state = ST_ANSWER;
         return 0;
     case QE_MARK_TURN_CLOSE:
-        if (t->state == ST_BLOCK)
+        if (t->state == ST_BLOCK) {
             t->block.len = 0;
+            if (t->announced)
+                t->aborted = 1;
+            t->announced = 0;
+        }
         return flush_blank(t, t->calls == 0) || rescue_answer(t) || finish_turn(t);
     default:
         break;
@@ -1470,7 +1498,9 @@ int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes) {
     case ST_REASON:
         return emit_text(t, QE_TURN_REASONING, utf8, nbytes);
     case ST_BLOCK:
-        return qe_str_append(&t->block, utf8, (size_t)nbytes);
+        if (qe_str_append(&t->block, utf8, (size_t)nbytes))
+            return 1;
+        return t->announced ? 0 : announce_call(t);
     case ST_ECHO:
         return 0;
     default:
@@ -1484,10 +1514,16 @@ int qe_turn_end(qe_turn *t) {
     /* A request whose block never closed is dropped: the client suppresses a
      * call that arrived with finish_reason length anyway, and a partial one is
      * the least safe thing to hand it. */
-    if (t->state == ST_BLOCK)
+    if (t->state == ST_BLOCK) {
         t->block.len = 0;
+        if (t->announced)
+            t->aborted = 1;
+        t->announced = 0;
+    }
     return flush_blank(t, t->calls == 0);
 }
+
+int qe_turn_aborted(const qe_turn *t) { return t ? t->aborted : 0; }
 
 long qe_turn_reasoning_bytes(const qe_turn *t) {
     return t ? t->reason_bytes : 0;

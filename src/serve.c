@@ -861,6 +861,24 @@ static int sampling_from_body(const qe_json *body, int n_vocab, qe_gen_opts *go,
         }
         go->min_p = m == 0.0f ? -1.0f : m;
     }
+    /* OpenAI's range, and a refusal outside it rather than a silently different
+     * distribution; absent and null are 0, which is off. */
+    static const char *const pens[2] = { "presence_penalty", "frequency_penalty" };
+    for (int i = 0; i < 2; i++) {
+        float *dst = i ? &go->frequency_penalty : &go->presence_penalty;
+        *dst = 0.0f;
+        if (!(v = qe_json_at(body, pens[i])) || v->kind == QE_JSON_NULL)
+            continue;
+        if (v->kind != QE_JSON_NUM) {
+            snprintf(why, whyn, "'%s' must be a number", pens[i]);
+            return -1;
+        }
+        if (!(v->num >= -2.0 && v->num <= 2.0)) {
+            snprintf(why, whyn, "'%s' must be in [-2, 2]", pens[i]);
+            return -1;
+        }
+        *dst = (float)v->num;
+    }
     return 0;
 }
 
@@ -915,6 +933,7 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
      * lane: an encode needs the whole pool, and the batched lane's driver walks the
      * weights on it outside the engine's lock. */
     co.vision = st->info.has_vision && st->info.n_batch <= 1;
+    co.vision_batched = st->info.has_vision && st->info.n_batch > 1;
     qe_chat r = { 0 };
     qe_tok *tk = qe_engine_tok(st->eng);
     int rc = tk && qe_chat_supported(tk) ? qe_chat_render(tk, body, &co, &r, err, sizeof err)
@@ -1014,7 +1033,11 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
      * the model closed its own turn, it ran out of the budget it was given, and
      * it stopped because it asked for something. A missing finish_reason is a
      * truncated stream to a careful client, not a successful one. */
-    const char *finish = k.finish ? k.finish
+    /* A call the client was told about and never got the end of is a truncated
+     * reply, however generation stopped (a shutdown, say): any other finish and the
+     * client runs the call with whatever arguments it has. */
+    const char *finish = qe_turn_aborted(k.turn) ? "length"
+                   : k.finish ? k.finish
                    : gs.truncated ? "length"
                                     : (k.n_calls ? "tool_calls" : "stop");
     if (n < 0 && !k.chunk_failed) {
@@ -1598,6 +1621,12 @@ int qe_serve(const qe_serve_opts *opts) {
          * than its path: a long path on a status row is a path that gets cut in half
          * in the middle of a directory name, which is worse than not showing it. The
          * banner above and /v1/models both carry it whole. */
+        char vis[64] = "";
+        if (st.info.has_vision && st.info.n_batch <= 1)
+            snprintf(vis, sizeof vis, "vision on, at most %d rows an image",
+                     st.info.image_max_tokens);
+        if (vis[0] && !st.info.mtp_path[0])
+            qe_ui_head(NULL, vis);
         if (st.info.mtp_path[0]) {
             const char *bn = strrchr(st.info.mtp_path, '/');
             char nextn[24], sub[192];
@@ -1605,9 +1634,10 @@ int qe_serve(const qe_serve_opts *opts) {
                 snprintf(nextn, sizeof nextn, " nextn=%d", st.info.mtp_layers);
             else
                 nextn[0] = 0;
-            snprintf(sub, sizeof sub, "draft head %s %.2f GiB %s%s",
+            snprintf(sub, sizeof sub, "draft head %s %.2f GiB %s%s%s%s",
                      bn ? bn + 1 : st.info.mtp_path,
-                     (double)st.info.mtp_bytes / 1073741824.0, st.info.mtp_stage, nextn);
+                     (double)st.info.mtp_bytes / 1073741824.0, st.info.mtp_stage, nextn,
+                     vis[0] ? " \xc2\xb7 " : "", vis);
             qe_ui_head(NULL, sub);
         }
     }

@@ -565,6 +565,14 @@ Three things the client's own log said, and what changed for each
 - `dropping empty assistant message` by the hundred: the same reasoning-only turns,
   dropped from every later prompt. They no longer occur once the answer is rescued.
 
+A tool call is opened to the client as soon as the model has written its function's
+name, and its arguments follow, whole and schema-typed, when its block closes. crush
+draws the call when it opens, so a `write` of a 44-line file shows at 3.3 s instead of
+at 33 s when the arguments are done. A call that was opened and whose block never
+closes ends the reply with `finish_reason: length`: fantasy fills in `{}` and runs any
+call it was opened on unless the reply says it was truncated, and a call nobody
+finished writing must not run (`qe_turn_aborted`).
+
 Absent `temperature` now means the server's default: `--temp X` when given, the
 checkpoint's otherwise. Send `"temperature": 0` (crush: per-model `temperature`) for
 the old greedy behaviour.

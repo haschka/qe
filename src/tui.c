@@ -49,7 +49,7 @@
  * room to draw a rule across a wide terminal at all. */
 #define LINE_CHARS 1800
 
-enum { IDLE = 0, INGESTING = 1, EMITTING = 2 };
+enum { IDLE = 0, INGESTING = 1, EMITTING = 2, SEEING = 3 };
 
 /* Counters, not state: every one is a number a token path increments and the render
  * thread reads. Nothing here is worth a lock, and the render thread takes none of
@@ -79,6 +79,10 @@ static struct {
     _Atomic double emit_t0; /* the first emitted token */
     _Atomic double emit_t1; /* the latest one */
     _Atomic double req_end; /* the request finished: its clock stops here */
+    /* The vision tower, while it encodes: which image of how many, and how many of its
+     * blocks are through. A large screenshot is a minute of this, and a panel that sat
+     * on the prompt row's last value for that minute looked hung. */
+    _Atomic long vis_img, vis_n, vis_done, vis_total;
 } c;
 
 static double started;
@@ -168,6 +172,14 @@ void qe_ui_ingest(long done, long total) {
     if (total > 0)
         atomic_store_explicit(&c.req_total, total, memory_order_relaxed);
     atomic_store_explicit(&c.phase, INGESTING, memory_order_relaxed);
+}
+
+void qe_ui_vision(int image, int images, long done, long total) {
+    atomic_store_explicit(&c.vis_img, image, memory_order_relaxed);
+    atomic_store_explicit(&c.vis_n, images, memory_order_relaxed);
+    atomic_store_explicit(&c.vis_done, done, memory_order_relaxed);
+    atomic_store_explicit(&c.vis_total, total, memory_order_relaxed);
+    atomic_store_explicit(&c.phase, SEEING, memory_order_relaxed);
 }
 
 void qe_ui_ingested(long tokens) {
@@ -295,6 +307,12 @@ enum {
     ST_OK,     /* a request that finished the way it meant to */
     ST_BAD,    /* one that did not */
     ST_HOTDIM, /* the amber, muted: the trend's older answer seconds */
+    ST_VIS,    /* the vision tower's violet, bold: the IMAGE label and its bar */
+    ST_BADGE,  /* the wordmark: dark on the blue */
+    ST_PILL_OK,  /* a finish reason, as a badge: dark on green */
+    ST_PILL_HOT, /* ... dark on amber */
+    ST_PILL_BAD, /* ... light on red */
+    ST_BORDER, /* the box */
     ST_N
 };
 /* Composed at start for the terminal's colour depth: 24-bit where the terminal says so
@@ -304,6 +322,7 @@ enum {
  * about writing an answer; the rest is grey. */
 static char sgr[ST_N][48];
 static int track_bg; /* the track is a background (a solid band) rather than a glyph */
+static int truecolor; /* the bar can be a gradient, one colour a cell */
 
 static void palette_init(void) {
     const char *ct = getenv("COLORTERM"), *term = getenv("TERM");
@@ -326,7 +345,14 @@ static void palette_init(void) {
         snprintf(sgr[ST_OK], sizeof sgr[0], "\033[38;2;119;221;153m");
         snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[38;2;255;110;110m");
         snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[38;2;166;133;66m");
+        snprintf(sgr[ST_VIS], sizeof sgr[0], "\033[1;38;2;190;160;255m");
+        snprintf(sgr[ST_BADGE], sizeof sgr[0], "\033[1;38;2;10;24;36;48;2;102;204;255m");
+        snprintf(sgr[ST_PILL_OK], sizeof sgr[0], "\033[38;2;10;30;18;48;2;119;221;153m");
+        snprintf(sgr[ST_PILL_HOT], sizeof sgr[0], "\033[38;2;40;28;6;48;2;255;204;102m");
+        snprintf(sgr[ST_PILL_BAD], sizeof sgr[0], "\033[38;2;255;240;240;48;2;190;60;60m");
+        snprintf(sgr[ST_BORDER], sizeof sgr[0], "\033[38;2;96;112;128m");
         track_bg = 1;
+        truecolor = 1;
     } else if (c256) {
         snprintf(sgr[ST_DIM], sizeof sgr[0], "\033[38;5;245m");
         snprintf(sgr[ST_LABEL], sizeof sgr[0], "\033[38;5;248m");
@@ -342,6 +368,12 @@ static void palette_init(void) {
         snprintf(sgr[ST_OK], sizeof sgr[0], "\033[38;5;114m");
         snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[38;5;203m");
         snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[38;5;136m");
+        snprintf(sgr[ST_VIS], sizeof sgr[0], "\033[1;38;5;147m");
+        snprintf(sgr[ST_BADGE], sizeof sgr[0], "\033[1;38;5;16;48;5;81m");
+        snprintf(sgr[ST_PILL_OK], sizeof sgr[0], "\033[38;5;16;48;5;114m");
+        snprintf(sgr[ST_PILL_HOT], sizeof sgr[0], "\033[38;5;16;48;5;221m");
+        snprintf(sgr[ST_PILL_BAD], sizeof sgr[0], "\033[38;5;231;48;5;160m");
+        snprintf(sgr[ST_BORDER], sizeof sgr[0], "\033[38;5;240m");
         track_bg = 1;
     } else {
         snprintf(sgr[ST_DIM], sizeof sgr[0], "\033[90m");
@@ -358,6 +390,12 @@ static void palette_init(void) {
         snprintf(sgr[ST_OK], sizeof sgr[0], "\033[92m");
         snprintf(sgr[ST_BAD], sizeof sgr[0], "\033[91m");
         snprintf(sgr[ST_HOTDIM], sizeof sgr[0], "\033[33m");
+        snprintf(sgr[ST_VIS], sizeof sgr[0], "\033[1;95m");
+        snprintf(sgr[ST_BADGE], sizeof sgr[0], "\033[1;30;106m");
+        snprintf(sgr[ST_PILL_OK], sizeof sgr[0], "\033[30;102m");
+        snprintf(sgr[ST_PILL_HOT], sizeof sgr[0], "\033[30;103m");
+        snprintf(sgr[ST_PILL_BAD], sizeof sgr[0], "\033[97;101m");
+        snprintf(sgr[ST_BORDER], sizeof sgr[0], "\033[90m");
         track_bg = 0;
     }
 }
@@ -492,19 +530,25 @@ static struct {
     const char *rule, *full, *empty, *arrow, *sep;
     const char *part[8];  /* a cell filled to i eighths, i = 1..7 (0 unused) */
     const char *spark[9]; /* a sparkline column at height 0..8 */
-    const char *spin[10];
-    int nspin;
+    /* The box: corners, the sides, and the tees a section title hangs from. */
+    const char *tl, *tr, *bl, *br, *vert, *lt, *rt;
+    const char *on, *off; /* the header's status dot, busy and idle */
 } g = { "-", "#", ".", ">", " - ",
         { "", "#", "#", "#", "#", "#", "#", "#" },
         { " ", "_", "_", ".", ".", "-", "-", "=", "#" },
-        { "|", "/", "-", "\\" }, 4 };
+        "+", "+", "+", "+", "|", "+", "+", "*", "o" };
 
 static void glyphs_init(void) {
     static const char *env[] = { "LC_ALL", "LC_CTYPE", "LANG", NULL };
     for (int i = 0; env[i]; i++) {
         const char *v = getenv(env[i]);
-        if (!v)
+        if (!v || !*v)
             continue;
+        /* The first of the three that is set is the locale, as POSIX orders them: an
+         * LC_ALL of C over a LANG of UTF-8 is a C terminal, and box drawing sent to one
+         * arrives as three bytes of noise a glyph. */
+        if (!strcasestr(v, "UTF-8") && !strcasestr(v, "utf8"))
+            return;
         for (const char *s = v; *s; s++)
             if (!strncasecmp(s, "UTF-8", 5) || !strncasecmp(s, "utf8", 4)) {
                 g.rule = "─";
@@ -514,25 +558,23 @@ static void glyphs_init(void) {
                 g.sep = " · ";
                 static const char *eighths[8] = { "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
                 static const char *bars[9] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
-                /* The Linux console's font has the block elements and not braille. */
+                /* The Linux console's font has the block elements but only the half
+                 * cell of the eighths, and square corners rather than round ones. */
                 const char *term = getenv("TERM");
                 const int console = term && !strcmp(term, "linux");
-                static const char *braille[10] = { "⠋", "⠙", "⠹", "⠸", "⠼",
-                                                   "⠴", "⠦", "⠧", "⠇", "⠏" };
-                static const char *quad[4] = { "▖", "▘", "▝", "▗" };
                 for (int k = 0; k < 8; k++)
                     g.part[k] = console ? (k >= 4 ? "▌" : "") : eighths[k];
                 for (int k = 0; k < 9; k++)
                     g.spark[k] = bars[k];
-                if (console) {
-                    for (int k = 0; k < 4; k++)
-                        g.spin[k] = quad[k];
-                    g.nspin = 4;
-                } else {
-                    for (int k = 0; k < 10; k++)
-                        g.spin[k] = braille[k];
-                    g.nspin = 10;
-                }
+                g.tl = console ? "┌" : "╭";
+                g.tr = console ? "┐" : "╮";
+                g.bl = console ? "└" : "╰";
+                g.br = console ? "┘" : "╯";
+                g.vert = "│";
+                g.lt = "├";
+                g.rt = "┤";
+                g.on = "●";
+                g.off = "○";
                 return;
             }
     }
@@ -572,7 +614,7 @@ static int height_of(void) {
  * Filled cells are one run of one style, the partial cell its own, the track one run:
  * three escapes a row however long the bar, and a row that differs from the last frame
  * only when the bar has actually moved an eighth. */
-static void ln_bar(ln *l, int width, long done, long total, int active) {
+static void ln_bar(ln *l, int width, long done, long total, int active, int vision) {
     long eighths = 0;
     if (total > 0) {
         double f = (double)done / (double)total;
@@ -589,17 +631,34 @@ static void ln_bar(ln *l, int width, long done, long total, int active) {
         rem = 0; /* a font with no partial cells rounds down */
     char run[68 * 4 * 4 + 8];
     size_t o = 0;
-    for (int i = 0; i < full && o + 5 < sizeof run; i++) {
-        size_t gl = strlen(g.full);
-        memcpy(run + o, g.full, gl);
-        o += gl;
+    if (full && color && truecolor && active) {
+        /* A gradient, deep to bright toward the head of the bar, so the eye finds the
+         * moving end. One colour a cell is one escape a cell, and the row is only
+         * rewritten when the bar has moved an eighth, which is what keeps it cheap. */
+        const int r0 = vision ? 92 : 30, g0 = vision ? 70 : 96, b0 = vision ? 160 : 140;
+        const int r1 = vision ? 190 : 102, g1 = vision ? 160 : 204, b1 = vision ? 255 : 255;
+        for (int i = 0; i < full; i++) {
+            const double t = full > 1 ? (double)i / (double)(full - 1) : 1.0;
+            char seg[64];
+            snprintf(seg, sizeof seg, "\033[38;2;%d;%d;%dm%s", r0 + (int)((r1 - r0) * t),
+                     g0 + (int)((g1 - g0) * t), b0 + (int)((b1 - b0) * t), g.full);
+            ln_cat(l, seg, strlen(seg));
+            l->used++;
+        }
+        ln_cat(l, "\033[0m", 4);
+    } else {
+        for (int i = 0; i < full && o + 5 < sizeof run; i++) {
+            size_t gl = strlen(g.full);
+            memcpy(run + o, g.full, gl);
+            o += gl;
+        }
+        run[o] = 0;
+        if (full)
+            ln_put(l, run, vision ? ST_VIS : active ? ST_BAR : ST_BARDIM);
     }
-    run[o] = 0;
-    if (full)
-        ln_put(l, run, active ? ST_BAR : ST_BARDIM);
     int used = full;
     if (rem && used < width) {
-        ln_put(l, g.part[rem], color ? (active ? ST_PART : ST_PARTDIM) : ST_PLAIN);
+        ln_put(l, g.part[rem], color ? (vision ? ST_VIS : active ? ST_PART : ST_PARTDIM) : ST_PLAIN);
         used++;
     }
     o = 0;
@@ -749,9 +808,15 @@ static void ln_spark(ln *l, int width, float *pin, float *pout) {
  * red. */
 static void ln_hist(ln *l, const char *h) {
     if (!strncmp(h, "qe: WARN", 8)) {
-        ln_addf(l, ST_BAD, "%s", h);
+        ln_addf(l, ST_BAD, "%s", h + 4);
         return;
     }
+    /* The log line's "qe: " and its kind, when the kind is chat - nearly every request -
+     * are nine columns an 80-column row needs for the badge that says how it ended. */
+    if (!strncmp(h, "qe: ", 4))
+        h += 4;
+    if (!strncmp(h, "chat ", 5))
+        h += 5;
     const char *pi = strstr(h, "  in "), *po = pi ? strstr(pi, "  out ") : NULL;
     const char *pf = po ? strstr(po + 6, "  ") : NULL;
     if (!pi || !po || !pf) {
@@ -769,7 +834,13 @@ static void ln_hist(ln *l, const char *h) {
     const int good = !strncmp(fin, "stop", 4) || !strncmp(fin, "tool", 4);
     const int warn = !strncmp(fin, "length", 6);
     ln_put(l, "  ", ST_PLAIN);
-    ln_addf(l, good ? ST_OK : warn ? ST_HOT : ST_BAD, "%s", fin);
+    /* How it ended, as a badge where there is colour to make one: the column a reader
+     * scans first, since a turn that ended on length or on an error is the one to
+     * look at. Without colour it is the word, as the log line has it. */
+    if (color)
+        ln_addf(l, good ? ST_PILL_OK : warn ? ST_PILL_HOT : ST_PILL_BAD, " %s ", fin);
+    else
+        ln_addf(l, ST_PLAIN, "%s", fin);
 }
 
 /* Seconds, at the granularity that line is worth changing for. The uptime used to be
@@ -817,6 +888,18 @@ static int clip_cols(char *dst, size_t n, const char *s, int want) {
     dst[len] = 0;
     return *p != 0;
 }
+
+/* What a composed row is, for the box pass: an ordinary row, the header (top edge), a
+ * separator with an optional title, or the bottom edge. */
+enum { K_TEXT = 0, K_HEAD, K_SEP, K_BOT };
+static int fkind[MAX_ROWS];
+static char ftitle[MAX_ROWS][32];
+static char hdr_r[LINE_CHARS]; /* the header's right half: status and uptime */
+static int hdr_rw, hdr_lw;     /* columns of each half */
+static int boxed;              /* this frame is drawn in its box */
+/* Where the cursor waits between frames while a phase is running: the cell after that
+ * phase's label. -1 when nothing is running, and the cursor is hidden then. */
+static int park_row = -1, park_col;
 
 /* Builds one frame into `out` and returns how many lines it filled. `budget` is the
  * tallest panel the screen will take without scrolling the banner off the top. */
@@ -979,7 +1062,9 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     int left = budget - 3 - (show_sub ? 1 : 0);
     const int show_bar = left >= 1 && (left -= 1, 1);
     const int show_tail = left >= 2 && (left -= 2, 1);
-    const int show_rules = left >= 2 && (left -= 2, 1);
+    /* Two separators and the box's bottom edge: the frame is all or nothing, because a
+     * box with a side missing is a box that looks broken. */
+    const int show_rules = left >= 3 && (left -= 3, 1);
     const int show_trend = left >= 1 && (left -= 1, 1);
     const int show_recent = show_rules && nl > 0 && left >= 2 && (left -= 1, 1);
     int max_log = left;
@@ -988,25 +1073,65 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     if (max_log > LOG_LINES)
         max_log = LOG_LINES;
 
+    /* Boxed, the rows are composed four columns narrower and the box is put round
+     * them afterwards (draw), so everything below measures columns the same way
+     * either way. The leading column of margin is the box's own then. */
+    boxed = show_rules;
+    if (boxed)
+        width -= 4;
+    const char *M = boxed ? "" : " ";
+    const int ARG = boxed ? 10 : 11; /* the column every figure after a label starts in */
+    const int seeing = phase == SEEING;
+    const long vimg = atomic_load_explicit(&c.vis_img, memory_order_relaxed);
+    const long vn = atomic_load_explicit(&c.vis_n, memory_order_relaxed);
+    const long vdone = atomic_load_explicit(&c.vis_done, memory_order_relaxed);
+    const long vtot = atomic_load_explicit(&c.vis_total, memory_order_relaxed);
+
     int n = 0;
     ln l;
-    const int spin = (int)(tnow * 10.0) % g.nspin;
-    const int ARG = 11; /* the column every figure after a label starts in */
+    park_row = -1;
+    for (int i = 0; i < MAX_ROWS; i++) {
+        fkind[i] = K_TEXT;
+        ftitle[i][0] = 0;
+    }
 
-    /* Header: the wordmark, the engine, and the uptime pinned right. */
-    ln_open(&l, out[n], LINE_CHARS, width);
-    ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, ST_IN, "qe");
-    ln_put(&l, "  ", ST_PLAIN);
+    /* Header: the wordmark, the engine; and on the right what it is doing and for how
+     * long it has been up. Composed as two halves so the box can run its top edge
+     * between them, and the right half wins when there is not room for both. */
     {
-        /* The header gives way to the uptime, never the other way round. The engine's
-         * id is the first word and the one in bold; the rest is grey. */
+        ln r;
+        ln_open(&r, hdr_r, LINE_CHARS, width);
+        const char *what = phase == INGESTING ? "READING" : phase == EMITTING ? "WRITING"
+                         : seeing             ? "SEEING"  : "idle";
+        const int st = phase == INGESTING ? ST_IN : phase == EMITTING ? ST_OUT
+                     : seeing             ? ST_VIS : ST_DIM;
+        ln_addf(&r, st, "%s %s", phase == IDLE ? g.off : g.on, what);
+        ln_addf(&r, ST_DIM, "%sup ", g.sep);
+        ln_addf(&r, ST_LABEL, "%s", up);
+        hdr_rw = r.used;
+
+        ln_open(&l, out[n], LINE_CHARS, width);
+        ln_put(&l, M, ST_PLAIN);
+        if (color)
+            ln_addf(&l, ST_BADGE, " qe ");
+        else
+            ln_addf(&l, ST_IN, "qe");
+        ln_put(&l, " ", ST_PLAIN);
+        /* The wordmark already says "qe": an engine whose id is that too (the default,
+         * and what a crush config names it) does not say it twice. */
+        const char *hd = head;
+        if (!strncmp(hd, "qe ", 3)) {
+            hd += 3;
+            while (*hd == ' ' || *hd == '-' || (unsigned char)*hd == 0xc2 ||
+                   (unsigned char)*hd == 0xb7)
+                hd++;
+        }
         char hc[LINE_CHARS];
-        int room = width - vwidth(up) - 3 - l.used - 3;
+        int room = width - hdr_rw - l.used - 4;
         if (room < 8)
             room = 8;
-        int cut = vwidth(head) > room ? clip_cols(hc, sizeof hc, head, room - 2) : 0;
-        const char *h = cut ? hc : head;
+        int cut = vwidth(hd) > room ? clip_cols(hc, sizeof hc, hd, room - 2) : 0;
+        const char *h = cut ? hc : hd;
         const char *sp1 = strchr(h, ' ');
         if (sp1) {
             char first[LINE_CHARS];
@@ -1018,54 +1143,91 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         }
         if (cut)
             ln_addf(&l, ST_DIM, "..");
+        hdr_lw = l.used;
+        if (!boxed) {
+            ln_to(&l, width - hdr_rw);
+            ln_cat(&l, hdr_r, strlen(hdr_r));
+            l.used += hdr_rw;
+        }
+        fkind[n] = K_HEAD;
+        n++;
     }
-    ln_to(&l, width - vwidth(up) - 3 < l.used ? l.used : width - vwidth(up) - 3);
-    ln_addf(&l, ST_DIM, "up ");
-    ln_addf(&l, ST_LABEL, "%s", up);
-    n++;
 
     /* The second row: the file the engine is reading that the header has no room
      * for. Cut to the terminal and marked as cut, because a row that stops in the
      * middle of a name is read as a name that ended there. */
     if (show_sub) {
-        char cut[LINE_CHARS];
+        char cutb[LINE_CHARS];
         int room = width - 7; /* the five-column indent and the two of the marker */
-        int truncated = vwidth(sub) > room ? clip_cols(cut, sizeof cut, sub, room) : 0;
+        int truncated = vwidth(sub) > room ? clip_cols(cutb, sizeof cutb, sub, room) : 0;
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, "     ", ST_PLAIN);
-        ln_addf(&l, ST_DIM, "%s", truncated ? cut : sub);
+        ln_put(&l, boxed ? "    " : "     ", ST_PLAIN);
+        ln_addf(&l, ST_DIM, "%s", truncated ? cutb : sub);
         if (truncated)
             ln_addf(&l, ST_DIM, "..");
         n++;
     }
 
     if (show_rules) {
-        ln_open(&l, out[n++], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
-        ln_rule(&l, g.rule);
+        ln_open(&l, out[n], LINE_CHARS, width);
+        if (!boxed) {
+            ln_put(&l, " ", ST_PLAIN);
+            ln_rule(&l, g.rule);
+        }
+        fkind[n++] = K_SEP;
     }
 
+    /* The phase cell: where the blinking cursor sits while that phase is the one
+     * running. A terminal blinks its own cursor for nothing, so a busy panel costs no
+     * bytes a second to look alive - the spinner it replaces redrew a glyph ten times a
+     * second. Without a terminal there is no cursor, and the cell is an arrow. */
+#define PHASE_CELL(active, st)                                                            \
+    do {                                                                                  \
+        if ((active) && tty) {                                                            \
+            park_row = n;                                                                 \
+            park_col = l.used;                                                            \
+            ln_put(&l, " ", ST_PLAIN);                                                    \
+        } else {                                                                          \
+            ln_addf(&l, (active) ? (st) : ST_DIM, "%s", g.arrow);                         \
+        }                                                                                 \
+    } while (0)
+
     /* INGEST: how far through the prompt, the percentage, and how fast it is read, with
-     * the bar on the row below at the full width the figures leave. */
+     * the bar on the row below at the full width the figures leave. While the vision
+     * tower runs, the same two rows are the image's: which one, how far through its
+     * blocks, and the bar of all of them. */
     ln_open(&l, out[n], LINE_CHARS, width);
-    ln_put(&l, " ", ST_PLAIN);
-    ln_addf(&l, phase == INGESTING ? ST_IN : ST_LABEL, "%-7s", "INGEST");
-    ln_addf(&l, phase == INGESTING ? ST_IN : ST_DIM, "%s",
-            phase == INGESTING ? g.spin[spin] : g.arrow);
-    ln_to(&l, ARG);
-    if (total > 0) {
-        char pad[24];
-        snprintf(pad, sizeof pad, "%*s", vwidth(b) - vwidth(a) > 0 ? vwidth(b) - vwidth(a) : 0, "");
-        ln_addf(&l, ST_PLAIN, "%s", pad);
-        ln_addf(&l, phase == INGESTING ? ST_HEAD : ST_PLAIN, "%s", a);
-        ln_addf(&l, ST_DIM, "/%s tok", b);
-        const long pct = total > 0 ? (long)(100.0 * (double)shown / (double)total + 1e-9) : 0;
-        ln_put(&l, "  ", ST_PLAIN);
-        ln_raddf(&l, 4, phase == INGESTING ? ST_BAR : ST_DIM, "%ld%%", pct > 100 ? 100 : pct);
-        ln_to(&l, width - vwidth(s_ing));
-        ln_addf(&l, phase == INGESTING ? ST_PLAIN : ST_DIM, "%s", s_ing);
+    ln_put(&l, M, ST_PLAIN);
+    if (seeing) {
+        ln_addf(&l, ST_VIS, "%-7s", "IMAGE");
+        PHASE_CELL(1, ST_VIS);
+        ln_to(&l, ARG);
+        ln_addf(&l, ST_HEAD, "%ld", vimg);
+        ln_addf(&l, ST_DIM, "/%ld", vn);
+        ln_addf(&l, ST_DIM, " image%s%sblock ", vn == 1 ? "" : "s", g.sep);
+        ln_addf(&l, ST_PLAIN, "%ld", vdone);
+        ln_addf(&l, ST_DIM, "/%ld", vtot);
+        const char *tail = "vision tower";
+        ln_to(&l, width - vwidth(tail));
+        ln_addf(&l, ST_DIM, "%s", tail);
     } else {
-        ln_addf(&l, ST_DIM, "no prompt in hand");
+        ln_addf(&l, phase == INGESTING ? ST_IN : ST_LABEL, "%-7s", "INGEST");
+        PHASE_CELL(phase == INGESTING, ST_IN);
+        ln_to(&l, ARG);
+        if (total > 0) {
+            char pad[24];
+            snprintf(pad, sizeof pad, "%*s", vwidth(b) - vwidth(a) > 0 ? vwidth(b) - vwidth(a) : 0, "");
+            ln_addf(&l, ST_PLAIN, "%s", pad);
+            ln_addf(&l, phase == INGESTING ? ST_HEAD : ST_PLAIN, "%s", a);
+            ln_addf(&l, ST_DIM, "/%s tok", b);
+            const long pct = total > 0 ? (long)(100.0 * (double)shown / (double)total + 1e-9) : 0;
+            ln_put(&l, "  ", ST_PLAIN);
+            ln_raddf(&l, 4, phase == INGESTING ? ST_BAR : ST_DIM, "%ld%%", pct > 100 ? 100 : pct);
+            ln_to(&l, width - vwidth(s_ing));
+            ln_addf(&l, phase == INGESTING ? ST_PLAIN : ST_DIM, "%s", s_ing);
+        } else {
+            ln_addf(&l, ST_DIM, "no prompt in hand");
+        }
     }
     n++;
 
@@ -1075,17 +1237,25 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         int bw = width - l.used;
         if (bw > 68)
             bw = 68;
-        if (bw >= 6)
-            ln_bar(&l, bw, total > 0 ? shown : 0, total > 0 ? total : 1, phase == INGESTING);
+        if (bw >= 6) {
+            if (seeing) {
+                /* All the images' blocks as one bar: image k of n is (k-1)/n of it. */
+                const long den = (vn > 0 ? vn : 1) * (vtot > 0 ? vtot : 1);
+                const long num = (vimg > 0 ? vimg - 1 : 0) * (vtot > 0 ? vtot : 1) + vdone;
+                ln_bar(&l, bw, num, den, 1, 1);
+            } else {
+                ln_bar(&l, bw, total > 0 ? shown : 0, total > 0 ? total : 1,
+                       phase == INGESTING, 0);
+            }
+        }
         n++;
     }
 
     /* EMIT: the answer so far, how fast it is coming, for how long, and for whom. */
     ln_open(&l, out[n], LINE_CHARS, width);
-    ln_put(&l, " ", ST_PLAIN);
+    ln_put(&l, M, ST_PLAIN);
     ln_addf(&l, phase == EMITTING ? ST_OUT : ST_LABEL, "%-7s", "EMIT");
-    ln_addf(&l, phase == EMITTING ? ST_OUT : ST_DIM, "%s",
-            phase == EMITTING ? g.spin[spin] : g.arrow);
+    PHASE_CELL(phase == EMITTING, ST_OUT);
     ln_to(&l, ARG);
     ln_raddf(&l, 6, emit > 0 ? (phase == EMITTING ? ST_OUT : ST_HOT) : ST_PLAIN, "%s", h2);
     ln_addf(&l, ST_DIM, " tok");
@@ -1104,11 +1274,12 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         }
     }
     n++;
+#undef PHASE_CELL
 
     /* trend: the last minute, and the peaks it is scaled to. */
     if (show_trend) {
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
+        ln_put(&l, M, ST_PLAIN);
         ln_addf(&l, ST_LABEL, "%-7s", "trend");
         ln_addf(&l, ST_DIM, "%s", g.arrow);
         ln_to(&l, ARG);
@@ -1145,14 +1316,18 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     }
 
     if (show_rules) {
-        ln_open(&l, out[n++], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
-        ln_rule(&l, g.rule);
+        ln_open(&l, out[n], LINE_CHARS, width);
+        if (!boxed) {
+            ln_put(&l, " ", ST_PLAIN);
+            ln_rule(&l, g.rule);
+        }
+        snprintf(ftitle[n], sizeof ftitle[0], "since start");
+        fkind[n++] = K_SEP;
     }
 
     if (show_tail) {
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
+        ln_put(&l, M, ST_PLAIN);
         ln_addf(&l, ST_LABEL, "%-10s", "total");
         ln_addf(&l, ST_INTXT, "%s", u);
         ln_addf(&l, ST_DIM, " ingested%s", g.sep);
@@ -1165,7 +1340,7 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
         n++;
 
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
+        ln_put(&l, M, ST_PLAIN);
         ln_addf(&l, ST_LABEL, "%-10s", "cache");
         if (slots > 0) {
             ln_addf(&l, held > 0 ? ST_PLAIN : ST_DIM, "%ld", held);
@@ -1182,24 +1357,126 @@ static int frame(char out[][LINE_CHARS], int width, int budget) {
     }
 
     if (show_recent) {
-        ln_open(&l, out[n++], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
-        ln_addf(&l, ST_DIM, "%s%s recent ", g.rule, g.rule);
-        ln_rule(&l, g.rule);
+        ln_open(&l, out[n], LINE_CHARS, width);
+        if (!boxed) {
+            ln_put(&l, " ", ST_PLAIN);
+            ln_addf(&l, ST_DIM, "%s%s recent ", g.rule, g.rule);
+            ln_rule(&l, g.rule);
+        }
+        snprintf(ftitle[n], sizeof ftitle[0], "recent");
+        fkind[n++] = K_SEP;
     }
 
     /* Clamped at zero: with fewer finished requests than the panel has room for, a
      * negative start repeats the oldest line once per missing one, and a panel that
      * draws the same request five times is read as five requests that went badly. */
     for (int i = nl - max_log > 0 ? nl - max_log : 0; i < nl; i++) {
-        if (n >= MAX_ROWS)
+        if (n >= MAX_ROWS - 1)
             break;
         ln_open(&l, out[n], LINE_CHARS, width);
-        ln_put(&l, " ", ST_PLAIN);
+        ln_put(&l, M, ST_PLAIN);
         ln_hist(&l, hist[i]);
         n++;
     }
+    if (boxed && n < MAX_ROWS) {
+        out[n][0] = 0;
+        fkind[n++] = K_BOT;
+    }
     return n;
+}
+
+/* The box round a composed frame, row by row. A text row becomes side, space, the row
+ * padded to the inner width, space, side; the header becomes the top edge with the
+ * engine on the left and the status on the right; a separator is a tee to tee rule
+ * with its title in it; and the last row is the bottom edge. Every row comes out
+ * exactly `width` columns wide, which is what keeps the no-wrap rule true. */
+static int ansi_width(const char *s) {
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == 0x1b) {
+            while (p[1] && !((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z')))
+                p++;
+            if (p[1])
+                p++;
+            continue;
+        }
+        if (*p < 0x80 || *p >= 0xc0)
+            w++;
+    }
+    return w;
+}
+
+static void box_rows(char out[][LINE_CHARS], int n, int width) {
+    static char tmp[LINE_CHARS];
+    const char *bs = color ? sgr[ST_BORDER] : "", *be = color ? "\033[0m" : "";
+    for (int i = 0; i < n; i++) {
+        ln l;
+        ln_open(&l, tmp, LINE_CHARS, width);
+        if (fkind[i] == K_HEAD) {
+            ln_cat(&l, bs, strlen(bs));
+            ln_cat(&l, g.tl, strlen(g.tl));
+            ln_cat(&l, g.rule, strlen(g.rule));
+            ln_cat(&l, be, strlen(be));
+            ln_cat(&l, " ", 1);
+            l.used = 3;
+            ln_cat(&l, out[i], strlen(out[i]));
+            l.used += hdr_lw;
+            ln_cat(&l, " ", 1);
+            l.used++;
+            const int fill = width - l.used - hdr_rw - 4;
+            ln_cat(&l, bs, strlen(bs));
+            for (int k = 0; k < fill && l.len + 8 < l.n; k++) {
+                ln_cat(&l, g.rule, strlen(g.rule));
+                l.used++;
+            }
+            ln_cat(&l, be, strlen(be));
+            ln_cat(&l, " ", 1);
+            ln_cat(&l, hdr_r, strlen(hdr_r));
+            l.used += 1 + hdr_rw;
+            ln_cat(&l, " ", 1);
+            ln_cat(&l, bs, strlen(bs));
+            ln_cat(&l, g.rule, strlen(g.rule));
+            ln_cat(&l, g.tr, strlen(g.tr));
+            ln_cat(&l, be, strlen(be));
+        } else if (fkind[i] == K_SEP || fkind[i] == K_BOT) {
+            const int bot = fkind[i] == K_BOT;
+            ln_cat(&l, bs, strlen(bs));
+            ln_cat(&l, bot ? g.bl : g.lt, strlen(bot ? g.bl : g.lt));
+            int used = 1;
+            if (ftitle[i][0]) {
+                ln_cat(&l, g.rule, strlen(g.rule));
+                ln_cat(&l, be, strlen(be));
+                char t[48];
+                snprintf(t, sizeof t, " %s ", ftitle[i]);
+                if (color)
+                    ln_cat(&l, sgr[ST_LABEL], strlen(sgr[ST_LABEL]));
+                ln_cat(&l, t, strlen(t));
+                ln_cat(&l, be, strlen(be));
+                ln_cat(&l, bs, strlen(bs));
+                used += 1 + vwidth(t);
+            }
+            for (; used < width - 1 && l.len + 8 < l.n; used++)
+                ln_cat(&l, g.rule, strlen(g.rule));
+            ln_cat(&l, bot ? g.br : g.rt, strlen(bot ? g.br : g.rt));
+            ln_cat(&l, be, strlen(be));
+        } else {
+            ln_cat(&l, bs, strlen(bs));
+            ln_cat(&l, g.vert, strlen(g.vert));
+            ln_cat(&l, be, strlen(be));
+            ln_cat(&l, " ", 1);
+            ln_cat(&l, out[i], strlen(out[i]));
+            const int pad = width - 4 - ansi_width(out[i]);
+            for (int k = 0; k < pad && l.len + 8 < l.n; k++)
+                ln_cat(&l, " ", 1);
+            ln_cat(&l, " ", 1);
+            ln_cat(&l, bs, strlen(bs));
+            ln_cat(&l, g.vert, strlen(g.vert));
+            ln_cat(&l, be, strlen(be));
+        }
+        snprintf(out[i], LINE_CHARS, "%s", tmp);
+    }
+    if (park_row >= 0)
+        park_col += 2; /* the side and its space */
 }
 
 /* The row of the panel the cursor is believed to be on. Every frame ends with the
@@ -1216,8 +1493,9 @@ static void move_to(int row) {
     } else if (d == -1) {
         /* One row down is a newline, not a cursor move: at the bottom of the screen a
          * newline scrolls and stays coherent, while a cursor-down is clamped and
-         * writes the new row over the one beneath the panel. */
-        fputc('\n', stdout);
+         * writes the new row over the one beneath the panel. The carriage return is
+         * for a cursor that was parked mid-row (park below). */
+        fputs("\r\n", stdout);
         cursor_row = row;
         return;
     } else {
@@ -1227,8 +1505,23 @@ static void move_to(int row) {
     cursor_row = row;
 }
 
+/* The cursor to a cell inside rows already drawn: cursor up or down, never a newline,
+ * because a newline into a row is a write to it as far as the screen is concerned. */
+static void park_at(int row, int col) {
+    int d = cursor_row - row;
+    if (d > 0)
+        fprintf(stdout, "\033[%dA", d);
+    else if (d < 0)
+        fprintf(stdout, "\033[%dB", -d);
+    fprintf(stdout, "\033[%dG", col + 1);
+    cursor_row = row;
+}
+
+static int cursor_shown;
+
 static void draw(void) {
     static char out[MAX_ROWS][LINE_CHARS];
+    static int parked_row = -2, parked_col = -2;
     int w = width_of(), h = height_of();
     if (w != cols || h != rows) {
         /* A resize moves the panel's own rows under a reflowing terminal, so where the
@@ -1250,13 +1543,18 @@ static void draw(void) {
      * was just given - a rule across a wide screen would arrive with its last
      * character missing. The spare column is what the erase is for. */
     int n = frame(out, cols - 1, budget);
+    if (boxed)
+        box_rows(out, n, cols - 1);
+    const int want_row = tty ? park_row : -1;
 
-    /* Rule 1: a frame that says the same thing writes nothing at all. */
+    /* Rule 1: a frame that says the same thing writes nothing at all - and while a
+     * phase runs, that includes the indicator, which is the terminal's own blinking
+     * cursor waiting in the phase's cell rather than a glyph redrawn on a timer. */
     int changed = n != prev_n;
     for (int i = 0; i < n && !changed; i++)
         if (i >= prev_n || strcmp(prev[i], out[i]))
             changed = 1;
-    if (!changed) {
+    if (!changed && want_row == parked_row && (want_row < 0 || park_col == parked_col)) {
         fflush(stdout);
         return;
     }
@@ -1279,7 +1577,21 @@ static void draw(void) {
         move_to(i);
         fputs("\033[K", stdout);
     }
-    move_to(n > 0 ? n - 1 : 0);
+    if (want_row >= 0 && want_row < n) {
+        park_at(want_row, park_col);
+        if (!cursor_shown) {
+            fputs("\033[?25h", stdout);
+            cursor_shown = 1;
+        }
+    } else {
+        if (cursor_shown) {
+            fputs("\033[?25l", stdout);
+            cursor_shown = 0;
+        }
+        move_to(n > 0 ? n - 1 : 0);
+    }
+    parked_row = want_row;
+    parked_col = park_col;
     if (tty)
         fputs("\033[?2026l", stdout);
     fflush(stdout);
@@ -1323,7 +1635,11 @@ void qe_ui_start(int want, const char *head) {
     if (pthread_create(&th, NULL, render, NULL))
         return;
     running = 1;
-    fputs("\033[?25l", stdout); /* the panel owns the screen while it is up */
+    /* The panel owns the screen while it is up. The cursor is hidden until a phase
+     * runs, and then it is a blinking block parked on that phase's row. */
+    fputs("\033[?25l", stdout);
+    if (tty)
+        fputs("\033[1 q", stdout);
     fflush(stdout);
 }
 
@@ -1336,7 +1652,11 @@ void qe_ui_stop(void) {
     /* Leave the frame on the screen and put the cursor below it, so that whatever
      * the shell prints next starts on a clean line. The synchronise markers are off
      * by then because the last frame flushed them; nothing else is owed. */
-    fputs("\033[?25h\n", stdout);
+    if (prev_n > 0 && cursor_row != prev_n - 1)
+        park_at(prev_n - 1, 0);
+    if (tty)
+        fputs("\033[0 q", stdout); /* the terminal's own cursor shape again */
+    fputs("\r\033[?25h\n", stdout);
     fflush(stdout);
 }
 

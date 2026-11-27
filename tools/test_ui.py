@@ -150,6 +150,9 @@ class Screen:
     def csi(self, params, cmd):
         digits = params.split(";")[0]
         n = int(digits) if digits.isdigit() else 1
+        if cmd == "G":  # the cursor to a column: where the panel parks it between frames
+            self.c = n - 1
+            return
         if cmd == "A":
             self.r = max(0, self.r - n)
         elif cmd == "B":
@@ -173,12 +176,14 @@ class Screen:
         while i < len(data):
             ch = data[i]
             if ch == "\x1b":
-                m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z@])", data[i:])
+                # Intermediate bytes too: the cursor-shape request (CSI 1 SP q) has one,
+                # and a parser that stops at the space prints "[1 q" onto the screen.
+                m = re.match(r"\x1b\[([0-9;?]*)([ -/]*)([A-Za-z@])", data[i:])
                 if not m:
                     i += 1
                     continue
-                if m.group(2) not in "mhlh" or not m.group(1).startswith("?"):
-                    self.csi(m.group(1), m.group(2))
+                if not m.group(2) and (m.group(3) not in "mhlh" or not m.group(1).startswith("?")):
+                    self.csi(m.group(1), m.group(3))
                 i += m.end()
                 continue
             if ch == "\r":
@@ -194,6 +199,21 @@ class Screen:
 
     def rows_written(self):
         return set(self.wrote)
+
+
+# A finished request as the panel draws it: the id's tail and the time, then the prompt
+# half. The log line's "qe: chat" prefix is dropped there for the columns.
+HIST = re.compile(r"^[0-9a-f]{6} \d\d:\d\d:\d\d  in ")
+HIST_ANY = re.compile(r"[0-9a-f]{6} \d\d:\d\d:\d\d  in \d")
+
+
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def inner(row):
+    """A row with the panel's box taken off: its side, in either glyph set, and the
+    spaces against it."""
+    return row.strip().strip("\u2502|").strip()
 
 
 def frames(data):
@@ -387,7 +407,7 @@ def geometry(label, stream):
         if at != [0]:
             off.append((k, at))
         for want in LABELS:
-            hits = [r for r in range(Screen.HEIGHT) if after[r].strip().lower().startswith(want)]
+            hits = [r for r in range(Screen.HEIGHT) if inner(after[r]).lower().startswith(want)]
             if len(hits) > 1:
                 dup.append((k, want, hits))
         # The lines under the counters are the last few finished requests, and a
@@ -395,8 +415,7 @@ def geometry(label, stream):
         # have happened, the ones that have not happened must simply be missing:
         # repeating the oldest to fill the space is a screen that reports one request
         # five times, and five requests is a story about the server that is not true.
-        hist = [after[r].strip() for r in range(Screen.HEIGHT)
-                if after[r].strip().startswith("qe: ")]
+        hist = [inner(after[r]) for r in range(Screen.HEIGHT) if HIST.match(inner(after[r]))]
         if len(hist) != len(set(hist)):
             reps.append((k, len(hist)))
     check(not off, f"{label}: every frame began on the row the last one began on",
@@ -461,7 +480,11 @@ def main():
     print(f"ui: {BIN} on :{PORT}, selftest engine")
 
     body, outs, errs, got = run("auto-pty", [], True, requests=2)
-    low = body.lower()
+    # Colour is between a number and its word on a terminal that has it ("2" in one
+    # style, " requests" in another), so the text is read with the styles taken out;
+    # the counts below never matched a coloured panel until they were.
+    plain = SGR.sub("", body)
+    low = plain.lower()
     check(bool(got) and all("choices" in g for g in got),
           "requests answered while the panel was drawing")
     check("\x1b[?25l" in body, "cursor hidden: the panel took the screen")
@@ -484,7 +507,7 @@ def main():
     check("qe-selftest" in body, "panel says which engine it is watching")
     # One writer per screen: with the panel up, the finished request's line belongs
     # to the panel, and a second writer beside it would scramble both.
-    check("qe: chat " in body, "the request log line moved inside the panel")
+    check(HIST_ANY.search(plain) is not None, "the request log line moved inside the panel")
     check("qe: chat " not in errs, "the request log line is not on stderr too",
           say(errs[-200:] if errs else ""))
     check("\x1c" not in body or MARKER.search(say(body)) is None,
@@ -575,7 +598,7 @@ def main():
     check(lr is not None, "the narrow panel still drew the draft head")
     check(lr is not None and os.path.basename(LONG_HEAD) not in lr,
           "a name too long for the row is not drawn whole", say(lr or ""))
-    check(lr is not None and lr.rstrip().endswith(".."),
+    check(lr is not None and inner(lr).endswith(".."),
           "and the row admits to being cut", say(lr or ""))
     check(f"qe: draft head: {LONG_HEAD}" in narrow_errs.splitlines(),
           "the banner keeps the whole path the panel had to cut")

@@ -450,16 +450,42 @@ static void test_parser(void) {
         cleared();
     }
 
-    /* Structure that never closes is dropped: a request the model did not finish
-     * writing is the one thing that must not be executed. */
+    /* A request that never closes is opened - the client was shown it starting - and
+     * never given arguments, and the parser says it was cut off: a request the model
+     * did not finish writing is the one thing that must not be executed, and a
+     * client runs a call it was opened on unless the reply says it was truncated. */
+    {
+        captured *cp = &c;
+        qe_turn *t = qe_turn_new(cap_cb, cp, 0);
+        const char *head = tag_named("function", "half");
+        qe_turn_token(t, QE_MARK_TOOL_OPEN, "", 0);
+        qe_turn_token(t, -1, head, (int)strlen(head));
+        /* The call opens as soon as its name is whole, before the block closes. */
+        CHECK(c.n_calls == 1 && c.args.len == 0, "a call was not opened at its name (%d)",
+              c.n_calls);
+        qe_turn_token(t, -1, "\n", 1);
+        const char *par = tag_named("parameter", "x");
+        qe_turn_token(t, -1, par, (int)strlen(par));
+        qe_turn_token(t, -1, "\n1\n", 3);
+        qe_turn_end(t);
+        CHECK(c.args.len == 0, "a truncated call was given arguments");
+        CHECK(c.n_stops == 0, "truncated call invented a finish");
+        CHECK(qe_turn_aborted(t), "a truncated call was not reported as cut off");
+        qe_turn_free(t);
+        cap_free(&c);
+        cleared();
+    }
+
+    /* The model closing its turn inside a request: the same cut-off call, and a finish
+     * of "length", which is what keeps a client from dispatching it. */
     f_tok(&f, QE_MARK_TOOL_OPEN);
     f_text(&f, tag_named("function", "half"));
     f_text(&f, "\n");
-    f_text(&f, tag_named("parameter", "x"));
-    f_text(&f, "\n1\n");
+    f_tok(&f, QE_MARK_TURN_CLOSE);
     f_feed(&f, &c, 0);
-    CHECK(c.n_calls == 0, "truncated call reported as a call");
-    CHECK(c.n_stops == 0, "truncated call invented a finish");
+    CHECK(c.n_calls == 1 && c.args.len == 0, "an unclosed call: opened %d, args [%s]", c.n_calls,
+          c.args.p ? c.args.p : "");
+    CHECK_STR(c.finish, "length", "a turn closed inside a request");
     cap_free(&c);
     cleared();
 
@@ -773,8 +799,17 @@ static void test_render(qe_tok *t) {
         qe_chat_free(&r);
         o.vision = 0;
         CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render image off: %s", err);
-        CHECK(!r.vision && strstr(r.prompt.p, "not visible to you") != NULL,
-              "an unseen image does not say so");
+        CHECK(!r.vision && strstr(r.prompt.p, "not visible to you") != NULL &&
+                  strstr(r.prompt.p, "--mmproj") != NULL,
+              "an unseen image does not say so, or why");
+        qe_chat_free(&r);
+        /* A tower that is there but cannot run beside the batched lane: the sentence
+         * the model relays has to name the setting that fixes it, not deny the tower. */
+        o.vision_batched = 1;
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render batched: %s", err);
+        CHECK(strstr(r.prompt.p, "--batch 1") != NULL && strstr(r.prompt.p, "--mmproj") == NULL,
+              "a batched server's image note does not name --batch 1");
+        o.vision_batched = 0;
         qe_chat_free(&r);
         qe_json_free(b);
 
@@ -849,6 +884,13 @@ static void test_render(qe_tok *t) {
         char e2[256] = { 0 };
         CHECK(qe_chat_opts_from_body(b, &o, e2, sizeof e2) == 0, "high should be accepted");
         CHECK(o.effort_xhigh == 1, "high should mean xhigh");
+        qe_json_free(b);
+        /* "max" is the top of the scale in crush's client library; here that is xhigh,
+         * not a refused turn. */
+        b = body("{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],"
+                 "\"reasoning_effort\":\"max\"}");
+        CHECK(qe_chat_opts_from_body(b, &o, e2, sizeof e2) == 0, "max should be accepted");
+        CHECK(o.effort_xhigh == 1 && o.enable_thinking, "max should mean xhigh");
         qe_json_free(b);
     }
 
@@ -950,7 +992,9 @@ static void test_render(qe_tok *t) {
                             "{\"role\":\"user\",\"content\":\"second\"}]}";
         qe_json *b = body(quiet);
         qe_chat r = { 0 };
-        qe_chat_opts o = { .enable_thinking = 1, .preserve_thinking = 1 };
+        /* The effort a request gets when it names none, whose sentence is the system
+         * turn counted below; without it there is no system turn at all. */
+        qe_chat_opts o = { .enable_thinking = 1, .effort_xhigh = 1, .preserve_thinking = 1 };
         CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "quiet replay: %s", err);
         /* System turn, two user turns, the assistant turn, the generation prompt -
          * and one reasoning marker only, the block the generation prompt opens. */
@@ -961,7 +1005,7 @@ static void test_render(qe_tok *t) {
 
         b = body(quiet);
         qe_chat r2 = { 0 };
-        qe_chat_opts o2 = { .enable_thinking = 1, .preserve_thinking = 1,
+        qe_chat_opts o2 = { .enable_thinking = 1, .effort_xhigh = 1, .preserve_thinking = 1,
                             .empty_thinking_blocks = 1 };
         CHECK(qe_chat_render(t, b, &o2, &r2, err, sizeof err) == 0, "quiet replay forced: %s", err);
         check_markers(t, &r2, "quiet replay forced", 5, 4, 0, 0, 0, 0, 2, 1);
@@ -997,8 +1041,11 @@ static void test_render(qe_tok *t) {
         /* No tools were offered with this request, so the only example request in
          * the prompt is the one being replayed, and there is one result pair per
          * result. The user turn, the assistant turn, the one turn the two results
-         * share, and the generation prompt: four openings, three closings. */
-        check_markers(t, &r, "tool round trip", 4, 3, 1, 1, 2, 2, 2, 1);
+         * share, and the generation prompt: four openings, three closings. The
+         * assistant turn carried no reasoning, so it renders no block (the default
+         * since --empty-thinking-blocks became a switch): one opening, the generation
+         * prompt's, and no closing. */
+        check_markers(t, &r, "tool round trip", 4, 3, 1, 1, 2, 2, 1, 0);
         CHECK(strstr(r.prompt.p, "a\nb") != NULL, "result text missing");
         qe_chat_free(&r);
         qe_json_free(b);
