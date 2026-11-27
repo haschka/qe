@@ -137,7 +137,8 @@ enum {
     E_e640, E_u640, E_h640, E_mlogits, E_cmlogits, E_ey,
     E_cs, E_sel, E_selbits, E_attnpy, E_attnpm, E_attnpl,
     E_routes, E_seq, E_heap, E_heapb, E_i8x, E_i8s, E_i8p,
-    E_cqwork, E_csel, E_tiscore, E_theap, E_theapb, E_tbits, E_gpy, E_gpm, E_gpl, E_COUNT
+    E_cqwork, E_csel, E_tiscore, E_theap, E_theapb, E_tbits, E_gpy, E_gpm, E_gpl, E_rpos,
+    E_COUNT
 };
 
 typedef struct {
@@ -249,6 +250,24 @@ struct qe_forward {
     float *ple_hist;
     uint32_t *seq;  /* the token ids fed so far, PLE-visible (image positions
                      * already substituted) */
+    /* The rope position of every cell, as the (t, h, w) the checkpoint's interleaved
+     * m-rope reads (rope.dimension_sections, ref/qwen4exp.cpp: LLAMA_ROPE_TYPE_IMROPE).
+     * For text the three are one number, and until a sequence holds an image that
+     * number is the cell, so the table is written and never read: `mrope[s]` is what
+     * turns it on, and every angle a text-only sequence takes is the arithmetic it
+     * always took. An image row's three are its own (llama.cpp's mtmd decoder
+     * positions: t at the image's start, h and w that plus its row and column in the
+     * merged grid), and a text row's is one past the largest of the row before it -
+     * which puts the text after an image max(nx, ny) on from where the image began. */
+    int32_t *rpos;  /* n_ctx x 3 */
+    int mrope[QE_MAX_SEQ];
+    int msec[4];    /* the sections, in rope pairs */
+    /* The rows of the prefill in flight that are not token embeddings, as
+     * qe_forward_prefill_mm hands them over: one pointer per row (NULL for a token)
+     * and that row's (t, h, w). Set for exactly one chunk at a time and NULL between
+     * calls, which is what keeps a step from ever reading them. */
+    const float *const *mm_emb;
+    const int32_t *mm_pos;
     long pos;    int gdn_slots, qsa_slots;
     size_t kv_row, n_ctx;
     /* The sequences one step may carry (qe_forward_opts.n_seq). One is everything
@@ -2837,6 +2856,18 @@ qe_forward *qe_forward_open(qe_model *m, const qe_forward_opts *opts, char *err,
     f->head_dim = dim_int(m, "qwen4exp.attention.key_length", 256);
     f->n_rope = dim_int(m, "qwen4exp.rope.dimension_count", 64);
     f->theta = dim_float(m, "qwen4exp.rope.freq_base", 1e7f);
+    {
+        /* The m-rope sections, in pairs: which share of the rotated pairs reads the
+         * temporal, the height and the width position. Absent, every pair reads the
+         * first, which is ordinary rope - and that is all a text-only pass ever is. */
+        const long long *sec = NULL;
+        size_t ns = 0;
+        f->msec[0] = f->n_rope / 2;
+        f->msec[1] = f->msec[2] = f->msec[3] = 0;
+        if (!qe_model_get_arr_int(m, "qwen4exp.rope.dimension_sections", &sec, &ns) && ns >= 3)
+            for (size_t i = 0; i < 4; i++)
+                f->msec[i] = i < ns ? (int)sec[i] : 0;
+    }
     f->eps = dim_float(m, "qwen4exp.attention.layer_norm_rms_epsilon", 1e-6f);
     f->n_idx_heads = dim_int(m, "qwen4exp.attention.indexer.head_count", 4);
     f->idx_dim = dim_int(m, "qwen4exp.attention.indexer.key_length", 128);
@@ -3245,7 +3276,8 @@ qe_forward *qe_forward_open(qe_model *m, const qe_forward_opts *opts, char *err,
         !(f->heap_b = scratch(f, E_heapb, ((size_t)f->idx_topk_blocks + 1) * sizeof(int))) ||
         !(f->routes = scratch(f, E_routes, (size_t)f->n_experts_active * sizeof(qe_route))) ||
         !(f->croutes = scratch(f, E_routes, ROWS(f->n_experts_active) * (sizeof(qe_route) / sizeof(float)))) ||
-        !(f->seq = scratch(f, E_seq, n_ctx * sizeof(uint32_t)))) {
+        !(f->seq = scratch(f, E_seq, n_ctx * sizeof(uint32_t))) ||
+        !(f->rpos = scratch(f, E_rpos, n_ctx * 3 * sizeof(int32_t)))) {
         snprintf(err, errn, "out of memory for the step's scratch");
         qe_forward_close(f);
         return NULL;
@@ -3360,8 +3392,10 @@ void qe_forward_reset(qe_forward *f) {
      * matters after an abandoned prefill. */
     qe_ple_drain(f->ple);
     f->pos = 0;
-    for (int s = 0; s < QE_MAX_SEQ; s++)
+    for (int s = 0; s < QE_MAX_SEQ; s++) {
         f->spos[s] = 0;
+        f->mrope[s] = 0;
+    }
     /* No row is waiting for the token that follows it, and the row a new sequence
      * would be handed belongs to a sequence that no longer exists. The chunk that
      * just finished is history for the same reason: its rows are readable until the
@@ -3575,12 +3609,29 @@ int qe_forward_restore(qe_forward *f, const qe_state *in) {
      * stale by construction and written before it is read again. */
     f->pos = in->pos;
     f->spos[0] = in->pos; /* the cursor a chunk reads its positions off */
+    /* Whether the cells it stands on take m-rope. The table under them is as
+     * append-only as the caches are, so it is the restored position that decides
+     * which part of it is this sequence's, and one pass over it says whether any cell
+     * there is not plain text at its own index. */
+    f->mrope[0] = 0;
+    for (long c = 0; c < in->pos && !f->mrope[0]; c++) {
+        const int32_t *rp = f->rpos + (size_t)c * 3;
+        f->mrope[0] = rp[0] != c || rp[1] != c || rp[2] != c;
+    }
     qe_ple_drain(f->ple);
     return 0;
 }
 
 long qe_state_pos(const qe_state *s) { return s ? s->pos : 0; }
 const uint32_t *qe_state_ids(const qe_state *s) { return s ? s->ids : NULL; }
+
+int qe_state_set_ids(qe_state *s, const int *ids, long n) {
+    if (!s || !ids || n != s->pos || n < 0 || (size_t)n > s->n_ctx)
+        return -1;
+    for (long i = 0; i < n; i++)
+        s->ids[i] = (uint32_t)ids[i];
+    return 0;
+}
 
 long qe_forward_hidden(const qe_forward *f, float *dst, long n) {
     if (!f || !dst || n < f->K)
@@ -4726,6 +4777,46 @@ static void idx_score_task(void *vp, int tid, int nthreads) {
 #define QE_IDX_PAR_MIN 64
 #endif
 
+static int32_t *seq_rpos(const qe_forward *f, int s) {
+    return f->rpos + (size_t)s * f->seq_stride * 3;
+}
+
+/* The angles of one cell. A sequence that never held an image takes the path every
+ * text pass always took, cell for position, and nothing in the table is read. One that
+ * did reads the cell's (t, h, w), and a cell whose three agree is still ordinary rope
+ * at that position - only an image's rows take the interleaved form, ggml's
+ * GGML_ROPE_TYPE_IMROPE: pair k reads t, h or w by k mod 3 while k is inside that
+ * section's share, every ladder accumulated by repeated multiplication as
+ * qe_rope_init's is. */
+static void rope_at(const qe_forward *f, int s, long cell, int rd, float *cs) {
+    if (!f->mrope[s]) {
+        qe_rope_init(cs, rd, cell, f->theta);
+        return;
+    }
+    const int32_t *p = seq_rpos(f, s) + (size_t)cell * 3;
+    if (p[0] == p[1] && p[1] == p[2]) {
+        qe_rope_init(cs, rd, p[0], f->theta);
+        return;
+    }
+    const float step = powf(f->theta, -2.0f / (float)rd);
+    float th[3] = { (float)p[0], (float)p[1], (float)p[2] };
+    const int s0 = f->msec[0], s1 = f->msec[1], s2 = f->msec[2];
+    const int sect = s0 + s1 + s2 + f->msec[3];
+    for (int k = 0; k < rd / 2; k++) {
+        const int sector = sect > 0 ? k % sect : k;
+        int c = 0; /* the fourth section is never non-zero in this file; t is its stand-in */
+        if (sector % 3 == 1 && sector < 3 * s1)
+            c = 1;
+        else if (sector % 3 == 2 && sector < 3 * s2)
+            c = 2;
+        cs[2 * k] = cosf(th[c]);
+        cs[2 * k + 1] = sinf(th[c]);
+        th[0] *= step;
+        th[1] *= step;
+        th[2] *= step;
+    }
+}
+
 static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos) {
     const int hd = f->head_dim, nqh = f->n_q_heads, nkvh = f->n_kv_heads;
     const int krow = (int)f->kv_row, id = f->idx_dim, nih = f->n_idx_heads;
@@ -4766,12 +4857,12 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
             f->ipool[i] = acc / (float)ratio;
         }
         qe_rms_norm_grouped(f->ipool, f32v(f, L->ixkn), 0, f->ipool, id, 1, f->eps);
-        qe_rope_init(cs2, rd, b * ratio, f->theta);
+        rope_at(f, s, b * ratio, rd, cs2);
         qe_rope_apply(f->ipool, 1, id, rd, cs2);
         kpool_put(f, kpoolc, b, f->ipool);
     }
     qe_rms_norm_grouped(iq, f32v(f, L->ixqn), 0, iq, id, nih, f->eps);
-    qe_rope_init(cs, rd, pos, f->theta);
+    rope_at(f, s, pos, rd, cs);
     qe_rope_apply(iq, nih, id, rd, cs);
 
     idx_job ij = { .iq = iq,
@@ -4807,7 +4898,7 @@ static void qsa_core(qe_forward *f, const qe_layer *L, int slot, int s, long pos
                (size_t)hd * sizeof(float));
     }
     qe_rms_norm_grouped(f->qwork, f32v(f, L->aqn), 0, f->qwork, hd, nqh, f->eps);
-    qe_rope_init(cs, rd, pos, f->theta);
+    rope_at(f, s, pos, rd, cs);
     qe_rope_apply(f->qwork, nqh, hd, rd, cs);
     qe_rms_norm_grouped(kcur, f32v(f, L->akn), 0, kcur, hd, nkvh, f->eps);
     qe_rope_apply(kcur, nkvh, hd, rd, cs);
@@ -5091,7 +5182,7 @@ static void row_qsa_pre(rows_job *j, int t, int tid) {
     float *qw = f->cqwork + (size_t)t * (size_t)hd * nqh;
     memcpy(px->krawc + (size_t)pos * (size_t)id, ikraw, (size_t)id * sizeof(float));
     qe_rms_norm_grouped(iq, f32v(f, L->ixqn), 0, iq, id, nih, f->eps);
-    qe_rope_init(cs, rd, pos, f->theta);
+    rope_at(f, 0, pos, rd, cs);
     qe_rope_apply(iq, nih, id, rd, cs);
     for (int h = 0; h < nqh; h++)
         memcpy(qw + (size_t)h * hd, qg + (size_t)h * 2 * hd, (size_t)hd * sizeof(float));
@@ -5133,7 +5224,7 @@ static void row_qsa_pool(rows_job *j, int i, int tid) {
         dst[c] = acc / (float)ratio;
     }
     qe_rms_norm_grouped(dst, f32v(f, px->L->ixkn), 0, dst, id, 1, f->eps);
-    qe_rope_init(cs2, rd, b * ratio, f->theta);
+    rope_at(f, 0, b * ratio, rd, cs2);
     qe_rope_apply(dst, 1, id, rd, cs2);
     kpool_put(f, px->kpoolc, b, dst);
 }
@@ -6214,12 +6305,37 @@ static int chunk_impl(qe_forward *f, const int *tokens, int T, float *logits_out
         ids[ppos[t]] = (uint32_t)tokens[t];
         if (f->ple)
             qe_ple_issue(f->ple, ids, (size_t)ppos[t]);
+        /* The cell's rope position, before any layer asks for it. A token continues
+         * from the largest component of the cell before it, which for text is the cell
+         * itself; an image row brings its own. */
+        int32_t *rp = seq_rpos(f, rs[t]) + (size_t)ppos[t] * 3;
+        if (f->mm_emb && f->mm_emb[t]) {
+            memcpy(rp, f->mm_pos + (size_t)t * 3, 3 * sizeof(int32_t));
+        } else {
+            int32_t next = 0;
+            if (ppos[t] > 0) {
+                const int32_t *q = rp - 3;
+                next = q[0] > q[1] ? q[0] : q[1];
+                next = (next > q[2] ? next : q[2]) + 1;
+            }
+            rp[0] = rp[1] = rp[2] = next;
+        }
+        if (rp[0] != ppos[t] || rp[1] != ppos[t] || rp[2] != ppos[t])
+            f->mrope[rs[t]] = 1;
     }
 
     ts = QE_TICK();
     for (int t = 0; t < T; t++) {
         use_row(f, t);
-        embed(f, tokens[t]);
+        if (f->mm_emb && f->mm_emb[t]) {
+            /* An image row: the vision tower's row is the embedding, in all four
+             * streams, exactly where a token's table row would have been put. */
+            memcpy(f->res, f->mm_emb[t], (size_t)f->K * sizeof(float));
+            for (int hs = 1; hs < f->HC; hs++)
+                memcpy(f->res + (size_t)hs * f->K, f->res, (size_t)f->K * sizeof(float));
+        } else {
+            embed(f, tokens[t]);
+        }
     }
     QE_TALLY(QE_ST_EMBED, ts);
 
@@ -6519,6 +6635,7 @@ int qe_forward_reset_seq(qe_forward *f, int s) {
     /* Whatever was prefetched for the old sequence belongs to the old sequence. */
     qe_ple_drain(f->ple);
     f->spos[s] = 0;
+    f->mrope[s] = 0;
     if (s == 0)
         f->pos = 0;
     return 0;
@@ -6706,7 +6823,8 @@ int qe_ckpt_state(const qe_forward *f, const qe_ckpt *c, int boundary, qe_state 
  * row of every chunk belongs to sequence `s` of a pass that is driving more than one
  * of them. The two are the same loop because a prompt is a chunk in which all rows
  * are one sequence's, which is one entry of the row map repeated. */
-static int prefill_rows(qe_forward *f, int s, const int *tokens, long n, float *logits_out) {
+static int prefill_rows(qe_forward *f, int s, const int *tokens, long n, float *logits_out,
+                        const float *const *mm_emb, const int32_t *mm_pos) {
     if (!f || !tokens || n < 1)
         return -1;
     const int width = f->chunk_width;
@@ -6720,8 +6838,12 @@ static int prefill_rows(qe_forward *f, int s, const int *tokens, long n, float *
         unsigned flags = last ? (STEP_PROBE | (logits_out ? STEP_LOGITS : 0)) : 0;
         f->pf_base = done;
         f->pf_total = n;
+        f->mm_emb = mm_emb ? mm_emb + done : NULL;
+        f->mm_pos = mm_pos ? mm_pos + (size_t)done * 3 : NULL;
         int rc = chunk_impl(f, tokens + done, T, (flags & STEP_LOGITS) ? logits_out : NULL,
                             flags, s >= 0 ? rseq : NULL);
+        f->mm_emb = NULL;
+        f->mm_pos = NULL;
         f->pf_total = 0;
         if (rc)
             return rc;
@@ -6738,13 +6860,25 @@ static int prefill_rows(qe_forward *f, int s, const int *tokens, long n, float *
 }
 
 int qe_forward_prefill(qe_forward *f, const int *tokens, long n, float *logits_out) {
-    return prefill_rows(f, -1, tokens, n, logits_out);
+    return prefill_rows(f, -1, tokens, n, logits_out, NULL, NULL);
 }
 
 int qe_forward_prefill_seq(qe_forward *f, int s, const int *tokens, long n, float *logits_out) {
     if (!f || s < 0 || s >= f->n_seq)
         return -1;
-    return prefill_rows(f, f->n_seq == 1 ? -1 : s, tokens, n, logits_out);
+    return prefill_rows(f, f->n_seq == 1 ? -1 : s, tokens, n, logits_out, NULL, NULL);
+}
+
+int qe_forward_prefill_mm(qe_forward *f, int s, const int *tokens, long n,
+                          const float *const *row_emb, const int32_t *row_pos,
+                          float *logits_out) {
+    if (!f || s < 0 || s >= f->n_seq || (row_emb && !row_pos))
+        return -1;
+    return prefill_rows(f, f->n_seq == 1 ? -1 : s, tokens, n, logits_out, row_emb, row_pos);
+}
+
+int qe_forward_mrope(const qe_forward *f, int s) {
+    return f && s >= 0 && s < f->n_seq ? f->mrope[s] : 0;
 }
 
 void qe_forward_set_progress_fine(qe_forward *f, void (*cb)(void *, long, long), void *user) {

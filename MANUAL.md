@@ -35,6 +35,7 @@ section 11](docs/DESIGN.md) is the post-mortem.
 | Exponentials (`QE_EXP2_SIMD`) | **built, wired, measured, and off**: the degree-5 `exp2` the 96 gates have always used is now in `src/kern.h` and reachable from the two places that also exponentiate by the ten thousand - a gated-delta block's per-head decay and one cell's `per` attention weights inside the fused walk - and it is **7.1-7.4x the element rate** (0.16 against 1.12 to 1.17 ns an element, `make fast`) at **3.5e-06 relative**. What it is worth is the element count, and the count is small: 114,048 exponentials a token at the selection a 600-cell context reaches, 322,992 at the 2051-cell ceiling, 0.14 to 0.39 ms of CPU, and a step is nineteen threads, so 7 to 20 microseconds of an 88 ms step is the whole prize - **1.000x** of ingestion (15.56 against 15.55 ms/token) and **1.00x** of a step for **0.67 nats** on the token the engine goes on to say (`/tmp/f41_wide.log`). The dial is therefore off. What it made free instead ships unconditionally: sixteen value heads of one key head each computed `exp` of the same float for the same token, 27,648 calls a token where 1,728 are that number, and one row of scratch per token is the same `expf` on the same input - byte-identical, and the precondition for widening anything ([ideas.md §6.6](ideas.md)) |
 | Weight staging | whole checkpoint read once into private pinned RAM **at engine launch**: 87.2 GiB, `mlock`'d, 2 MiB pages, no root. An engine that cannot get it resident does not start; the load is never timed or rate-reported, because storage speed is not a quantity this project optimises |
 | OpenAI-compatible server | `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, SSE, images as `data:` URLs |
+| Vision | `--mmproj` opens the projector's tower: each image of a request becomes its merged grid of prompt rows (at most `--image-max-tokens`, default 4096), m-rope positioned, reused across turns like any prefix. `bin/bench_vision` holds it to llama.cpp's own dump (docs/DESIGN.md, Images) |
 | Forward pass for `qwen4exp` | **implemented, and it is a working model**: 3.56 nats/token teacher-forced over reference text, 0.442 nats where the reference scores itself 0.452 on the positions it is confident about, same argmax on 7 of those 7, and coherent greedy text (`make score`, `make cmp`) |
 | Decode rate on this host | **64.0 ms/token, 15.6 tok/s** at 512 tokens of context and 66.5 ms (15.0 tok/s) at 4,096, against **130.7 ms/token** for llama.cpp b12110 on the same file and host: 2.04x (`make forward`'s generation leg reads 64 ms / 15.54 tok/s, `make decode` races it against the engine before [ideas.md §7.30](ideas.md) at 88.4 ms). The older figures in this row's history - 103-104 ms at the default pool, 88-91 after the load-time copies - are what the table below the line was measured against |
 | Pool width | **one core short of the affinity mask**, not the whole mask: the same binary at 20 threads on 20 cpus takes 125.2 ms/token and at 19 takes 106.2 on the 64-position corpus, because a spinning pool with no core left to itself pays a scheduler timeslice at every one of the ~800 dispatches a token makes (`make pool`) |
@@ -542,6 +543,31 @@ from the id of the request that produced them (`qe_turn_set_id_prefix`, which ma
 them unique per request and per process), and every `tool_calls` delta carries the
 `index` a reader accumulates a call's arguments under, which is how a second call in
 one turn stays a second call.
+
+Three things the client's own log said, and what changed for each
+(`~/.crush/logs/crush.log` is where to look):
+
+- `Malformed tool call JSON from provider, replacing with empty object` on every
+  `job_output`. Crush names background shells `001`, `00A`, and a value that only
+  looked like a number went out as `{"shell_id":001}`, which no strict parser takes.
+  Arguments are now typed by the request's own `tools[]` schema: a `string`
+  parameter is the text the model wrote, byte for byte - the indentation an edit's
+  `old_string` needs included, which used to be trimmed - and everything else is
+  re-serialised as strict JSON.
+- A sub-agent that ran for minutes and handed back `Sub-agent completed but produced
+  no text output`. Crush returns the text of the sub-agent's last turn, and that turn
+  was 36 KB of reasoning that closed the turn without ever closing its thinking
+  block. Two causes, both fixed: a request with no `temperature` was decoded
+  greedily instead of at the checkpoint's own `general.sampling.temp`, and greedy
+  reasoning is where a thinking block goes round in circles; and a turn that closes
+  inside its reasoning with nothing else said now reports that reasoning as its
+  answer (`qe_turn_token` in `src/chat.h`).
+- `dropping empty assistant message` by the hundred: the same reasoning-only turns,
+  dropped from every later prompt. They no longer occur once the answer is rescued.
+
+Absent `temperature` now means the server's default: `--temp X` when given, the
+checkpoint's otherwise. Send `"temperature": 0` (crush: per-model `temperature`) for
+the old greedy behaviour.
 
 Two smaller things worth knowing from the same run. The banner prints the window it
 actually opened, because the default is the checkpoint's trained length and is

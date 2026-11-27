@@ -882,11 +882,43 @@ signal, within the grace, saying which way it left, and the port bindable again.
 
 ### Images
 
-`image_url` parts with a base64 `data:` URL are decoded (32 MiB cap), counted,
-size-checked and recorded in the transcript as `[image N: image/png, 1234 bytes]`.
-There is no vision decoder, so an image is honestly represented as "an image
-was here", and `mmproj-*.gguf` is opened for its metadata only. Remote `http(s)`
-image URLs are refused with 400 rather than fetched.
+With `--mmproj`, an image is seen. `src/vision.c` is the projector's tower - 27 ViT
+blocks of 1152 with 16 heads of 72, 16-pixel patches embedded by the summed temporal
+pair of kernels, a 48x48 learned position table resampled to the grid, the 2D vision
+rotary, and the 2x2 merger to the trunk's 2560 - and `src/engine.c` turns each image
+of a request into its merged grid of prompt rows:
+
+- **The prompt.** The renderer writes the template's own spelling of an image, the
+  vision start and end markers around one image pad, by id. The engine replaces each
+  pad with the image's `nx * ny` rows. The pass reads `ple.image_token_id` at those
+  rows, which is what the PLE window hashes there and what llama.cpp's cache stores for
+  an embedding cell (`ple_embd_token`); the transcript, the carry-over and the rewind
+  points read a tag made of the image's bytes and the row, so the same screenshot sent
+  again next turn is reused and a different one of the same size is not.
+- **Positions.** The checkpoint's rope is interleaved m-rope over sections
+  [11, 11, 10, 0]. An image row is (t, h, w) = (base, base + row, base + column) and a
+  text row is one past the largest component of the row before it, which is
+  llama.cpp's mtmd decoder position for this projector and puts the text after an
+  image max(nx, ny) on from its start. The pass keeps a (t, h, w) per cell and reads it
+  only once a sequence has held an image: a text-only sequence takes `qe_rope_init` at
+  its cell, the arithmetic it always took.
+- **Cost.** The tower runs only for an image whose rows are not in the reused prefix.
+  At the default cap of 4096 rows a 5760x2160 screenshot is 4056 rows and 69 s of
+  tower (llama.cpp b12359: 77 s); a 640x480 photo is 300 rows and 1.0 s (2.1 s).
+  `--image-max-tokens N` lowers the cap, and the time falls with its square.
+- **Agreement.** `bin/bench_vision mmproj image ref.bin` compares against llama.cpp's own
+  dump (`MTMD_DEBUG_EMBEDDINGS=ref.bin llama-mtmd-cli ...`). The median row cosine is
+  0.99998 and 0.999994 on the two images measured; a few rows of a ViT are
+  ill-conditioned, and on them llama.cpp's flash and plain attention disagree with each
+  other by 0.97 in cosine and 2.3 % overall, which is the size of the gap between this
+  f32 tower and either of them. `QE_VISION_EMULATE=1` reproduces the reference's
+  BF16-rounded activations and half-precision GELU, for that comparison only.
+
+Decoding is stb_image for PNG, JPEG, GIF and BMP - the decoder the reference uses, so
+the pixels agree - and libwebp, opened at run time, for WebP. Remote `http(s)` image
+URLs are refused with 400 rather than fetched. Without a tower (no `--mmproj`, or
+`--batch N`), an image is recorded in the transcript as `[image N: image/png, 1234
+bytes. ...]` with a sentence telling the model it cannot see it.
 
 ### How that was verified
 
@@ -981,7 +1013,7 @@ source to find out what is missing.
 |---|---|
 | Batching exists for decode and stops there | `--batch N` drives N sequences through one walk of the weights (`qe_forward_step_batch_rows`, asserted by `make batch` and measured through the request entry by `make lane`): **2.15-2.20x** the step eight rows share, **1.79x** a wave of eight short requests, and **1.00-1.02x** a wave of two 512-token ones, because a prompt is still read one at a time. What is left is named by that gap and by `QE_MAX_SEQ`: eight rows is where the row map stops, a row costs its share of the vocabulary-wide logits and one replicated copy of the 113 MiB GDN state (`docs/ARCH.md` §5), and packing several prompts into one chunked row map is measured rather than believed not to be the answer (ideas.md §8.1) |
 | Chat templates are rendered by hard-coded ChatML, not evaluated | the file carries 9993 characters of Jinja with image/video count handling. An evaluator is a project of its own; today `render_messages` reproduces the ChatML shape the template produces for text-only transcripts, and that is the honest description of it |
-| No vision | a ViT encoder for `mmproj-Qwen3.8-Flash-Next-BF16.gguf`; today its bytes are mapped and its metadata reported |
+| Vision is serial-lane only | the mmproj's tower is built (`src/vision.c`, §Images) and an image a request carries becomes its rows of the prompt; with `--batch N` images are described instead, because an encode needs the whole pool and the lane driver walks the weights on it outside the engine lock |
 | Speculation pays only at the shortest draft, and only just | the drafter is not the gap: `mtp-...-Q4_K_M.gguf` is resident, drafts, and never changes what greedy says. A verified window is the gap - **4.45x** a step at nine rows, ~97 ms of it head and lm_head logits paid for rejected rows as well as kept ones - so acceptance of 1.85 ids a pass closes the arithmetic at k = 1 and nowhere above it: 1.19x at k = 1 with a head and 0.75x at k = 8, 1.05x at k = 2 with the n-gram hash and 0.91x at k = 8 (`/tmp/f40_head.log`). The length is therefore resolved from the drafter at open instead of being a constant (§4); what would widen it - logits for only the rows a window keeps, boundary copies made cheaper - is priced at together ~1.1x |
 | A turn that trims its history is still ingested from the beginning | `--turn-cache` stores boundaries at prompt end and answer end, so a client that re-renders or replays goes back instead of re-reading (§7). One that *shortens* the conversation matches nothing, because nothing was stored partway through a prompt. Closing that needs intra-prompt boundaries: a copy per chunk of prefill, or a delta rule that can be run backwards. Which of the two causes a turn that re-read everything it is worth knowing is `agreed=` on the request line: `agreed=0` is this row, `agreed=9820` is a cache that ran out (§7) |
 | Ingestion still pays per token for the recurrences, and for the experts wherever routing does not repeat itself | the dense half is chunked: `qe_forward_prefill` runs sixteen tokens of a prompt through one stage of a layer at a time and sweeps each projection once for the chunk, worth 94 → 51 ms per ingested token at the shipping width (§12). What a chunk cannot share is a recurrence - the conv ring and the delta rule are position-ordered by definition. The other two things it could not share are now shared: Q8_0's kernel that turns one dequantised weight run into T accumulators is reached through `qe_gemv_multi_t` behind the projection threshold, which `make forward` prices at **1.15-1.21x** of ingestion (§12), and the experts have the same kernel for both of their types - **1.80x** on a deep expert bucket, flat past four rows because that is the register budget - wired through `moe_block_chunk` for **1.05-1.06x** of ingestion (§12). What is left in this row is what real routing cannot reach: 512 experts and ten picks a token make buckets of about one row, so a chunk shares an expert's bytes far more often than it shares its dequantisation, and a decode step is one row and shares nothing at all |

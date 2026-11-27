@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Helvetica Neue, Arial, sans-serif" width="1080" height="1080" viewBox="0 0 1080 1080" role="img" aria-label="qe: a CPU-only inference engine for an 87 GiB mixture-of-experts model, benchmarked against llama.cpp on one machine">
+<svg xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, Helvetica Neue, Arial, sans-serif" width="1080" height="1080" viewBox="0 0 1080 1080" role="img" aria-label="qe: a CPU-only inference engine for an 87 GiB mixture-of-experts model that also sees images, benchmarked against llama.cpp on one machine">
   <defs>
     <radialGradient id="bg" cx="20%" cy="6%" r="125%">
       <stop offset="0%" stop-color="#122140"/>
@@ -61,6 +61,8 @@
 
   <!-- header -->
   <text x="60" y="128" font-size="100" font-weight="700" fill="url(#gTx)" filter="url(#glow)">qe</text>
+  <rect x="446" y="64" width="278" height="58" rx="29" fill="#a78bfa" fill-opacity="0.12" stroke="#a78bfa" stroke-width="2" opacity="0.95"/>
+  <text x="585" y="104" text-anchor="middle" font-size="28" font-weight="700" letter-spacing="3" fill="#c4b5fd">SEES IMAGES</text>
   <rect x="742" y="64" width="278" height="58" rx="29" fill="none" stroke="#a3e635" stroke-width="2" opacity="0.85"/>
   <text x="881" y="104" text-anchor="middle" font-size="28" font-weight="700" letter-spacing="3" fill="#a3e635">NO GPU CODE</text>
   <text x="60" y="182" font-size="29" font-weight="700" letter-spacing="3" fill="#93abcb">CPU-ONLY INFERENCE, TUNED TO ONE MACHINE</text>
@@ -81,7 +83,7 @@
     <rect x="716" y="280" width="304" height="6" fill="url(#gAm)"/>
     <rect x="60" y="440" width="305" height="6" fill="url(#gVi)"/>
     <rect x="388" y="440" width="305" height="6" fill="url(#gRd)"/>
-    <rect x="716" y="440" width="304" height="6" fill="url(#gCy)"/>
+    <rect x="716" y="440" width="304" height="6" fill="url(#gVi)"/>
 
     <text x="88" y="338" font-size="38" font-weight="700" fill="#ffffff">87 GiB</text>
     <text x="88" y="376" font-size="30" font-weight="400" fill="#a3b8d4">resident before</text>
@@ -103,9 +105,9 @@
     <text x="416" y="536" font-size="30" font-weight="400" fill="#a3b8d4">read on 8 cores,</text>
     <text x="416" y="566" font-size="30" font-weight="400" fill="#a3b8d4">AVX-VNNI</text>
 
-    <text x="744" y="498" font-size="38" font-weight="700" fill="#ffffff">2 libs</text>
-    <text x="744" y="536" font-size="30" font-weight="400" fill="#a3b8d4">pthread, libm:</text>
-    <text x="744" y="566" font-size="30" font-weight="400" fill="#a3b8d4">nothing else</text>
+    <text x="744" y="498" font-size="38" font-weight="700" fill="#ffffff">1.0 s</text>
+    <text x="744" y="536" font-size="30" font-weight="400" fill="#a3b8d4">to see a photo,</text>
+    <text x="744" y="566" font-size="30" font-weight="400" fill="#a3b8d4">2.1x llama.cpp</text>
   </g>
 
   <!-- benchmark panels -->
@@ -141,11 +143,11 @@
     <text x="992" y="876" text-anchor="end" fill="#c3d3e8" font-size="35" font-weight="700" >7.65</text>
     <rect x="578" y="886" width="203" height="24" rx="4" fill="#3b5c8c"/>
 
-    <text x="578" y="926" font-size="29" font-weight="400" fill="#7d92b0">one token at a time</text>
+    <text x="578" y="938" font-size="27" font-weight="400" fill="#7d92b0">one token at a time</text>
   </g>
 
   <!-- footer -->
   <path d="M60 990h960" stroke="#1e3a5f" stroke-width="1.5"/>
-  <text x="60" y="1028" font-family="DejaVu Sans Mono, ui-monospace, monospace" font-size="29" font-weight="400" fill="#a3e635">$ make &amp;&amp; ./bin/qe-serve --model qwen.gguf</text>
-  <text x="60" y="1062" font-size="29" font-weight="400" fill="#7d92b0">48 layers &#183; 2560 wide &#183; 512 experts &#183; one CPU, no accelerator</text>
+  <text x="60" y="1028" font-family="DejaVu Sans Mono, ui-monospace, monospace" font-size="26" font-weight="400" fill="#a3e635">$ ./bin/qe-serve --model qwen.gguf --mmproj mmproj.gguf</text>
+  <text x="60" y="1062" font-size="29" font-weight="400" fill="#7d92b0">48 layers &#183; 512 experts &#183; a 27-block vision tower &#183; one CPU</text>
 </svg>

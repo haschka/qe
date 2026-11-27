@@ -12,7 +12,7 @@ OPT     ?= -O3 -fno-math-errno -fno-trapping-math -ffp-contract=fast \
            -funroll-loops -fomit-frame-pointer -fno-plt
 CFLAGS  += -std=gnu17 -g $(ARCH) $(OPT) -Iinclude -Isrc -pthread -Wall -Wextra \
            -Wno-unused-parameter -Wshadow -Wno-format-truncation
-LDFLAGS += -pthread -lm
+LDFLAGS += -pthread -lm -ldl
 
 # Every recipe here is a fuse, and this is what makes one a fuse rather than a
 # suggestion: plain `timeout` sends SIGTERM and then waits for the child for as
@@ -29,7 +29,7 @@ TO := timeout -k $(KILLGRACE)
 # tokens without pulling in the serving stack. The n-gram drafter belongs here for
 # the same reason - it reads no weights and no checkpoint, only tokens.
 CORE := src/mem.c src/gguf.c src/kern.c src/kern_iq.c src/layer.c src/moe.c src/tok.c \
-        src/ple.c src/forward.c src/sampler.c src/draft.c
+        src/ple.c src/forward.c src/sampler.c src/draft.c src/vision.c
 ENG := src/json.c src/mtp.c src/http.c src/chat.c src/engine.c src/serve.c src/tui.c \
        src/turns.c
 COREOBJ := $(CORE:.c=.o)
@@ -38,9 +38,9 @@ BIN := bin/bench_kern bin/bench_gemv bin/bench_moe bin/bench_mtp bin/bench_json 
        bin/bench_route bin/bench_stage bin/bench_tok bin/bench_ple bin/bench_prefill \
        bin/bench_forward bin/bench_decode bin/bench_score bin/bench_pool bin/bench_prefix bin/bench_alu \
        bin/bench_sample bin/bench_turns bin/bench_walk bin/bench_cosched bin/bench_serve \
-       bin/bench_batch
+       bin/bench_batch bin/bench_vision
 
-.PHONY: all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve lane score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup batch decode probe-igpu
+.PHONY: vision all clean test fast moe mtp head json chat sample pool turns tok http spec forward prefix serve lane score oracle cmp report gemv stage route ple prefill walk cosched demo sanitize alu probe probe-selftest probe-crush probe-crush-ckpt probe-discover shutdown ui ui-crush ui-crush-live ui-crush-dup batch decode probe-igpu
 
 all: $(BIN) bin/qe-serve
 
@@ -118,6 +118,11 @@ bin/bench_pool: $(COREOBJ) bench/bench_pool.c | bin
 ALU_REPS ?= 3
 bin/bench_alu: $(COREOBJ) bench/bench_alu.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_alu.c $(LDFLAGS)
+
+# The vision tower alone, against llama.cpp's own dump of the same image: the mmproj
+# is 0.9 GiB and the trunk is never opened, so this runs in seconds.
+bin/bench_vision: $(COREOBJ) bench/bench_vision.c | bin
+	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_vision.c $(LDFLAGS)
 
 bin/bench_tok: $(COREOBJ) bench/bench_tok.c | bin
 	$(CC) $(CFLAGS) -o $@ $(COREOBJ) bench/bench_tok.c $(LDFLAGS)
@@ -655,6 +660,15 @@ ARMS ?= ship
 decode: bin/bench_decode
 	$(TO) $$(( $(FUSE) + 120 )) ./bin/bench_decode --model $(CHECKPOINT) --fuse $(FUSE) \
 	  --arms $(ARMS) --text ideas.md
+
+# The vision tower alone against llama.cpp's own dump of the same image. Make the dump
+# once with MTMD_DEBUG_EMBEDDINGS=$(VISION_REF) llama-mtmd-cli -m ... --mmproj $(MMPROJ)
+# --image $(VISION_IMG) -p x -n 1; the trunk is never opened here, so this takes seconds.
+MMPROJ ?= /x-data/llm/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+VISION_IMG ?= /tmp/vision_test.jpg
+VISION_REF ?= -
+vision: bin/bench_vision
+	$(TO) 600 ./bin/bench_vision $(MMPROJ) $(VISION_IMG) $(VISION_REF)
 
 score: bin/bench_score
 	$(TO) $$(( $(FUSE) + 900 )) ./bin/bench_score --model $(CHECKPOINT) --threads $(THREADS) \

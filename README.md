@@ -1,16 +1,20 @@
 # qe
 
-![qe: 1.8x faster prefill, 2.0x faster generation, against llama.cpp on one CPU](marketing.svg)
+![qe: 1.8x faster prefill, 2.0x faster generation, images seen at up to 2.1x the encode speed, against llama.cpp on one CPU](marketing.svg)
 
 **A CPU-only inference engine for `Qwen3.8-Flash-Next`, hand-tuned to one machine:
 an Intel Core Ultra 7 265 with 128 GB of DDR5 and no GPU in the picture.**
 
 Not a fork of llama.cpp and not a wrapper around one: the GGUF reader, the
-quantised kernels, the router, the attention indexer, the draft-head loop and the
-HTTP server are all in this tree. It links two libraries - `libpthread` and `libm`.
+quantised kernels, the router, the attention indexer, the draft-head loop, the
+vision tower and the HTTP server are all in this tree. It links three libraries -
+`libpthread`, `libm`, and `libdl`, which is there only to open `libwebp` at run time
+when a request sends a WebP and the host has it. PNG and JPEG are decoded by the
+vendored `src/stb_image.h`, the decoder llama.cpp uses, so an image is the same pixels
+in both engines.
 
 ```
-LDFLAGS += -pthread -lm
+LDFLAGS += -pthread -lm -ldl
 ```
 
 There is no CUDA, Metal, Vulkan, ROCm, OpenCL or SYCL in it, and no `libggml`.
@@ -28,9 +32,13 @@ Measured on this host, default settings, 19 of 20 cores, one sequence:
 | **Generation**, greedy | **15.3 - 15.6 tok/s** (64 - 65 ms/token) | 7.65 tok/s (130.7 ms) | **2.0x** |
 | Generation at 32k / 128k tokens of context | 14.9 / 14.5 tok/s (67.0 / 68.8 ms/token) | | |
 | **Throughput**, eight sequences in one step (`--batch 8`) | 18.0 tok/s across a wave of eight (measured before §7.30 below) | none | |
+| **Seeing an image**, 640x480 photo (300 rows) | **1.0 s** | 2.1 s | **2.1x** |
+| Seeing an image, 5760x2160 screenshot (4056 rows) | 69 s | 77 s | 1.1x |
 
 llama.cpp is the same checkpoint and the same host: b12359 for ingestion
-(`-ngl 0 -t 20 -fa on`), b12110 for generation on the same corpus. The two engines
+(`-ngl 0 -t 20 -fa on`), b12110 for generation on the same corpus, b12359's
+`llama-mtmd-cli` for the image rows (its own "batch encoding done" line, same mmproj,
+same image, same 19 threads). The two engines
 are never resident at the same time; nothing here was measured with both of them
 holding 90 GB of weights.
 
@@ -130,7 +138,9 @@ model of a CPU.
 - **About 95 GiB of RAM free** for the checkpoint used here (87.25 GiB of weights
   plus 7.7 GiB of the load-time copies), and one GGUF you trust. If the copies do
   not fit, the engine says so at open with the bytes it wanted and the bytes it saw,
-  and serves without them.
+  and serves without them. Seeing images adds the 0.85 GiB projector, plus the
+  activations of one encode while it runs (a few hundred MiB for a screenshot, under
+  1 GiB at the 4096-row cap).
 - Build it on the machine that will run it. `-march=native` is not optional here,
   and the tuning is host-specific: the numbers above are not portable, and on a
   different CPU the honest answer is `make walk` and `make alu` on your own box.
@@ -150,8 +160,9 @@ MODEL=/path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf ./bin/qe-serve --repor
 # 3. Serve it. Every weight byte is placed in RAM before the listener opens, so the
 #    port stays closed until the engine can actually answer a request. After that
 #    the file is never read again.
-./bin/qe-serve --port 8097 \
-  --model /path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf
+./bin/qe-serve --port 8097 --id qe \
+  --model /path/to/Qwen3.8-Flash-Next-...-00001-of-00003.gguf \
+  --mmproj /path/to/mmproj-Qwen3.8-Flash-Next-BF16.gguf   # optional: images are seen
 
 # 4. Use it
 curl -s localhost:8097/v1/chat/completions -H 'content-type: application/json' \
@@ -171,10 +182,57 @@ restarts. `--ctx N` is a memory setting as much as a token limit. `SIGTERM` clos
 the listener immediately and gives the port back inside its grace period.
 
 Routes: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and
-SSE streaming. What the engine is doing stays visible while it does it: `/health`
+SSE streaming. A request with no `temperature` samples at the checkpoint's own
+(`general.sampling.temp`, 1.0) unless `--temp` says otherwise; send `"temperature": 0`
+for a greedy, byte-for-byte repeatable answer. What the engine is doing stays visible while it does it: `/health`
 reports the draft head, the draft length and the turn-cache counters, and `--ui`
 opens the terminal panel with the per-stage timings of the request in flight
 (`make ui` shows that panel on a pty and asserts it never draws into a log).
+
+## Seeing images
+
+Give the server the projector that ships beside the checkpoint and an image in a
+request is seen, not described:
+
+```sh
+./bin/qe-serve --model .../Qwen3.8-Flash-Next-...-00001-of-00003.gguf \
+  --mmproj .../mmproj-Qwen3.8-Flash-Next-BF16.gguf --id qe --port 8097
+# qe: vision: images are seen, at most 4096 rows each (--image-max-tokens)
+
+curl -s localhost:8097/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "qe", "temperature": 0, "reasoning_effort": "none",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -w0 page.jpg)"'"}},
+    {"type": "text", "text": "What is the headline?"}]}]}'
+```
+
+What happens to the image, all of it in this tree (`src/vision.c`, docs/DESIGN.md
+"Images"):
+
+- **The tower.** The mmproj is a 27-block ViT, 1152 wide, 16-pixel patches, a 2D
+  rotary and a 2x2 merger to the trunk's 2560. It is staged in RAM at startup with
+  everything else (0.85 GiB), and run with an AVX2 GEMM tiled six rows by sixteen,
+  its tiles handed out from a cursor like every other walk here.
+- **The prompt.** Each image becomes its merged grid of rows - a 640x480 photo is 300,
+  a full-HD screenshot about 2000 - placed where the chat template puts an image and
+  positioned with the checkpoint's interleaved m-rope. The text after it carries on
+  from where the image's grid ends, as the model was trained to read.
+- **The cache.** An image is identified by its bytes, so a conversation that sends the
+  same screenshot again on the next turn reuses it like any other prefix: no second
+  encode, no second read. A different image of the same size is not mistaken for it.
+- **What it costs text.** Nothing measurable: ingestion is 93.1 tok/s with the tower
+  built and without it, and a text-only conversation takes exactly the rope arithmetic
+  it took before - same logits, same argmax (`make decode`, both builds, one load each).
+- **What it agrees with.** `make vision` encodes an image and compares it row by row
+  with llama.cpp's own dump of the same image (`MTMD_DEBUG_EMBEDDINGS=ref.bin
+  llama-mtmd-cli ...`): median row cosine 0.99998, the same resize and the same grid.
+- **The dial.** `--image-max-tokens N` caps the rows one image may become (4096 by
+  default, llama.cpp's). The encode falls with the square of it: 1024 sees a 1024x1024
+  screenshot in a few seconds.
+
+Up to 32 images a request; past that the oldest are left out, because an agent
+resends its history and the image it is asking about is the newest. With `--batch N`
+images are described in text instead, because an encode needs the whole thread pool.
 
 ## Pointing Crush at it
 
@@ -189,11 +247,21 @@ opens the terminal panel with the per-stage timings of the request in flight
       "base_url": "http://127.0.0.1:8097/v1",
       "type": "llamacpp",
       "auto_discover_models": true,
-      "api_key": "qe"
+      "api_key": "qe",
+      "models": [
+        { "id": "qe", "name": "qe", "context_window": 262144,
+          "default_max_tokens": 32768, "supports_attachments": true }
+      ]
     }
   }
 }
 ```
+
+`supports_attachments` is what lets crush's `view` tool send an image at all: without
+it crush answers "this model does not support image data" before a byte reaches the
+engine, and its `llamacpp` discovery reads only the context window, never the
+capability. A model listed by hand is kept as written, so `context_window` goes in it
+too - the number `--ctx` opened, or smaller.
 
 `request_timeout` is load-bearing: it is an *idle* deadline on a stream, an unset
 one is 120 seconds, and a long ingestion emits no parsed part while it runs.
@@ -201,6 +269,14 @@ one is 120 seconds, and a long ingestion emits no parsed part while it runs.
 `/v1/models`, so the context window this process opened with becomes the window the
 client plans with. `make probe-crush` drives exactly this block against a loaded
 engine, including a tool call that has to come back as a tool result.
+
+Three things crush's own log showed going wrong, and what the server does about them:
+tool arguments are typed by the request's `tools[]` schema, so a shell id like `001`
+arrives as the string it is and an edit's `old_string` keeps its indentation; a turn
+that closes inside its reasoning without an answer reports that reasoning as the
+answer, so a sub-agent always hands its parent text; and a request with no
+temperature samples instead of decoding greedily, which is what kept a thinking block
+from going round in circles. MANUAL.md, "Pointing crush at it", has the detail.
 
 ## Dials
 
@@ -241,8 +317,8 @@ the interesting arguments about this machine can be settled on yours.
   two one at a time, and `make serve` still measures the wall a second client waits for.
 - Not a general model runner: it runs `qwen4exp` checkpoints (48 layers, 2560 wide,
   512 routed experts with 10 active, the n-gram PLE table, hyper-connections, the
-  block indexer), an OpenAI-compatible surface, and a chat template read from the
-  file. Anything else it refuses at open rather than approximates.
+  block indexer), its `qwen3vl_merger` vision projector, an OpenAI-compatible surface,
+  and a chat template read from the file. No video, and no audio. Anything else it refuses at open rather than approximates.
 - Not measured on your machine yet. Run `make alu`, `make walk` and `make report`
   first; the design numbers in this repository are host-specific on purpose, which
   is the only reason any of them are worth quoting.
@@ -250,10 +326,12 @@ the interesting arguments about this machine can be settled on yours.
 ## Layout
 
 ```
-src/            20 C files: gguf reader, kernels, layers, MoE, attention,
-                indexer, forward pass, sampler, drafter, spec loop, HTTP, server
+src/            21 C files: gguf reader, kernels, layers, MoE, attention,
+                indexer, forward pass, vision tower, sampler, drafter, spec loop,
+                HTTP, server; plus the vendored stb_image.h
 include/qe.h    the whole interface, with what each function owes whom
-bench/          the instruments: gemv, walk, moe, pool, alu, score, forward, head
+bench/          the instruments: gemv, walk, moe, pool, alu, score, forward, head,
+                vision
 docs/           DESIGN.md (the budget and the dead ends), ARCH.md (the shapes)
 ideas.md        2,500 lines of what was measured, priced, and left off
 MANUAL.md       status tables, every make target, every route, the crush notes

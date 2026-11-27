@@ -114,7 +114,8 @@ struct qe_engine {
     qe_engine_info info;
     qe_engine_opts o;
     qe_model *mm;     /* checkpoint metadata, mapped read-only */
-    qe_model *mmproj; /* vision projector, metadata only */
+    qe_model *mmproj; /* vision projector, resident like the weights */
+    qe_vision *vision; /* its tower, NULL when there is none to drive */
     qe_model *mtp;    /* draft head, in its own GGUF, resident like the weights */
     qe_tok *tok;       /* real BPE tokenizer, NULL if the file's is unusable */
     char tok_err[256]; /* why tok is NULL, for --report and /v1/models */
@@ -460,6 +461,11 @@ static long turns_store(qe_engine *e, long n, const float *logits, long vocab, i
     double t0 = now();
     if (qe_forward_snapshot(e->fw, r->st))
         return 0;
+    /* The point answers to the transcript's ids, which are the pass's own for text
+     * and the image's tag where an image was: a rewind point is matched against the
+     * next prompt, and an image pad matches every image of its size. */
+    if (e->fed && e->fed_valid && e->fed_n >= n)
+        qe_state_set_ids(r->st, e->fed, n);
     const long us = (long)((now() - t0) * 1e6);
     turns_commit(e, r, n, logits, vocab, answer);
     return us;
@@ -855,6 +861,11 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
         e->samp.min_p = o->min_p;
     else if (o->min_p < 0.0f)
         e->samp.min_p = 0.0f;
+    /* Temperature is the one knob whose 0 is a real value (greedy), so "not given"
+     * is spelled negative here: main.c leaves it at -1 unless --temp was on the
+     * command line, and the checkpoint's own temperature stands. */
+    if (o->temp >= 0.0f)
+        e->samp.temp = o->temp;
     int n_gdn = 0, n_qsa = 0;
     for (int il = 0; il < e->info.n_blocks; il++) {
         char nm[QE_MAX_NAME];
@@ -927,6 +938,19 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
             snprintf(err, errn, "warning: not generating: %s", ferr);
     }
     e->info.can_generate = e->fw != NULL;
+    if (e->fw && e->mmproj) {
+        /* After the pass, because the tower shares its thread pool. A tower this build
+         * does not encode is a warning and not a refusal: the server still serves, and
+         * an image is then described in the prompt, as it was before there was one. */
+        char verr[256] = { 0 };
+        e->vision = qe_vision_open(e->mmproj, o->image_max_tokens, verr, sizeof verr);
+        if (e->vision) {
+            e->info.has_vision = 1;
+            e->info.image_max_tokens = qe_vision_max_tokens(e->vision);
+        } else if (err && errn) {
+            snprintf(err, errn, "warning: mmproj: %s; images are described, not seen", verr);
+        }
+    }
     if (e->fw) {
         /* The hook belongs to the forward pass and not to a request: it outlives
          * every connection, and a request installs a pointer to itself in the
@@ -1033,6 +1057,16 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
                      e->n_batch, e->info.n_ctx);
         else
             snprintf(lanenote, sizeof lanenote, "One sequence at a time");
+        char imgnote[160];
+        if (e->vision)
+            snprintf(imgnote, sizeof imgnote,
+                     "Images are seen: the mmproj's tower encodes each one to at most %d "
+                     "rows of the trunk's width.",
+                     e->info.image_max_tokens);
+        else
+            snprintf(imgnote, sizeof imgnote,
+                     "Images are described in the prompt text: no vision tower is open "
+                     "(--mmproj).");
         used = snprintf(e->info.why, sizeof e->info.why,
              "generating. %d layers (%d gated-delta-net, %d sparse attention with the "
              "indexer, hyper-connections and %d-of-%d routed experts) executed from %s "
@@ -1040,14 +1074,13 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
              "%d tokens of state, key and value cache %s (%.0f MiB of state, %.1f KiB "
              "per token of context); sampler starts at the file's own "
              "top_k %d, top_p %.2f, min_p %.3f, "
-             "temp %.2f. Images are described in the prompt text: the vision projector is "
-             "resident but no encoder drives it. %s",
+             "temp %.2f. %s %s",
              e->info.n_blocks, n_gdn, n_qsa, e->info.n_experts_active, e->info.n_experts,
              o->model_path, e->info.arch, e->info.n_tensors, (double)bytes / 1073741824.0,
              e->info.n_volumes, place, lanenote, e->info.n_ctx, e->info.kv_cache,
              (double)st_total / 1048576.0, (double)st_token / 1024.0,
              e->samp.top_k, (double)e->samp.top_p, (double)e->samp.min_p,
-             (double)e->samp.temp, specnote);
+             (double)e->samp.temp, imgnote, specnote);
     } else {
         used = snprintf(e->info.why,
              sizeof e->info.why,
@@ -1092,6 +1125,7 @@ void qe_engine_close(qe_engine *e) {
     spec_drop(&e->spec);
     if (e->fw)
         qe_forward_close(e->fw);
+    qe_vision_close(e->vision);
     if (e->tok)
         qe_tok_close(e->tok);
     if (e->mtp)
@@ -1566,11 +1600,220 @@ static qe_sampler_opts samp_for(const qe_engine *e, const qe_gen_opts *o) {
         so.top_k = 0;
     if (o->top_p > 0.0f)
         so.top_p = o->top_p;
-    else if (o->min_p > 0.0f)
+    /* Independent of top_p: an `else` here dropped the min_p of every request that
+     * also sent a top_p, which is every request from a client with both configured. */
+    if (o->min_p > 0.0f)
         so.min_p = o->min_p;
     else if (o->min_p < 0.0f)
         so.min_p = 0.0f;
     return so;
+}
+
+/* ------------------------------------------------------------------ images
+ *
+ * A rendered prompt holds one image-pad token per image, between the vision start and
+ * end markers, exactly where the chat template puts the image; here each one becomes
+ * the image's rows. A row has three identities and each reader gets the one it needs:
+ *
+ *   - the forward pass reads ple.image_token_id, which is what the PLE window hashes at
+ *     an image position and what the pass will accept as an id;
+ *   - the transcript, the carry-over and the rewind points read a tag made of the
+ *     image's own bytes and the row's place in it, so a conversation that sends the
+ *     same screenshot again matches token for token and one that sends a different
+ *     screenshot of the same size does not - the image pad itself would match both;
+ *   - the rope reads the row's (t, h, w).
+ *
+ * Tags are 0x40000000 and up, outside any vocabulary, so a tag can never be mistaken
+ * for a token, and nothing that feeds ids to the pass is ever handed one. */
+#define MM_TAG 0x40000000u
+
+typedef struct {
+    int n;
+    unsigned char **rgb;
+    int *w, *h, *nx, *ny;
+    uint64_t *hash;
+    float **emb;       /* nx*ny rows of the trunk's width, encoded only when needed */
+    int *fids;         /* what the forward pass is fed */
+    int32_t *irow;     /* -1 for a token, else image << 20 | row */
+    int32_t *pos;      /* (t, h, w) per row; read for image rows only */
+    const float **rowp;
+} mm_prompt;
+
+static void mm_free(mm_prompt *m) {
+    for (int k = 0; k < m->n; k++) {
+        free(m->rgb ? m->rgb[k] : NULL);
+        free(m->emb ? m->emb[k] : NULL);
+    }
+    free(m->rgb);
+    free(m->w);
+    free(m->h);
+    free(m->nx);
+    free(m->ny);
+    free(m->hash);
+    free(m->emb);
+    free(m->fids);
+    free(m->irow);
+    free(m->pos);
+    free(m->rowp);
+    memset(m, 0, sizeof *m);
+}
+
+static uint64_t fnv1a(const void *p, size_t n) {
+    const unsigned char *b = p;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+/* Every image pad in `*ids` replaced by that image's rows. The count has to be the
+ * count of images the request carried: a pad is a control token, so text cannot put
+ * one there, and a mismatch is a renderer and a request that disagree. */
+static int mm_expand(qe_engine *e, const qe_prompt *p, int **ids, long *np, mm_prompt *m,
+                     char *why, size_t whyn) {
+    const int pad = e->info.image_token_id;
+    long count = 0;
+    for (long i = 0; i < *np; i++)
+        count += (*ids)[i] == pad;
+    if (count != p->n_images) {
+        snprintf(why, whyn, "the prompt has %ld image position(s) for %d image(s)", count,
+                 p->n_images);
+        return -1;
+    }
+    const int n = p->n_images;
+    m->n = n;
+    m->rgb = calloc((size_t)n, sizeof *m->rgb);
+    m->w = calloc((size_t)n, sizeof(int));
+    m->h = calloc((size_t)n, sizeof(int));
+    m->nx = calloc((size_t)n, sizeof(int));
+    m->ny = calloc((size_t)n, sizeof(int));
+    m->hash = calloc((size_t)n, sizeof *m->hash);
+    m->emb = calloc((size_t)n, sizeof *m->emb);
+    if (!m->rgb || !m->w || !m->h || !m->nx || !m->ny || !m->hash || !m->emb) {
+        snprintf(why, whyn, "out of memory");
+        return -1;
+    }
+    long total = *np - count;
+    for (int k = 0; k < n; k++) {
+        const qe_image *im = &p->images[k];
+        char derr[200] = { 0 };
+        if (qe_vision_decode(im->bytes, im->len, &m->rgb[k], &m->w[k], &m->h[k], derr,
+                             sizeof derr)) {
+            snprintf(why, whyn, "image %d: %s", k + 1, derr);
+            return -1;
+        }
+        qe_vision_grid(e->vision, m->w[k], m->h[k], &m->nx[k], &m->ny[k]);
+        m->hash[k] = fnv1a(im->bytes, im->len);
+        total += (long)m->nx[k] * m->ny[k];
+    }
+    int *out = malloc((size_t)(total + 8) * sizeof *out);
+    m->fids = malloc((size_t)(total + 8) * sizeof *m->fids);
+    m->irow = malloc((size_t)(total + 8) * sizeof *m->irow);
+    m->pos = calloc((size_t)(total + 8) * 3, sizeof *m->pos);
+    m->rowp = calloc((size_t)(total + 8), sizeof *m->rowp);
+    if (!out || !m->fids || !m->irow || !m->pos || !m->rowp) {
+        free(out);
+        snprintf(why, whyn, "out of memory");
+        return -1;
+    }
+    long o = 0;
+    int k = 0;
+    for (long i = 0; i < *np; i++) {
+        if ((*ids)[i] != pad) {
+            out[o] = m->fids[o] = (*ids)[i];
+            m->irow[o++] = -1;
+            continue;
+        }
+        const long rows = (long)m->nx[k] * m->ny[k];
+        for (long r = 0; r < rows; r++, o++) {
+            const uint64_t h = m->hash[k] ^ ((uint64_t)(r + 1) * 0x9E3779B97F4A7C15ull);
+            out[o] = (int)(MM_TAG | (uint32_t)((h >> 34) & 0x3fffffffu));
+            m->fids[o] = pad;
+            m->irow[o] = (int32_t)(((uint32_t)k << 20) | (uint32_t)r);
+        }
+        k++;
+    }
+    free(*ids);
+    *ids = out;
+    *np = total;
+    return 0;
+}
+
+/* The (t, h, w) of every image row, by the rule the pass applies to text: a row starts
+ * one past the largest position of the row before it. An image's rows all start from
+ * the same place, `base`, and add their row and column in the merged grid, which is
+ * llama.cpp's mtmd decoder position for this projector - and the text after the image
+ * then lands max(nx, ny) on from base without anyone saying so. Run after any front of
+ * the prompt was dropped, because then the sequence starts over at 0. */
+static void mm_positions(mm_prompt *m, long np) {
+    int32_t prev[3] = { -1, -1, -1 };
+    int32_t base = 0;
+    int last_img = -1;
+    for (long i = 0; i < np; i++) {
+        const int32_t pm = prev[0] > prev[1] ? (prev[0] > prev[2] ? prev[0] : prev[2])
+                                             : (prev[1] > prev[2] ? prev[1] : prev[2]);
+        int32_t *q = m->pos + (size_t)i * 3;
+        if (m->irow[i] < 0) {
+            q[0] = q[1] = q[2] = pm + 1;
+            last_img = -1;
+        } else {
+            const int k = m->irow[i] >> 20, r = m->irow[i] & 0xfffff;
+            if (k != last_img)
+                base = pm + 1;
+            last_img = k;
+            q[0] = base;
+            q[1] = base + r / m->nx[k];
+            q[2] = base + r % m->nx[k];
+        }
+        memcpy(prev, q, sizeof prev);
+    }
+}
+
+static int vision_progress(void *vp, long done, long total) {
+    qe_engine *e = vp;
+    /* The request's own hook only: it is what writes a keepalive on the stream and
+     * what says the client left, and a large image is a minute of neither otherwise. */
+    return e->user_progress ? e->user_progress(e->user_progress_user, done, total) : 0;
+}
+
+/* The images with a row in [from, to) through the tower, and the row pointers the pass
+ * reads. An image entirely inside the reused part of the prompt is in the caches
+ * already, and is not encoded again. */
+static int mm_encode(qe_engine *e, mm_prompt *m, long from, long to, qe_gen_stats *st,
+                     char *why, size_t whyn) {
+    const int D = qe_vision_dim(e->vision);
+    const double t0 = now();
+    for (int k = 0; k < m->n; k++) {
+        int needed = 0;
+        for (long i = from; i < to && !needed; i++)
+            needed = m->irow[i] >= 0 && (m->irow[i] >> 20) == k;
+        if (!needed)
+            continue;
+        const long rows = (long)m->nx[k] * m->ny[k];
+        m->emb[k] = malloc((size_t)rows * (size_t)D * sizeof(float));
+        if (!m->emb[k]) {
+            snprintf(why, whyn, "out of memory for image %d", k + 1);
+            return -1;
+        }
+        qe_vision_stats vs = { 0 };
+        int nx = 0, ny = 0;
+        const long got = qe_vision_encode(e->vision, m->rgb[k], m->w[k], m->h[k], m->emb[k], rows,
+                                          &nx, &ny, vision_progress, e, &vs);
+        if (got != rows || nx != m->nx[k] || ny != m->ny[k]) {
+            snprintf(why, whyn, "image %d could not be encoded", k + 1);
+            return -1;
+        }
+        if (st)
+            st->images_encoded++;
+    }
+    for (long i = from; i < to; i++)
+        if (m->irow[i] >= 0) {
+            const int k = m->irow[i] >> 20, r = m->irow[i] & 0xfffff;
+            m->rowp[i] = m->emb[k] + (size_t)r * (size_t)D;
+        }
+    if (st)
+        st->vision_seconds += now() - t0;
+    return 0;
 }
 
 static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *o,
@@ -1580,6 +1823,8 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
     int dropped = 0;
     int *ids = NULL;
     float *logits = NULL;
+    mm_prompt mm = { 0 };
+    int has_mm = 0;
     if (!e->tok) {
         /* Without the file's tokenizer there is no honest way to turn text into
          * ids, and inventing an encoding is worse than refusing. */
@@ -1611,6 +1856,25 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         errno = EINVAL;
         goto done;
     }
+    /* Images become their rows here, before anything measures the prompt: the window,
+     * the budget and the match against what the pass is holding are all about rows. */
+    if (p->n_images > 0 && e->vision && e->info.image_token_id > 0) {
+        char why[192] = { 0 };
+        if (mm_expand(e, p, &ids, &np, &mm, why, sizeof why)) {
+            if (st)
+                snprintf(st->error, sizeof st->error, "%s", why);
+            errno = EINVAL;
+            goto done;
+        }
+        has_mm = mm.n > 0;
+        if (st) {
+            st->images = mm.n;
+            for (int k = 0; k < mm.n; k++)
+                st->image_rows += (long)mm.nx[k] * mm.ny[k];
+        }
+    }
+    if (st)
+        st->prompt_rows = np;
 
     long mt = o->max_tokens > 0 ? o->max_tokens : 64;
     /* The window is the only ceiling on an answer, and a reasoning model needs
@@ -1632,9 +1896,15 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
             goto done;
         }
         memmove(ids, ids + (np - keep), (size_t)keep * sizeof *ids);
+        if (has_mm) {
+            memmove(mm.fids, mm.fids + (np - keep), (size_t)keep * sizeof *mm.fids);
+            memmove(mm.irow, mm.irow + (np - keep), (size_t)keep * sizeof *mm.irow);
+        }
         np = keep;
         dropped = 1;
     }
+    if (has_mm)
+        mm_positions(&mm, np);
 
     qe_sampler_opts so = samp_for(e, o);
     uint64_t rng =
@@ -1716,8 +1986,10 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
     spec_target *sp = NULL;
     qe_spec_stats spec_st = { 0, 0, 0, 0, 0, 0 };
     long feed_to = np;
+    /* Not with images: a draft row is a token, and the drafter indexes the transcript,
+     * where an image's rows are tags that are no token at all. */
     if (o->spec_k > 0 && so.temp <= 0.0f && mt > 0 && reuse != np && np >= 2 && ctx > 0 &&
-        mt <= (long)ctx - np - o->spec_k)
+        mt <= (long)ctx - np - o->spec_k && !has_mm)
         sp = spec_get(e, o->spec_k + 1, vocab);
     if (sp) {
         feed_to = np - 1;
@@ -1735,17 +2007,29 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         sp->last_read = 0;
         sp->read_any = 0;
     }
+    if (has_mm && feed_to > reuse) {
+        char why[192] = { 0 };
+        if (mm_encode(e, &mm, reuse, feed_to, st, why, sizeof why)) {
+            if (st && !st->error[0])
+                snprintf(st->error, sizeof st->error, "%s", why);
+            errno = EINVAL;
+            goto done;
+        }
+    }
     if (reuse == np) {
         memcpy(logits, cached, (size_t)vocab * sizeof *logits);
     } else if (reuse && feed_to > reuse) {
-        if (qe_forward_prefill(e->fw, ids + reuse, feed_to - reuse, logits)) {
+        if (has_mm ? qe_forward_prefill_mm(e->fw, 0, mm.fids + reuse, feed_to - reuse,
+                                           mm.rowp + reuse, mm.pos + (size_t)reuse * 3, logits)
+                   : qe_forward_prefill(e->fw, ids + reuse, feed_to - reuse, logits)) {
             errno = EIO;
             goto done;
         }
     } else if (feed_to > reuse) {
         qe_forward_reset(e->fw);
         fed_reset(e);
-        if (qe_forward_prefill(e->fw, (const int *)ids, feed_to, logits)) {
+        if (has_mm ? qe_forward_prefill_mm(e->fw, 0, mm.fids, feed_to, mm.rowp, mm.pos, logits)
+                   : qe_forward_prefill(e->fw, (const int *)ids, feed_to, logits)) {
             errno = EIO;
             goto done;
         }
@@ -1917,6 +2201,7 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
         st->prefill_seconds = t_read - t0;
     }
 done:
+    mm_free(&mm);
     /* Also on the way out of a failure: a panel left saying "ingesting" because a
      * request died is a panel that teaches people to ignore it. */
     qe_ui_gen_end();
@@ -2475,7 +2760,7 @@ long qe_engine_generate_tokens(qe_engine *e, const qe_prompt *p, const qe_gen_op
         mt = win - 1;
     qe_spec_opts so = {
         .k = o->spec_k > 0 ? o->spec_k : 4,
-        .temp = o->temp,
+        .temp = o->temp > 0.0f ? o->temp : 0.0f, /* negative is "not sent": greedy here */
         .seed = o->seed,
         .max_tokens = mt,
         .eos = ST_EOS,

@@ -549,12 +549,12 @@ long qe_json_write(const qe_json *v, char *out, size_t cap) {
         free(b.p);
         return -1;
     }
-    if (buf_putc(&b, 0))
+    /* One terminator, and the length excludes it. There used to be two, so the
+     * length counted the first and a caller copying `n` bytes copied a NUL. */
+    if (buf_putc(&b, 0)) {
+        free(b.p);
         return -1;
-    /* Always NUL-terminate the internal buffer so strlen is defined even for a
-     * zero-capacity sizing call. */
-    if (buf_putc(&b, 0))
-        return -1;
+    }
     size_t n = b.len - 1;
     if (out && cap) {
         size_t take = n < cap - 1 ? n : cap - 1;

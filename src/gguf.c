@@ -1062,6 +1062,13 @@ int qe_model_get_arr_int(qe_model *m, const char *key, const long long **out, si
     *n = k->n_arr;
     return 0;
 }
+int qe_model_get_arr_real(qe_model *m, const char *key, const double **out, size_t *n) {
+    const struct kv *k = kv_find(m, key);
+    if (!k || k->kind != KV_ARR_REAL) return -1;
+    *out = k->arr;
+    *n = k->n_arr;
+    return 0;
+}
 int qe_model_get_arr_str(qe_model *m, const char *key, const char *const **out, size_t *n) {
     const struct kv *k = kv_find(m, key);
     if (!k || k->kind != KV_ARR_STR) return -1;

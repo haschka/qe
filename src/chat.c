@@ -560,6 +560,11 @@ static int put_content(qe_str *o, const qe_json *m, qe_chat *r, char *why, size_
         }
         if (!strcmp(type, "image_url") || !strcmp(type, "image") ||
             !strcmp(type, "input_image")) {
+            if (r->vision && (!strcmp(qe_chat_role(m), "system") ||
+                              !strcmp(qe_chat_role(m), "developer"))) {
+                snprintf(why, whyn, "System message cannot contain images.");
+                return -1;
+            }
             const qe_json *iu = qe_json_at(part, "image_url");
             const char *url = iu ? qe_json_str_at(iu, "url", "") : NULL;
             if (iu && iu->kind == QE_JSON_STR)
@@ -568,14 +573,20 @@ static int put_content(qe_str *o, const qe_json *m, qe_chat *r, char *why, size_
                 snprintf(why, whyn, "image part has no url");
                 return -1;
             }
-            if (r->n_images >= QE_CHAT_MAX_IMAGES) {
+            if (r->image_seen++ < r->image_skip || r->n_images >= QE_CHAT_MAX_IMAGES) {
                 r->truncated_images = 1;
+                qe_str_puts(o, "[an earlier image, left out: this request carries more "
+                               "images than the server takes]");
                 continue;
             }
             if (qe_chat_record_image(r, url, why, whyn))
                 return -1;
-            qe_str_appendf(o, "[image %d: %s, %zu bytes]", r->n_images,
-                           r->image_mime[r->n_images - 1], r->images[r->n_images - 1].len);
+            if (r->vision)
+                qe_str_puts(o, r->image_mark);
+            else
+                qe_str_appendf(o, "[image %d: %s, %zu bytes. " QE_CHAT_IMAGE_NOTE "]",
+                               r->n_images, r->image_mime[r->n_images - 1],
+                               r->images[r->n_images - 1].len);
             continue;
         }
         if (!strcmp(type, "video") || !strcmp(type, "video_url")) {
@@ -697,6 +708,31 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
     }
     r->chat = 1;
     r->n_messages = (long)nm;
+    if (o->vision) {
+        char vo[MARK_MAX], vc[MARK_MAX], vp[MARK_MAX];
+        if (!mark_text(t, QE_MARK_VISION_OPEN, vo, sizeof vo) &&
+            !mark_text(t, QE_MARK_VISION_CLOSE, vc, sizeof vc) &&
+            !mark_text(t, QE_MARK_IMAGE_PAD, vp, sizeof vp)) {
+            snprintf(r->image_mark, sizeof r->image_mark, "%s%s%s", vo, vp, vc);
+            r->vision = 1;
+        }
+    }
+
+    /* The oldest images over the limit are the ones left out, so count them first. */
+    {
+        int total = 0;
+        for (size_t i = 0; i < nm; i++) {
+            const qe_json *c = qe_json_at(msg[i], "content");
+            if (!c || c->kind != QE_JSON_ARR)
+                continue;
+            for (const qe_json *part = c->child; part; part = part->next) {
+                const char *ty = qe_json_str_at(part, "type", "");
+                total += !strcmp(ty, "image_url") || !strcmp(ty, "image") ||
+                         !strcmp(ty, "input_image");
+            }
+        }
+        r->image_skip = total > QE_CHAT_MAX_IMAGES ? total - QE_CHAT_MAX_IMAGES : 0;
+    }
 
     /* ---- the leading system run, trimmed and joined (template: sysns walk) */
     qe_str sys = { 0 };
@@ -960,6 +996,9 @@ struct qe_turn {
     char id_prefix[48]; /* the stem those ids are built from */
     qe_str block; /* text of the request being buffered */
     qe_str blank; /* answer text that is only spaces, held until it has a side */
+    const qe_json *tools; /* the request's tools[], borrowed; types the arguments */
+    qe_str reasoning;     /* the reasoning text, kept for the rescue at the close */
+    long content_bytes;   /* answer text reported so far */
 };
 
 qe_turn *qe_turn_new(qe_turn_cb cb, void *user, int starts_in_reasoning) {
@@ -979,6 +1018,11 @@ void qe_turn_set_id_prefix(qe_turn *t, const char *prefix) {
     snprintf(t->id_prefix, sizeof t->id_prefix, "%s", prefix);
 }
 
+void qe_turn_set_tools(qe_turn *t, const qe_json *tools) {
+    if (t)
+        t->tools = tools && tools->kind == QE_JSON_ARR ? tools : NULL;
+}
+
 void qe_turn_free(qe_turn *t) {
     if (!t)
         return;
@@ -987,6 +1031,7 @@ void qe_turn_free(qe_turn *t) {
     free(t->ids);
     qe_str_free(&t->block);
     qe_str_free(&t->blank);
+    qe_str_free(&t->reasoning);
     free(t);
 }
 
@@ -998,8 +1043,12 @@ static int emit_text(qe_turn *t, int kind, const char *utf8, int nbytes) {
     if (nbytes <= 0)
         return 0;
     qe_turn_ev ev = { .kind = kind, .utf8 = utf8, .nbytes = nbytes };
-    if (kind == QE_TURN_REASONING)
+    if (kind == QE_TURN_REASONING) {
         t->reason_bytes += (long)nbytes;
+        qe_str_append(&t->reasoning, utf8, (size_t)nbytes);
+    } else if (kind == QE_TURN_CONTENT) {
+        t->content_bytes += (long)nbytes;
+    }
     return emit(t, &ev);
 }
 
@@ -1116,6 +1165,10 @@ static int is_number(const char *p, size_t n) {
         i++;
     if (i == start)
         return 0;
+    /* JSON has no leading zeros: 001 is a shell id, and written as a number it is
+     * a document no strict parser takes. */
+    if (i - start > 1 && p[start] == '0')
+        return 0;
     if (i < n && p[i] == '.') {
         i++;
         start = i;
@@ -1141,8 +1194,79 @@ static int is_word(const char *p, size_t n, const char *word) {
     return n == strlen(word) && !memcmp(p, word, n);
 }
 
-static void put_arg_value(qe_str *o, const char *p, size_t n) {
+/* What the request's schema says a parameter is. Only "a string and nothing else"
+ * changes how a value is read; every other answer, including none, reads it as
+ * JSON first. */
+enum { ARG_UNKNOWN, ARG_STRING, ARG_JSON };
+
+static int type_is(const qe_json *ty, const char *name) {
+    return ty && ty->kind == QE_JSON_STR && ty->str && !strcmp(ty->str, name);
+}
+
+static int schema_kind(const qe_json *prop) {
+    if (!prop || prop->kind != QE_JSON_OBJ)
+        return ARG_UNKNOWN;
+    const qe_json *ty = qe_json_at(prop, "type");
+    if (ty && ty->kind == QE_JSON_STR)
+        return type_is(ty, "string") ? ARG_STRING : ARG_JSON;
+    if (ty && ty->kind == QE_JSON_ARR) {
+        /* ["string", "null"] is a string that may be left out; a union with any
+         * other type is a value the text has to decide. */
+        int str = 0, other = 0;
+        for (const qe_json *k = ty->child; k; k = k->next) {
+            if (type_is(k, "string"))
+                str = 1;
+            else if (!type_is(k, "null"))
+                other = 1;
+        }
+        return str && !other ? ARG_STRING : ARG_UNKNOWN;
+    }
+    const qe_json *en = qe_json_at(prop, "enum");
+    if (en && en->kind == QE_JSON_ARR && en->child) {
+        for (const qe_json *k = en->child; k; k = k->next)
+            if (k->kind != QE_JSON_STR)
+                return ARG_UNKNOWN;
+        return ARG_STRING;
+    }
+    return ARG_UNKNOWN;
+}
+
+/* A tool's parameter schema, found by the function name the model wrote. Both the
+ * nested {type, function:{name, parameters}} spelling and the flat one are read. */
+static int param_kind(const qe_json *tools, slice fname, slice pname) {
+    if (!tools)
+        return ARG_UNKNOWN;
+    for (const qe_json *tool = tools->child; tool; tool = tool->next) {
+        const qe_json *fn = qe_json_at(tool, "function");
+        const qe_json *src = fn && fn->kind == QE_JSON_OBJ ? fn : tool;
+        const char *name = qe_json_str_at(src, "name", NULL);
+        if (!name || strlen(name) != fname.n || memcmp(name, fname.p, fname.n))
+            continue;
+        const qe_json *props = qe_json_at(qe_json_at(src, "parameters"), "properties");
+        if (!props || props->kind != QE_JSON_OBJ)
+            return ARG_UNKNOWN;
+        for (const qe_json *pr = props->child; pr; pr = pr->next)
+            if (pr->key && strlen(pr->key) == pname.n && !memcmp(pr->key, pname.p, pname.n))
+                return schema_kind(pr);
+        return ARG_UNKNOWN;
+    }
+    return ARG_UNKNOWN;
+}
+
+/* One value, as JSON. A string parameter is the text as written: the newline that
+ * frames it in the block is already gone, and nothing else is trimmed, because the
+ * leading spaces of a line of code are the line. Anything else is read as JSON
+ * after trimming, and what leaves is either a token that is already strict JSON or
+ * a re-serialisation of what parsed - the parser here is lenient about numbers, and
+ * a lenient echo is how 001 reached a client. Text that is not JSON is a string. */
+static void put_arg_value(qe_str *o, const char *raw, size_t rawn, int kind) {
     char err[64] = { 0 };
+    if (kind == ARG_STRING) {
+        put_jstr(o, raw, rawn);
+        return;
+    }
+    const char *p = raw;
+    size_t n = rawn;
     while (n && is_space((unsigned char)*p)) {
         p++;
         n--;
@@ -1158,18 +1282,41 @@ static void put_arg_value(qe_str *o, const char *p, size_t n) {
         qe_str_append(o, p, n);
         return;
     }
+    size_t numeric = 0;
+    while (numeric < n && strchr("+-.0123456789eE", p[numeric]) && p[numeric])
+        numeric++;
+    if (kind == ARG_JSON && n < 64 && numeric == n) {
+        /* The schema asked for something other than a string and the model wrote a
+         * number loosely (007, 1.): the value is clear, only its spelling is not
+         * JSON. */
+        char tmp[64], *end = NULL;
+        memcpy(tmp, p, n);
+        tmp[n] = 0;
+        double d = strtod(tmp, &end);
+        if (end == tmp + n && d == d && d < 1e308 && d > -1e308) {
+            put_num(o, d);
+            return;
+        }
+    }
     qe_json *v = qe_json_parse(p, n, err, sizeof err);
     if (v && v->kind == QE_JSON_STR) {
         put_jstr(o, v->str ? v->str : "", v->str_len);
         qe_json_free(v);
         return;
     }
-    if (v) {
+    if (v && (v->kind == QE_JSON_OBJ || v->kind == QE_JSON_ARR)) {
+        long need = qe_json_write(v, NULL, 0);
+        char *buf = need >= 0 ? malloc((size_t)need + 1) : NULL;
+        if (buf && qe_json_write(v, buf, (size_t)need + 1) == need)
+            qe_str_append(o, buf, (size_t)need);
+        else
+            o->err = 1;
+        free(buf);
         qe_json_free(v);
-        qe_str_append(o, p, n);
         return;
     }
-    put_jstr(o, p, n);
+    qe_json_free(v);
+    put_jstr(o, raw, rawn);
 }
 
 /* Reports one buffered request as an id, a name and one argument object.
@@ -1212,7 +1359,7 @@ static int emit_call(qe_turn *t) {
         first = 0;
         put_jstr(&args, pname.p, pname.n);
         putc1(&args, ':');
-        put_arg_value(&args, p + vs, ve - vs);
+        put_arg_value(&args, p + vs, ve - vs, param_kind(t->tools, fname, pname));
         pos = cafter;
     }
     putc1(&args, '}');
@@ -1252,6 +1399,19 @@ static int emit_call(qe_turn *t) {
     t->calls++;
     qe_str_free(&args);
     return rc;
+}
+
+/* The turn closed with its reasoning block still open and nothing else said, so the
+ * answer it has is the one it wrote there. See qe_turn_token in chat.h. */
+static int rescue_answer(qe_turn *t) {
+    if (t->state != ST_REASON || t->calls || t->content_bytes)
+        return 0;
+    slice s = trim_slice(t->reasoning.p, t->reasoning.len);
+    if (!s.n)
+        return 0;
+    qe_turn_ev ev = { .kind = QE_TURN_CONTENT, .utf8 = s.p, .nbytes = (int)s.n };
+    t->content_bytes += (long)s.n;
+    return emit(t, &ev);
 }
 
 /* The close of an assistant turn. A reply that asked for something ended with a
@@ -1300,7 +1460,7 @@ int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes) {
     case QE_MARK_TURN_CLOSE:
         if (t->state == ST_BLOCK)
             t->block.len = 0;
-        return flush_blank(t, t->calls == 0) || finish_turn(t);
+        return flush_blank(t, t->calls == 0) || rescue_answer(t) || finish_turn(t);
     default:
         break;
     }

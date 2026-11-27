@@ -228,6 +228,8 @@ int qe_model_get_float(qe_model *m, const char *key, double *out);
 int qe_model_get_str(qe_model *m, const char *key, const char **out);
 int qe_model_get_arr_int(qe_model *m, const char *key, const long long **out, size_t *n);
 int qe_model_get_arr_str(qe_model *m, const char *key, const char *const **out, size_t *n);
+/* f32 and f64 arrays alike, widened to double as the reader stores them. */
+int qe_model_get_arr_real(qe_model *m, const char *key, const double **out, size_t *n);
 int qe_model_get_arr_len(qe_model *m, const char *key, size_t *n);
 
 /* Host pointer for a tensor's bytes, or NULL if not resident. */
@@ -1351,6 +1353,17 @@ int qe_forward_prefill(qe_forward *f, const int *tokens, long n, float *logits_o
  * 0, which is what makes them the same walk rather than a second one. */
 int qe_forward_step_seq(qe_forward *f, int s, int token, float *logits_out);
 int qe_forward_prefill_seq(qe_forward *f, int s, const int *tokens, long n, float *logits_out);
+/* The same with rows that are not token embeddings: row i takes `row_emb[i]` (the
+ * trunk's width of floats) when it is non-NULL, at the rope position
+ * row_pos[3i..3i+2] = (t, h, w), and `tokens[i]` is what the PLE window sees there -
+ * ple.image_token_id for an image row. Every other row is the token it names, at one
+ * past the largest position of the cell before it. A sequence that has taken such a
+ * row reads every rope angle from its position table from then on (qe_forward_mrope);
+ * one that never has takes the arithmetic it always did. */
+int qe_forward_prefill_mm(qe_forward *f, int s, const int *tokens, long n,
+                          const float *const *row_emb, const int32_t *row_pos,
+                          float *logits_out);
+int qe_forward_mrope(const qe_forward *f, int s);
 /* B sequences through the trunk in one walk of the weights: `tokens[s]` is the token
  * sequence s continues, and `logits_out + s * qe_forward_vocab()` is the vocabulary
  * row predicting sequence s's next token. B is at most the pass's n_seq, and every
@@ -1889,6 +1902,10 @@ int qe_forward_restore(qe_forward *f, const qe_state *in);
  * to the snapshot and are good until it is freed. */
 long qe_state_pos(const qe_state *s);
 const uint32_t *qe_state_ids(const qe_state *s);
+/* The ids a state answers to, overwritten with the caller's own spelling of the same
+ * prefix: the pass keeps the image token at an image position, and a caller that tells
+ * two images apart keeps something that does. n has to be the state's position. */
+int qe_state_set_ids(qe_state *s, const int *ids, long n);
 /* The vector the output projection reads: the head mixer's output for the token
  * the last step fed. Two implementations of one graph disagree about 248320
  * logits and about nothing else, so comparing this is comparing the whole trunk;
@@ -2100,6 +2117,42 @@ void qe_sampler_opts_from_model(qe_model *m, qe_sampler_opts *o);
  * Returns -1 when every logit is -inf or the vocabulary is empty. */
 int qe_sample(const float *logits, long n, const qe_sampler_opts *o, uint64_t *rng);
 
+/* ------------------------------------------------------------------ vision
+ *
+ * The mmproj's vision tower (src/vision.c): image bytes in, one row of the trunk's
+ * width per merged 2x2 group of 16-pixel patches out, in raster order of the merged
+ * grid. Everything from decoding to the patch grid reproduces llama.cpp's qwen3vl
+ * path, so an image is sized and sampled the way the model saw images; the tower
+ * itself is f32 over the file's BF16 weights. Opened at engine open, out of bytes
+ * that are already resident; run only for a request that carries an image. */
+
+typedef struct qe_vision qe_vision;
+
+typedef struct {
+    double preprocess, patch, blocks, merge; /* seconds */
+    double attention;                        /* the part of `blocks` that is attention */
+    long patches;
+    int width, height; /* the size the image was resampled to */
+} qe_vision_stats;
+
+/* max_tokens caps the merged tokens of one image (llama.cpp's default is 4096); the
+ * size an image is resampled to is chosen to stay inside it. */
+qe_vision *qe_vision_open(qe_model *mmproj, int max_tokens, char *err, size_t errn);
+void qe_vision_close(qe_vision *v);
+int qe_vision_dim(const qe_vision *v);
+int qe_vision_max_tokens(const qe_vision *v);
+/* PNG, JPEG, GIF and BMP through stb_image, WebP through libwebp when the host has
+ * it. *rgb is malloc'd, w*h*3 bytes. */
+int qe_vision_decode(const void *bytes, size_t n, unsigned char **rgb, int *w, int *h, char *err,
+                     size_t errn);
+/* The merged grid an image of w x h encodes to: nx * ny rows of output. */
+int qe_vision_grid(const qe_vision *v, int w, int h, int *nx, int *ny);
+/* Returns the rows written (nx * ny), or -1. `progress` is asked after every block and
+ * a non-zero answer abandons the encode. */
+long qe_vision_encode(qe_vision *v, const unsigned char *rgb, int w, int h, float *out,
+                      long cap_rows, int *nx, int *ny, int (*progress)(void *, long, long),
+                      void *progress_user, qe_vision_stats *st);
+
 /* ------------------------------------------------------------- engine hook
  *
  * The smallest thing a generator has to be for the HTTP layer to use it. It
@@ -2127,7 +2180,7 @@ typedef struct {
 
 typedef struct {
     int max_tokens;
-    float temp;  /* 0 = greedy */
+    float temp;  /* 0 = greedy, negative = the engine's default */
     /* 0 in each of these three means "what the checkpoint says", which is how a
      * client that sends nothing gets the model's own sampling. Beyond that a
      * request can be explicit about turning a filter off, which is what the
@@ -2198,6 +2251,19 @@ typedef struct {
      * the whole wall is a number dragged down by however long its prompt was. 0 where
      * the path does not separate them. */
     double prefill_seconds;
+    /* The prompt as the pass reads it: tokens plus the rows the images became. A text
+     * prompt has as many as its tokens; an image adds its merged grid. 0 where the
+     * path does not count them. */
+    long prompt_rows;
+    /* Images seen, how many of them had to be encoded this request (the rest were
+     * inside the part of the prompt that was reused), the rows they became, and the
+     * seconds the tower took. */
+    int images, images_encoded;
+    long image_rows;
+    double vision_seconds;
+    /* Why a request was refused, when the reason is the request's and not the engine's
+     * (an image that does not decode, say). Empty otherwise. */
+    char error[192];
 } qe_gen_stats;
 
 /* Emits generated text in order; `utf8` is a fragment and need not be a whole
@@ -2260,6 +2326,11 @@ typedef struct {
     int n_vocab;
     int eos_token_id;
     int image_token_id;
+    /* The vision tower is open (an mmproj was given and it is a tower this build
+     * encodes), and the merged tokens one image may become. 0 = images are described
+     * in the prompt text instead of shown. */
+    int has_vision;
+    int image_max_tokens;
     int has_chat_template; /* tokenizer.chat_template present in the file */
     int has_mtp_head;      /* any tensor that could drive qe_spec_opts.spec_k */
     /* The draft head, when it is a file rather than a tensor in the checkpoint.
@@ -2324,6 +2395,9 @@ typedef struct qe_engine qe_engine;
 typedef struct {
     const char *model_path; /* GGUF volume 0, or NULL for the selftest engine */
     const char *mmproj_path;
+    /* Merged tokens one image may encode to; the image is resampled to stay inside
+     * it. 0 = llama.cpp's default for this tower, 4096. */
+    int image_max_tokens;
     /* A draft head delivered as a separate GGUF (one nextn block plus the norms
      * around it). Placed in memory at launch exactly like the checkpoint, and
      * refused at launch if it is a head for another model. */
@@ -2337,7 +2411,7 @@ typedef struct {
      * `--walk-threads N`, QE_WALK_THREADS. */
     int walk_threads;
     int spec_k;       /* default draft length, or QE_SPEC_K_AUTO for the drafter's */
-    float temp;       /* default temperature */
+    float temp;       /* default temperature; negative = the checkpoint's own */
     /* Defaults the server offers when a request does not say, in the same "0 means
      * the checkpoint's own value" convention as qe_gen_opts. This is what makes
      * `--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0` mean the same thing here as

@@ -53,9 +53,22 @@
 
 #include <stddef.h>
 
-#define QE_CHAT_MAX_IMAGES 8
+/* Images one request may carry. A coding agent sends its whole history every turn,
+ * screenshots included, so past this count the oldest ones are left out - the one the
+ * user is asking about is the newest. */
+#define QE_CHAT_MAX_IMAGES 32
 #define QE_CHAT_MIME_MAX 64
 #define QE_CHAT_MAX_IMAGE_BYTES (32u << 20)
+/* What the transcript says where an image was. There is no vision encoder in this
+ * build, and "[image 1: image/png, 253154 bytes]" alone was read by the model as an
+ * image it had been shown: it answered a view of a PNG with "Now I can see the
+ * pattern much better!" and described what it imagined. So the placeholder says what
+ * the model can and cannot know, and an agent can go on to inspect the file with the
+ * tools it does have. */
+#define QE_CHAT_IMAGE_NOTE                                                                   \
+    "The image content is not visible to you: this server has no vision encoder. Do not "  \
+    "describe or guess what it shows; say you cannot see it, or inspect the file with "     \
+    "other tools"
 
 /* Vocabulary ids of the control tokens this model was trained with, as the
  * checkpoint's token_type array marks them. Kept as numbers so that no literal
@@ -68,7 +81,13 @@ enum {
     QE_MARK_TOOL_OUT_OPEN = 248066,
     QE_MARK_TOOL_OUT_CLOSE = 248067,
     QE_MARK_REASON_OPEN = 248068,
-    QE_MARK_REASON_CLOSE = 248069
+    QE_MARK_REASON_CLOSE = 248069,
+    /* An image in a message, as the template spells it: the start and end markers
+     * around one image pad, which is also the file's ple.image_token_id and the
+     * position the engine replaces with the image's rows. */
+    QE_MARK_VISION_OPEN = 248053,
+    QE_MARK_VISION_CLOSE = 248054,
+    QE_MARK_IMAGE_PAD = 248056
 };
 
 /* One rendered request: the prompt bytes, plus what could not be represented as
@@ -82,6 +101,8 @@ typedef struct {
     int n_images;
     size_t image_bytes;
     int truncated_images; /* more images than QE_CHAT_MAX_IMAGES */
+    int image_skip;       /* how many of the oldest images are left out */
+    int image_seen;       /* image parts met so far, kept or not */
     int chat;             /* messages were rendered, as opposed to a raw prompt */
     int has_reasoning;   /* the transcript carries the model's own reasoning */
     int opens_reasoning; /* the prompt leaves the model inside an open reasoning block,
@@ -89,6 +110,11 @@ typedef struct {
                             tokens belong */
     int tools_rendered;   /* the schema preamble went in */
     long n_messages;
+    /* Images go in as the template's three markers rather than as a sentence about
+     * them: set when the caller said the engine can see (qe_chat_opts.vision) and the
+     * vocabulary has the markers. `image_mark` is their text, from the vocabulary. */
+    int vision;
+    char image_mark[160];
 } qe_chat;
 
 /* What the caller asked for, after the request's own spellings are reconciled.
@@ -107,6 +133,10 @@ typedef struct {
      * thinking back would otherwise replay forty turns of an assistant that never
      * thinks. */
     int empty_thinking_blocks;
+    /* Not a client knob either: the server sets it when the engine has a vision tower
+     * that will turn each image's position into the image's rows. Off, an image is a
+     * sentence that says it cannot be seen. */
+    int vision;
 } qe_chat_opts;
 
 /* Fills o from a request body: enable_thinking (also accepted inside
@@ -186,9 +216,30 @@ void qe_turn_free(qe_turn *t);
  * nothing wider, and a reply is one turn of a conversation that keeps going. */
 void qe_turn_set_id_prefix(qe_turn *t, const char *prefix);
 
+/* The request's tools[] array, which decides what a parameter's value is. The model
+ * writes every value as bare text between two tags, and the argument object a client
+ * receives is JSON, so something has to say whether `001` is a number or a string.
+ * The schema says so: a parameter declared "string" is the text the model wrote, byte
+ * for byte inside the newline that frames it - indentation and quotes included, which
+ * is what an edit tool's old_string has to be to match anything. Anything else is
+ * read as JSON and re-serialised, so what leaves is always valid JSON. A parameter the
+ * schema does not mention falls back to reading the text. charmbracelet's client names
+ * background shells "001", "00A", and a guess that wrote 001 as a number made every
+ * job_output call arrive as invalid JSON, which the client then replaced with {}.
+ * The pointer is borrowed and has to outlive the parser; NULL means no schema. */
+void qe_turn_set_tools(qe_turn *t, const qe_json *tools);
+
 /* One decoded token. `utf8` is its text and must be empty for a control token,
  * which is what the engine reports. Non-zero stops generation (a client that
- * went away). Malformed structure is skipped, never forwarded as answer text. */
+ * went away). Malformed structure is skipped, never forwarded as answer text.
+ *
+ * One rescue happens at the turn close. A turn that closes while its reasoning block
+ * is still open, having written no answer and asked for nothing, wrote its answer
+ * inside the reasoning: the reasoning text is then reported once more as answer text,
+ * just before the stop. Without it the reply holds nothing a client shows, and a
+ * sub-agent whose last turn is that shape hands its parent "produced no text output"
+ * after minutes of work. A turn cut off by the budget is not rescued - it did not
+ * choose to end, and finish_reason length already says so. */
 int qe_turn_token(qe_turn *t, int id, const char *utf8, int nbytes);
 /* Flushes what is pending at the end of generation: text held back inside an
  * unterminated block is dropped, because a reply cut off mid-request is

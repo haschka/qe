@@ -231,10 +231,14 @@ static void f_call(feed *f, const char *name, const char *const *keys, const cha
 /* Feeds every piece, in order, and reports how many calls the parser refused to
  * continue on: a nonzero return from the callback contract is how a server stops
  * generation, so it must never happen for ordinary text. */
+/* The tools[] the next feed is parsed against, as a request would hand it over. */
+static const qe_json *feed_tools;
+
 static int f_feed_stem(feed *f, captured *c, int starts_in_reasoning, const char *stem) {
     qe_turn *t = qe_turn_new(cap_cb, c, starts_in_reasoning);
     int refused = 0;
     qe_turn_set_id_prefix(t, stem);
+    qe_turn_set_tools(t, feed_tools);
     for (size_t i = 0; i < f->n; i++) {
         const char *text = f->v[i].text ? f->v[i].text : "";
         int nbytes = f->v[i].text ? (int)strlen(text) : 0;
@@ -326,6 +330,85 @@ static void test_parser(void) {
         cap_free(&c);
         cleared();
     }
+
+    /* The schema decides. A shell id is "001": a number to a guess, which wrote it
+     * as 001 - not JSON, so the client threw the arguments away - and a string to
+     * the schema. A string parameter keeps the text as written, indentation and
+     * quotes included, because an edit's old_string has to match the file. A number
+     * the schema asked for is written as JSON even when the model spelled it 007. */
+    {
+        const char *schema =
+            "[{\"type\":\"function\",\"function\":{\"name\":\"job_output\",\"parameters\":"
+            "{\"type\":\"object\",\"properties\":{\"shell_id\":{\"type\":\"string\"},"
+            "\"wait\":{\"type\":\"boolean\"},\"lines\":{\"type\":\"integer\"},"
+            "\"mode\":{\"enum\":[\"a\",\"b\"]},\"note\":{\"type\":[\"string\",\"null\"]},"
+            "\"opts\":{\"type\":\"object\"}}}}}]";
+        qe_json *tools = qe_json_parse(schema, strlen(schema), NULL, 0);
+        CHECK(tools != NULL, "test schema did not parse");
+        feed_tools = tools;
+        const char *keys[] = { "shell_id", "wait", "lines", "mode", "note", "opts", "free" };
+        const char *vals[] = { "001", "true", "007", "true", "  \"quoted\"\n\tindented",
+                               "{\"a\": 01, \"b\": [1, 2]}", "00A" };
+        f_call(&f, "job_output", keys, vals, 7);
+        f_tok(&f, QE_MARK_TURN_CLOSE);
+        f_feed(&f, &c, 0);
+        CHECK_STR(c.args.p,
+                  "{\"shell_id\":\"001\",\"wait\":true,\"lines\":7,\"mode\":\"true\","
+                  "\"note\":\"  \\\"quoted\\\"\\n\\tindented\",\"opts\":{\"a\":1,\"b\":[1,2]},"
+                  "\"free\":\"00A\"}|",
+                  "arguments typed by the schema");
+        cap_free(&c);
+        cleared();
+        feed_tools = NULL;
+
+        /* With no schema at all a leading zero still cannot become a number. */
+        const char *k2[] = { "shell_id", "n" };
+        const char *v2[] = { "001", "0" };
+        f_call(&f, "job_output", k2, v2, 2);
+        f_tok(&f, QE_MARK_TURN_CLOSE);
+        f_feed(&f, &c, 0);
+        CHECK_STR(c.args.p, "{\"shell_id\":\"001\",\"n\":0}|", "no schema, leading zero");
+        cap_free(&c);
+        cleared();
+        qe_json_free(tools);
+    }
+
+    /* A turn that closes inside its reasoning, having said nothing else, wrote its
+     * answer there: it comes out as the answer, once, before the stop. A sub-agent
+     * whose last turn had this shape used to hand its parent no text at all. */
+    f_text(&f, "The report: ");
+    f_text(&f, "three bugs.\n");
+    f_tok(&f, QE_MARK_TURN_CLOSE);
+    CHECK(f_feed(&f, &c, 1) == 0, "rescue stopped the callback chain");
+    CHECK_STR(c.reasoning.p, "The report: three bugs.\n", "rescued reasoning still reasoning");
+    CHECK_STR(c.content.p, "The report: three bugs.", "unclosed reasoning becomes the answer");
+    CHECK_STR(c.finish, "stop", "rescued finish");
+    CHECK(c.order[c.n_order - 1] == QE_TURN_STOP && c.order[c.n_order - 2] == QE_TURN_CONTENT,
+          "the rescued answer comes just before the stop");
+    cap_free(&c);
+    cleared();
+
+    /* ...and nothing is rescued when the block closed, when there was an answer or a
+     * request, or when the turn never closed (the budget ran out). */
+    f_text(&f, "thought");
+    f_tok(&f, QE_MARK_REASON_CLOSE);
+    f_tok(&f, QE_MARK_TURN_CLOSE);
+    f_feed(&f, &c, 1);
+    CHECK(c.content.len == 0, "a closed reasoning block was rescued");
+    cap_free(&c);
+    cleared();
+    f_text(&f, "thought");
+    f_call(&f, "f", NULL, NULL, 0);
+    f_tok(&f, QE_MARK_TURN_CLOSE);
+    f_feed(&f, &c, 1);
+    CHECK(c.content.len == 0 && c.n_calls == 1, "a turn with a request was rescued");
+    cap_free(&c);
+    cleared();
+    f_text(&f, "cut off mid-thou");
+    f_feed(&f, &c, 1);
+    CHECK(c.content.len == 0, "a turn the budget cut was rescued");
+    cap_free(&c);
+    cleared();
 
     /* Two requests in one turn: distinct indexes and distinct ids, because a
      * client accumulates deltas per index and matches results by id. */
@@ -658,6 +741,71 @@ static void test_render(qe_tok *t) {
             show("single user turn", r.prompt.p);
         qe_chat_free(&r);
         qe_json_free(b);
+    }
+
+    /* An image, the way charmbracelet's client sends a viewed file: a user message
+     * of one image part after the tool result. With a tower it is the template's three
+     * markers - exactly one image pad, which the engine turns into the image's rows -
+     * and the pad is one id; without one it is a sentence that says it cannot be seen. */
+    {
+        const char *js =
+            "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":"
+            "\"what is this\"},{\"type\":\"image_url\",\"image_url\":{\"url\":"
+            "\"data:image/png;base64,iVBORw0KGgo=\"}}]}]}";
+        qe_json *b = body(js);
+        qe_chat r = { 0 };
+        qe_chat_opts o = { .enable_thinking = 1, .effort_xhigh = 1, .preserve_thinking = 1,
+                           .vision = 1 };
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render image: %s", err);
+        CHECK(r.vision && r.n_images == 1, "vision render: vision %d, images %d", r.vision,
+              r.n_images);
+        long cap = (long)r.prompt.len + 8, pads = 0, opens = 0;
+        int *ids = malloc((size_t)cap * sizeof *ids);
+        long got = ids ? qe_tok_encode(t, r.prompt.p, ids, cap) : -1;
+        for (long k = 0; k < got; k++) {
+            pads += ids[k] == QE_MARK_IMAGE_PAD;
+            opens += ids[k] == QE_MARK_VISION_OPEN;
+        }
+        CHECK(pads == 1 && opens == 1, "one image is one pad (%ld) inside one open (%ld)", pads,
+              opens);
+        CHECK(strstr(r.prompt.p, "cannot") == NULL, "a seen image carries the unseen note");
+        free(ids);
+        qe_chat_free(&r);
+        o.vision = 0;
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render image off: %s", err);
+        CHECK(!r.vision && strstr(r.prompt.p, "not visible to you") != NULL,
+              "an unseen image does not say so");
+        qe_chat_free(&r);
+        qe_json_free(b);
+
+        /* The template refuses an image in a system message; so does this. */
+        b = body("{\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"image_url\","
+                 "\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]},"
+                 "{\"role\":\"user\",\"content\":\"x\"}]}");
+        o.vision = 1;
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) != 0, "a system image was rendered");
+        qe_chat_free(&r);
+        qe_json_free(b);
+
+        /* Past the limit the oldest go: the last image a request carries is the one a
+         * client is asking about. */
+        qe_str big = { 0 };
+        qe_str_puts(&big, "{\"messages\":[");
+        for (int i = 0; i < QE_CHAT_MAX_IMAGES + 3; i++)
+            qe_str_appendf(&big, "%s{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+                                 "\"image_url\":{\"url\":\"data:image/png;base64,%s\"}}]}",
+                           i ? "," : "", i == QE_CHAT_MAX_IMAGES + 2 ? "TEFTVA==" : "iVBORw0KGgo=");
+        qe_str_puts(&big, "]}");
+        b = body(big.p);
+        CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render many images: %s", err);
+        CHECK(r.n_images == QE_CHAT_MAX_IMAGES && r.truncated_images,
+              "many images: %d kept, truncated %d", r.n_images, r.truncated_images);
+        CHECK(r.n_images > 0 && r.images[r.n_images - 1].len == 4 &&
+                  !memcmp(r.images[r.n_images - 1].bytes, "LAST", 4),
+              "the newest image was the one left out");
+        qe_chat_free(&r);
+        qe_json_free(b);
+        qe_str_free(&big);
     }
 
     /* Thinking off: no effort sentence, and an empty reasoning block instead of

@@ -151,6 +151,13 @@ static void request_log(const char *kind, const char *id, long prompt_tokens,
              gs->seconds > 0 ? (double)gs->steps / gs->seconds : 0.0,
              content_bytes, thinking_bytes, n_calls, finish ? finish : "-",
              streamed ? " stream" : "", client_left ? " client-left" : "");
+    if (gs->images > 0) {
+        /* What the images cost, in the same line: rows of prompt they became, and how
+         * many of them went through the tower (the rest were in the reused prefix). */
+        const size_t used = strlen(line);
+        snprintf(line + used, sizeof line - used, " images=%d rows=%ld encoded=%d vision=%.2f s",
+                 gs->images, gs->image_rows, gs->images_encoded, gs->vision_seconds);
+    }
     if (qe_ui_on()) {
         /* The panel's own history row: the same request in one 80-column line, with the
          * two halves of the wall quoted at their own rates - a prompt read at 60 tok/s
@@ -748,7 +755,8 @@ static int render_plain(const qe_json *messages, qe_chat *r, char *why, size_t w
                 }
                 if (qe_chat_record_image(r, url, why, whyn))
                     return -1;
-                qe_str_appendf(&r->prompt, "[image %d: %s, %zu bytes]\n", r->n_images,
+                qe_str_appendf(&r->prompt, "[image %d: %s, %zu bytes. " QE_CHAT_IMAGE_NOTE "]\n",
+                               r->n_images,
                                r->image_mime[r->n_images - 1], r->images[r->n_images - 1].len);
             }
             qe_str_puts(&r->prompt, "\n");
@@ -790,9 +798,24 @@ static int sampling_from_body(const qe_json *body, int n_vocab, qe_gen_opts *go,
                               char *why, size_t whyn) {
     const qe_json *v;
 
-    if (go->temp < 0.0f) {
-        snprintf(why, whyn, "'temperature' must not be negative");
-        return -1;
+    /* Absent (or null) is the server's default, which is the checkpoint's own
+     * general.sampling.temp unless --temp said otherwise: the engine reads a
+     * negative temperature as "not sent". It used to be read as 0, which made every
+     * request from a client that does not send one - charmbracelet's, unless a
+     * temperature is configured per model - a greedy decode of a reasoning model,
+     * and greedy reasoning is where a thinking block goes round in circles for
+     * thirty thousand bytes and closes the turn without an answer. */
+    go->temp = -1.0f;
+    if ((v = qe_json_at(body, "temperature")) && v->kind != QE_JSON_NULL) {
+        if (v->kind != QE_JSON_NUM) {
+            snprintf(why, whyn, "'temperature' must be a number");
+            return -1;
+        }
+        if (v->num < 0.0) {
+            snprintf(why, whyn, "'temperature' must not be negative");
+            return -1;
+        }
+        go->temp = v->num > 100.0 ? 100.0f : (float)v->num;
     }
     if ((v = qe_json_at(body, "top_k"))) {
         if (v->kind != QE_JSON_NUM) {
@@ -888,6 +911,10 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
      * reasoning text is replayed as an empty block is one rule for the whole
      * server, because a transcript that mixes the two teaches the model both. */
     co.empty_thinking_blocks = st->o.empty_thinking_blocks;
+    /* Images are shown when there is a tower to show them to, and only on the serial
+     * lane: an encode needs the whole pool, and the batched lane's driver walks the
+     * weights on it outside the engine's lock. */
+    co.vision = st->info.has_vision && st->info.n_batch <= 1;
     qe_chat r = { 0 };
     qe_tok *tk = qe_engine_tok(st->eng);
     int rc = tk && qe_chat_supported(tk) ? qe_chat_render(tk, body, &co, &r, err, sizeof err)
@@ -906,7 +933,6 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
     long mt = asked_budget(body, st->info.n_ctx, 1);
     qe_gen_opts go = {
         .max_tokens = (int)mt,
-        .temp = (float)qe_json_num_at(body, "temperature", 0.0),
         .seed = (unsigned)qe_json_num_at(body, "seed", 0),
         .spec_k = (int)qe_json_num_at(body, "qe_spec_k", st->info.spec_k),
         .eos = -1,
@@ -949,6 +975,7 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
      * under the id for the length of the conversation, so an id repeated in a later
      * turn is a call that never appears and a result filed against the wrong call. */
     qe_turn_set_id_prefix(k.turn, id);
+    qe_turn_set_tools(k.turn, qe_json_at(body, "tools"));
 
     if (stream) {
         if (qe_http_sse_head(c)) {
@@ -973,11 +1000,15 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
     }
 
     qe_gen_stats gs = { 0 };
+    errno = 0;
     long n = qe_engine_generate_tokens(st->eng, &p, &go, chat_token, &k, &gs);
+    const int gen_errno = errno;
     go.progress = NULL;
     go.progress_user = NULL;
     qe_turn_end(k.turn);
-    long prompt_tokens = count_prompt_tokens(st->eng, p.text);
+    /* The rows the pass read, when the engine counted them: an image is its merged grid
+     * of rows and not the three tokens that mark its place in the text. */
+    long prompt_tokens = gs.prompt_rows > 0 ? gs.prompt_rows : count_prompt_tokens(st->eng, p.text);
     long reasoning_tokens = k.reasoning.len ? count_prompt_tokens(st->eng, k.reasoning.p) : 0;
     /* Three ways a reply ends, and a client has to be able to tell them apart:
      * the model closed its own turn, it ran out of the budget it was given, and
@@ -987,7 +1018,19 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
                    : gs.truncated ? "length"
                                     : (k.n_calls ? "tool_calls" : "stop");
     if (n < 0 && !k.chunk_failed) {
-        qe_http_error(c, 500, "server_error", "generation failed");
+        /* The reason travels with the error: "generation failed" alone is what a
+         * client retried three times on, and a prompt that cannot fit the window
+         * (ENOSPC) fails identically on every retry. */
+        char gmsg[256];
+        if (gs.error[0])
+            snprintf(gmsg, sizeof gmsg, "%s", gs.error);
+        else
+            snprintf(gmsg, sizeof gmsg, "generation failed: %s%s",
+                     gen_errno ? strerror(gen_errno) : "engine error",
+                     gen_errno == ENOSPC ? " (the prompt does not fit the context window)" : "");
+        fprintf(stderr, "qe: chat %s %s\n", id, gmsg);
+        qe_http_error(c, gs.error[0] ? 400 : 500,
+                      gs.error[0] ? "invalid_request_error" : "server_error", gmsg);
         sink_free(&k);
         qe_turn_free(k.turn);
         free(id);
@@ -1028,12 +1071,17 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
         return 0;
     }
 
-    char extra[640];
+    char extra[800];
     snprintf(extra, sizeof extra,
              "\"measured\":{\"tokens\":%ld,\"target_passes\":%ld,\"drafted\":%ld,"
              "\"accepted\":%ld,\"tok_per_step\":%.3f,\"seconds\":%.6f,"
              "\"tok_per_s\":%.2f,\"passes_per_s\":%.1f,\"spec_k\":%d,\"messages\":%ld,"
              "\"images\":%d,\"image_bytes\":%zu,\"images_truncated\":%d,"
+             /* Whether the images were seen and what they cost: the rows they became,
+              * how many went through the tower this request (an image already in the
+              * reused prefix does not), and its seconds. */
+             "\"images_seen\":%d,\"image_rows\":%ld,\"images_encoded\":%d,"
+             "\"vision_seconds\":%.3f,"
              "\"reasoning_bytes\":%zu,\"tool_calls\":%d,\"thinking\":%d,\"effort\":\"%s\","
              /* The budget the reply actually ran under: what was asked for, or
               * what the window left after the prompt. A client that sent no
@@ -1055,7 +1103,8 @@ static int handle_chat(qe_http_conn *c, const qe_http_req *req, server *st) {
              gs.seconds > 0 ? (double)gs.tokens / gs.seconds : 0.0,
              gs.seconds > 0 ? (double)gs.steps / gs.seconds : 0.0,
              go.spec_k, r.n_messages,
-             r.n_images, r.image_bytes, r.truncated_images, k.reasoning.len, k.n_calls,
+             r.n_images, r.image_bytes, r.truncated_images, gs.images, gs.image_rows,
+             gs.images_encoded, gs.vision_seconds, k.reasoning.len, k.n_calls,
              co.enable_thinking, co.effort_low ? "low" : (co.effort_xhigh ? "xhigh" : "medium"),
              gs.budget, r.tools_rendered, gs.cached, gs.dropped,
              gs.rewound ? "true" : "false", gs.rewind_lcp, (double)gs.snapshot_us / 1000.0);
@@ -1167,7 +1216,6 @@ static int handle_completions(qe_http_conn *c, const qe_http_req *req, server *s
     long mt = asked_budget(body, st->info.n_ctx, 0);
     qe_gen_opts go = {
         .max_tokens = (int)mt,
-        .temp = (float)qe_json_num_at(body, "temperature", 0.0),
         .seed = (unsigned)qe_json_num_at(body, "seed", 0),
         .spec_k = (int)qe_json_num_at(body, "qe_spec_k", st->info.spec_k),
         .eos = -1,
@@ -1504,6 +1552,12 @@ int qe_serve(const qe_serve_opts *opts) {
             fprintf(stderr, "qe: draft head: staged, not walked - drafts come from the n-gram"
                             " drafter, so the nextn layer in this file is not what is drafting\n");
     }
+    if (st.info.has_vision)
+        fprintf(stderr, "qe: vision: images are seen, at most %d rows each (--image-max-tokens)%s\n",
+                st.info.image_max_tokens,
+                st.info.n_batch > 1 ? "; with --batch they are described instead" : "");
+    else if (o.engine.mmproj_path)
+        fprintf(stderr, "qe: vision: off, images are described in the prompt text\n");
     if (!st.info.can_generate)
         fprintf(stderr, "qe: %s\n", st.info.why);
 

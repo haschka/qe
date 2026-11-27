@@ -28,7 +28,11 @@ static void usage(const char *argv0) {
            "                      QE_HUGEPAGE_DIR and a reserved pool). mmap is refused:\n"
            "                      it reads weights off disk per token, and is accepted\n"
            "                      only together with --report, which wants headers.\n"
-           "  --mmproj PATH       vision projector GGUF, also placed in RAM at startup\n"
+           "  --mmproj PATH       vision projector GGUF, also placed in RAM at startup; its\n"
+           "                      tower encodes the images a request carries\n"
+           "  --image-max-tokens N  rows one image may become (default 4096, llama.cpp's);\n"
+           "                      an image is resampled to fit. Fewer is faster to encode\n"
+           "                      and to read: 1024 is a 1024x1024 screenshot\n"
            "  --mtp PATH          draft-head GGUF, the nextn block these checkpoints are\n"
            "                      shipped with as a sidecar file. Its bytes are placed\n"
            "                      in RAM at startup like every other weight byte, and a\n"
@@ -114,7 +118,8 @@ static void usage(const char *argv0) {
            "  --spec-k N           draft length for speculative decoding (default: 1\n"
            "                      with a --mtp head and 2 with the n-gram drafter,\n"
            "                      which is what this host measures worth it; 0 off)\n"
-           "  --temp X             default temperature (0 = greedy)\n"
+           "  --temp X             temperature for requests that send none (0 = greedy;\n"
+           "                      default: the checkpoint's general.sampling.temp)\n"
            "  --top-k N            default top-k: 0 keeps the file's own (20 here),\n"
            "                      -1 turns it off\n"
            "  --top-p X            default nucleus mass: 0 keeps the file's own (0.95),\n"
@@ -190,7 +195,7 @@ int main(int argc, char **argv) {
     o.port = 8080;
     o.engine.spec_k = QE_SPEC_K_AUTO;
     int fuse = 0, report = 0;
-    float tmp_temp = 0.0f;
+    float tmp_temp = -1.0f; /* not given: the checkpoint's general.sampling.temp */
     const char *stage_s = NULL;
     const char *ui_s = NULL;
 
@@ -206,6 +211,8 @@ int main(int argc, char **argv) {
             as_str = &stage_s;
         else if (!strcmp(a, "--mmproj"))
             as_str = &o.engine.mmproj_path;
+        else if (!strcmp(a, "--image-max-tokens"))
+            as_int = &o.engine.image_max_tokens;
         else if (!strcmp(a, "--mtp"))
             as_str = &o.engine.mtp_path;
         else if (!strcmp(a, "--id"))
