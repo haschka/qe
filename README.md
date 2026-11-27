@@ -234,7 +234,10 @@ What happens to the image, all of it in this tree (`src/vision.c`, docs/DESIGN.m
   screenshot in a few seconds.
 
 Up to 32 images a request; past that the oldest are left out, because an agent
-resends its history and the image it is asking about is the newest. With `--batch N`
+resends its history and the image it is asking about is the newest. They are left out
+16 at a time, so the front of the prompt stays the same for the next 16 images and the
+turn cache keeps working: one at a time, every new image changed the prompt where the
+oldest had been and the whole session was read again. With `--batch N`
 images are described in text instead, because an encode needs the whole thread pool;
 the model is told why, in a sentence that names `--batch 1`, so what reaches the user
 is the setting that fixes it. The request itself is not refused: an agent resends its

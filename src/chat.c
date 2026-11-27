@@ -809,7 +809,10 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
         }
     }
 
-    /* The oldest images over the limit are the ones left out, so count them first. */
+    /* The oldest images over the limit are the ones left out, so count them first, and
+     * leave them out in whole steps (QE_CHAT_IMAGE_DROP_STEP): the count left out moves
+     * once a step rather than at every new image, so the prompts in between agree with
+     * each other from the front and the turn cache can go back into them. */
     {
         int total = 0;
         for (size_t i = 0; i < nm; i++) {
@@ -822,7 +825,8 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
                          !strcmp(ty, "input_image");
             }
         }
-        r->image_skip = total > QE_CHAT_MAX_IMAGES ? total - QE_CHAT_MAX_IMAGES : 0;
+        const int over = total - QE_CHAT_MAX_IMAGES, step = QE_CHAT_IMAGE_DROP_STEP;
+        r->image_skip = over > 0 ? (over + step - 1) / step * step : 0;
     }
 
     /* ---- the leading system run, trimmed and joined (template: sysns walk) */
@@ -976,9 +980,15 @@ int qe_chat_render(qe_tok *t, const qe_json *body, const qe_chat_opts *o, qe_cha
              * client that stores thinking for its own UI and does not resend it -
              * would otherwise be a demonstration of not thinking, forty times over
              * on a long coding session. Render the block when there is thinking in
-             * it, and when the operator asked for the template-faithful empty one. */
+             * it, and when the operator asked for the template-faithful empty one.
+             * And when this request does not think: then not thinking is what the
+             * turns were, and the empty block is what the generation prompt of the
+             * request before held - without it the next prompt parts from that one
+             * four tokens before its end, and no turn ever goes back to its own
+             * rewind point, so every one of them reads the whole conversation. */
             int keep_reasoning = o->preserve_thinking || i > last_query;
-            if (keep_reasoning && (reason.n || o->empty_thinking_blocks)) {
+            if (keep_reasoning &&
+                (reason.n || o->empty_thinking_blocks || !o->enable_thinking)) {
                 qe_str_puts(&r->prompt, mk.reason_open);
                 qe_str_puts(&r->prompt, "\n");
                 qe_str_append(&r->prompt, reason.p, reason.n);

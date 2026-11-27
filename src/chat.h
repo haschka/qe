@@ -57,8 +57,13 @@
 
 /* Images one request may carry. A coding agent sends its whole history every turn,
  * screenshots included, so past this count the oldest ones are left out - the one the
- * user is asking about is the newest. */
+ * user is asking about is the newest. They are left out QE_CHAT_IMAGE_DROP_STEP at a
+ * time rather than one by one: dropping the oldest image changes the prompt where that
+ * image stood, near its start, and every token after it has to be read again. One at a
+ * time, that is every image turn of a long session re-reading the whole of it; in steps,
+ * the front stays put for the next step's worth of images. */
 #define QE_CHAT_MAX_IMAGES 32
+#define QE_CHAT_IMAGE_DROP_STEP (QE_CHAT_MAX_IMAGES / 2)
 #define QE_CHAT_MIME_MAX 64
 #define QE_CHAT_MAX_IMAGE_BYTES (32u << 20)
 /* What the transcript says where an image was when it cannot be shown. A bare

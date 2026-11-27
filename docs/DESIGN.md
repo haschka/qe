@@ -516,7 +516,11 @@ Deliberate choices, each of which is a trade and not an oversight:
   conversation. Whether that shape is worse than the template-faithful one is a
   claim about the model and not about this server, so it is a switch:
   `--empty-thinking-blocks` renders the empty block, and the banner prints which
-  rule is on so that anyone measuring an answer knows what the prompt said.
+  rule is on so that anyone measuring an answer knows what the prompt said. A
+  request with thinking off renders the empty block regardless: its own generation
+  prompt ends in one, so leaving it out of the replayed turn made every prompt part
+  from the one before four tokens short of that prompt's end, and no turn could go
+  back to its rewind point.
   `make chat` pins all three renders: quiet turn with no block, quiet turn with the
   flag on, and an assistant turn last.
 - **A turn that showed nothing is the engine's to report.** The client discards an
@@ -896,6 +900,16 @@ second sub-agent's ~800 MiB range arrives, and the main session then reads one 3
 prompt again. Hence the 4 GiB default. `make prefix` asserts the interleaved case on
 the checkpoint: the follow-up rewinds through kept cells and its continuation is the
 cold one token for token.
+
+Images had a cache problem of their own, and it was in the renderer. A request keeps
+its newest 32 images, and the 33rd used to push out the oldest one, which stood near
+the front of the prompt. That changed the prompt at that point, and every new image
+after it did the same with the next oldest, so each image turn of a long session read
+the whole session again. Replayed offline, a real 129-request crush session with 39
+screenshots read 986k of its 8.28 M prompt rows, nearly all of them from request 106
+on, each time about 100k rows. Images are now left out 16 at a time
+(`QE_CHAT_IMAGE_DROP_STEP`), so the front stays the same for the next 16 images: the
+same replay reads 217k rows (2.7 %), with one full re-read where the step is taken.
 
 ### Shutdown is a request path
 

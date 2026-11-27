@@ -857,7 +857,8 @@ static void test_render(qe_tok *t) {
         qe_str_puts(&big, "]}");
         b = body(big.p);
         CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0, "render many images: %s", err);
-        CHECK(r.n_images == QE_CHAT_MAX_IMAGES && r.truncated_images,
+        CHECK(r.n_images == QE_CHAT_MAX_IMAGES + 3 - QE_CHAT_IMAGE_DROP_STEP &&
+                  r.truncated_images,
               "many images: %d kept, truncated %d", r.n_images, r.truncated_images);
         CHECK(r.n_images > 0 && r.images[r.n_images - 1].len == 4 &&
                   !memcmp(r.images[r.n_images - 1].bytes, "LAST", 4),
@@ -865,6 +866,34 @@ static void test_render(qe_tok *t) {
         qe_chat_free(&r);
         qe_json_free(b);
         qe_str_free(&big);
+
+        /* ...and they go a step at a time: from one past the limit to a step past it,
+         * the same oldest images are left out, so the prompts of those turns agree from
+         * the front and a long session with screenshots is not read again at every new
+         * one. One at a time, image 33 changed the prompt where image 1 stood. */
+        const int counts[] = { QE_CHAT_MAX_IMAGES, QE_CHAT_MAX_IMAGES + 1,
+                               QE_CHAT_MAX_IMAGES + QE_CHAT_IMAGE_DROP_STEP,
+                               QE_CHAT_MAX_IMAGES + QE_CHAT_IMAGE_DROP_STEP + 1 };
+        const int skips[] = { 0, QE_CHAT_IMAGE_DROP_STEP, QE_CHAT_IMAGE_DROP_STEP,
+                              2 * QE_CHAT_IMAGE_DROP_STEP };
+        for (int c = 0; c < 4; c++) {
+            qe_str many = { 0 };
+            qe_str_puts(&many, "{\"messages\":[");
+            for (int i = 0; i < counts[c]; i++)
+                qe_str_appendf(&many, "%s{\"role\":\"user\",\"content\":[{\"type\":"
+                                      "\"image_url\",\"image_url\":{\"url\":"
+                                      "\"data:image/png;base64,iVBORw0KGgo=\"}}]}",
+                               i ? "," : "");
+            qe_str_puts(&many, "]}");
+            b = body(many.p);
+            CHECK(qe_chat_render(t, b, &o, &r, err, sizeof err) == 0 &&
+                      r.image_skip == skips[c] && r.n_images == counts[c] - skips[c],
+                  "%d images: %d left out, %d kept (want %d left out)", counts[c],
+                  r.image_skip, r.n_images, skips[c]);
+            qe_chat_free(&r);
+            qe_json_free(b);
+            qe_str_free(&many);
+        }
     }
 
     /* The bytes the model's own template writes, as transformers and llama.cpp apply it
@@ -953,6 +982,34 @@ static void test_render(qe_tok *t) {
         CHECK(qe_chat_opts_from_body(b, &o, e2, sizeof e2) == 0, "max should be accepted");
         CHECK(o.effort_xhigh == 1 && o.enable_thinking, "max should mean xhigh");
         qe_json_free(b);
+    }
+    /* A conversation that does not think comes back as a prefix of itself: the turn
+     * it was given is rendered with the empty block its generation prompt held, so
+     * the next prompt begins with the last one and the turn cache can go back to it.
+     * Without the block they parted four tokens before the end of the first prompt. */
+    {
+        const char *b1s = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+                          "\"reasoning_effort\":\"none\"}";
+        const char *b2s = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},"
+                          "{\"role\":\"assistant\",\"content\":\"Hello!\"},"
+                          "{\"role\":\"user\",\"content\":\"again\"}],"
+                          "\"reasoning_effort\":\"none\"}";
+        qe_json *b1 = body(b1s), *b2 = body(b2s);
+        qe_chat_opts o1, o2;
+        qe_chat r1 = { 0 }, r2 = { 0 };
+        CHECK(qe_chat_opts_from_body(b1, &o1, err, sizeof err) == 0 &&
+                  qe_chat_opts_from_body(b2, &o2, err, sizeof err) == 0 && !o1.enable_thinking,
+              "effort none: %s", err);
+        CHECK(qe_chat_render(t, b1, &o1, &r1, err, sizeof err) == 0 &&
+                  qe_chat_render(t, b2, &o2, &r2, err, sizeof err) == 0,
+              "render effort none: %s", err);
+        CHECK(r1.prompt.p && r2.prompt.p && r2.prompt.len > r1.prompt.len &&
+                  !memcmp(r1.prompt.p, r2.prompt.p, r1.prompt.len),
+              "a turn without thinking extends the prompt it answered");
+        qe_chat_free(&r1);
+        qe_chat_free(&r2);
+        qe_json_free(b1);
+        qe_json_free(b2);
     }
 
     /* Tools: the schema block, then the format instructions, then the caller's

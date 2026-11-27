@@ -351,7 +351,11 @@ nothing*, and a client that never sends thinking back - charmbracelet's does not
 would then replay an assistant that never thinks. `--empty-thinking-blocks`
 restores the template-faithful form, one empty block per replayed turn, and exists
 so the two prompt shapes can be measured against each other rather than to be
-turned on by default; the banner prints which rule is on. A turn that did carry
+turned on by default; the banner prints which rule is on. A request that does not
+think (`reasoning_effort: none`) is the exception: its replayed turns get the empty
+block, because that is what they were and what its generation prompt held. Without
+it, every next prompt parted from the last one four tokens before that prompt's end,
+and such a conversation never reused a token. A turn that did carry
 reasoning is replayed with it either way, subject to the request's own
 `preserve_thinking`, whose default keeps the whole conversation's reasoning.
 
@@ -590,8 +594,9 @@ that followed a reasoning block with no text was preceded by one newline too man
 Both are fixed, a 49,312-character crush prompt from a real session now renders
 identically to the template, and `bench_chat` holds the bytes. The one remaining
 deliberate difference is `--empty-thinking-blocks`: an assistant turn sent with no
-reasoning renders no block unless that switch is on, where the template always writes
-an empty one; crush sends reasoning with every turn, so it does not meet it.
+reasoning renders no block unless that switch is on or the request does not think,
+where the template always writes an empty one; crush sends reasoning with every turn,
+so it does not meet it.
 
 A tool call is opened to the client as soon as the model has written its function's
 name, and its arguments follow, whole and schema-typed, when its block closes. crush
