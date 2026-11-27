@@ -856,6 +856,47 @@ is left from the beginning. Closing that means boundaries inside a prompt, which
 either a copy per chunk or a delta rule that can be run backwards, and neither is a
 few milliseconds.
 
+### A rewind point stands on cells another prompt can overwrite
+
+The 8.9 ms above is cheap because a point copies the recurrences and nothing else. The
+keys and values, the indexer's keys and pool, and the rope positions stay in the shared
+caches at the cells they were written to. A point is therefore the state of its prefix
+only while those cells still hold that prefix. Every prompt fed from a lower position
+writes over them: a client's title request between two turns, a sub-agent, another
+session. Until this was found, the engine restored such a point anyway, putting one
+conversation's recurrent state on top of another's attention context. On the
+checkpoint the test is unambiguous: a system prompt holds a code word, a short first
+turn, an unrelated 1009-token prompt, then the follow-up "what is the code word". Put
+back over the overwritten cells, the model answered that there was none.
+
+Two changes, in `src/engine.c`:
+
+- **Honest matching.** `cells_held` is the agreement of the prompt with the transcript
+  that was last fed, from cell 0. A point beyond it is not a match. That alone is
+  correct, but it makes interleaving expensive. Replayed offline over a real crush
+  session with its two sub-agents (46 requests, 1.04 M prompt rows), the share of rows
+  read goes from 12.0 % (fast and wrong) to 78.1 % (correct).
+- **Kept cells.** Before a prompt overwrites cells from position `h` on,
+  `spans_save` copies `[h, end)` aside, where `end` is the longest held prompt-end point
+  that still stands on those cells. It does this only if such a point exists, and only
+  for prompt-end points: an answer-end point is the generated answer, which a client
+  that re-renders its history never sends again. A later prompt that matches a point
+  beyond `h` through a kept range gets the range put back (`qe_forward_cells_put`)
+  before the point is restored. A range whose every served point a newer range of the
+  same conversation also serves is dropped. Without that, two sub-agents taking turns
+  keep each other's history again at every switch. Otherwise the least recently used
+  range goes first. The copy is about 20 KiB a cell (K and V of the 12 attention
+  layers, the indexer's keys, the pool blocks the range touches, ids and positions).
+  The budget is `QE_KV_SPAN_MIB`, default 4096.
+
+The same offline replay with kept cells reads 14.7 % of the rows at a 2 GiB budget
+and 12.0 % at 3 or 4 GiB, which is the fast path's figure with the wrong answers taken
+out. At 2 GiB the main session's 551 MiB range is the least recently used when the
+second sub-agent's ~800 MiB range arrives, and the main session then reads one 36k
+prompt again. Hence the 4 GiB default. `make prefix` asserts the interleaved case on
+the checkpoint: the follow-up rewinds through kept cells and its continuation is the
+cold one token for token.
+
 ### Shutdown is a request path
 
 Closing the listener is the part that already worked, and it is the part that was

@@ -631,6 +631,84 @@ int main(int argc, char **argv) {
         free(body3);
     }
 
+    /* ------------------------------ 6. another prompt between two turns */
+    printf("\n== a turn, an unrelated prompt, then the turn's follow-up ==\n");
+    fflush(stdout);
+    /* A rewind point holds the recurrences and nothing else; the keys and values it
+     * stands on stay in the caches, under the positions they were written at. A
+     * prompt fed in between - a title request, a sub-agent - writes over those cells,
+     * and putting the point back on top of them is one conversation's state over
+     * another's attention context: asked for the word its first turn held, the model
+     * said there was none. So the follow-up has to answer exactly as it does cold, and
+     * it has to have gone back to the point through the cells kept aside for it rather
+     * than reading its prompt again. */
+    {
+        const char *u1 = "Remember this: the code word is PELICAN-7319. Just say hi.";
+        const char *u2 = "What is the code word? Reply with only the code word.";
+        qe_str g = { 0 };
+        qe_str_puts(&g, "Give a title for these notes: ");
+        for (int i = 0; i < 60; i++)
+            qe_str_puts(&g, "Gardening: tomatoes need sun, basil needs water, roses need "
+                            "pruning. ");
+        char *ba = chat_body(u1, NULL, NULL, NULL);
+        char *ba2 = chat_body(u1, "The user greets me.", "Hi!", u2);
+        char *bb = g.err ? NULL : chat_body(g.p, NULL, NULL, NULL);
+        char *pa = ba ? render_prompt(ba, err, sizeof err) : NULL;
+        char *pa2 = ba2 ? render_prompt(ba2, err, sizeof err) : NULL;
+        char *pb = bb ? render_prompt(bb, err, sizeof err) : NULL;
+        run c1, c2, c3, rx;
+        if (!pa || !pa2 || !pb) {
+            printf("  FAIL could not render the interleaving case: %s\n", err);
+            fails++;
+        } else {
+            long sv0 = 0, pu0 = 0, sv1 = 0, pu1 = 0, ns = 0;
+            long long sb = 0, bud = 0;
+            int was3 = qe_engine_prefix_cache(E, 0);
+            if (do_run("cold", pa2, 0, &c1))
+                return 1;
+            qe_engine_prefix_cache(E, 1);
+            qe_engine_span_stats(E, &ns, &sb, &bud, &sv0, &pu0);
+            if (do_run("turn 1", pa, 4, &rx))
+                return 1;
+            run_free(&rx);
+            if (do_run("unrelated", pb, 4, &rx))
+                return 1;
+            run_free(&rx);
+            if (do_run("follow-up", pa2, 0, &c2))
+                return 1;
+            say("reply", c2.text, c2.tn);
+            qe_engine_span_stats(E, &ns, &sb, &bud, &sv1, &pu1);
+            CHECK(same_ids(&c1, &c2), "the follow-up answers token for token as it does cold "
+                                      "(%ld, %ld)", c1.n, c2.n);
+            if (bud > 0) {
+                CHECK(c2.st.rewound && c2.st.cached > 0 && pu1 > pu0,
+                      "it went back to its point through kept cells (%ld cached, %ld put back, "
+                      "%ld kept, %.1f MiB of %.0f)",
+                      c2.st.cached, pu1 - pu0, sv1 - sv0, (double)sb / 1048576.0,
+                      (double)bud / 1048576.0);
+            } else {
+                printf("       kept cells off (QE_KV_SPAN_MIB=0): %ld cached\n", c2.st.cached);
+            }
+            /* The same follow-up once more, now that its own prompt is what the
+             * caches hold: an ordinary carry-over, and the same answer again. */
+            if (do_run("again", pa2, 0, &c3))
+                return 1;
+            CHECK(same_ids(&c1, &c3), "and again with the cells its own (%ld cached)",
+                  c3.st.cached);
+            qe_engine_prefix_cache(E, was3);
+            run_free(&c1);
+            run_free(&c2);
+            run_free(&c3);
+        }
+        free(pa);
+        free(pa2);
+        free(pb);
+        free(ba);
+        free(ba2);
+        free(bb);
+        qe_str_free(&g);
+    }
+
     qe_engine_close(E);
     qe_pool_shutdown();
     printf("\n%s (%d checks, %d failures)\n", fails ? "FAIL" : "PASS", checks, fails);

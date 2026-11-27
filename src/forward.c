@@ -3590,6 +3590,81 @@ int qe_forward_snapshot(const qe_forward *f, qe_state *out) {
     return 0;
 }
 
+/* A range of cells, copied out of the caches or back into them.
+ *
+ * A rewind point is the recurrences only, and the cells under it stay in the caches,
+ * so a point is good exactly as long as those cells are. A prompt fed from a lower
+ * position writes over them, and the conversation the point belongs to has then lost
+ * its attention context. These two move cells [from, to) of sequence 0 in and out of a
+ * flat buffer, so the engine can keep the cells another prompt is about to overwrite and
+ * put them back when their conversation returns.
+ *
+ * Every array a cell has, for every attention slot (the draft head's included): its key
+ * and value rows, in whichever form the cache stores them, with their scales; the
+ * indexer's raw key; and the pooled keys of every block the range touches. A block that
+ * straddles `from` was pooled from cells on both sides, and the cells below `from` are
+ * the shared prefix by construction, so the copy is that block as it was. Then the id
+ * and the rope position of every cell. One walk does both directions, so the layout the
+ * bytes are written in and the layout they are read back in cannot differ. */
+static size_t cells_walk(qe_forward *f, long from, long to, char *buf, int put) {
+    const size_t NC = f->seq_stride;
+    const size_t krow = f->kv_row, nkvh = (size_t)f->n_kv_heads, id = (size_t)f->idx_dim;
+    const size_t n = (size_t)(to - from);
+    const long b0 = from / f->kpool_ratio, b1 = (to + f->kpool_ratio - 1) / f->kpool_ratio;
+    const size_t esz = f->idx_f16 ? 2 : 4;
+    size_t o = 0;
+#define MOVE(ptr, bytes)                                                                  \
+    do {                                                                                  \
+        if (buf) {                                                                        \
+            if (put)                                                                      \
+                memcpy((ptr), buf + o, (bytes));                                          \
+            else                                                                          \
+                memcpy(buf + o, (ptr), (bytes));                                          \
+        }                                                                                 \
+        o += (bytes);                                                                     \
+    } while (0)
+    for (int slot = 0; slot < f->qsa_slots; slot++) {
+        const long sub = qsa_sub(f, slot, 0);
+        for (int kv = 0; kv < 2; kv++) { /* keys, then values */
+            const size_t row0 = (size_t)kv * NC + (size_t)from;
+            if (f->kv)
+                MOVE(f->kv + ((size_t)sub * 2 * NC + row0) * krow, n * krow * sizeof(float));
+            if (f->kvd)
+                MOVE(f->kvd + ((size_t)sub * 2 * NC + row0) * krow, n * krow);
+            if (f->kvs)
+                MOVE(f->kvs + ((size_t)sub * 2 * NC + row0) * nkvh, n * nkvh * sizeof(float));
+        }
+        if (f->kraw)
+            MOVE(f->kraw + ((size_t)sub * NC + (size_t)from) * id, n * id * sizeof(float));
+        if (f->kpool && b1 > b0)
+            MOVE((char *)kpool_seq(f, sub) + (size_t)b0 * id * esz, (size_t)(b1 - b0) * id * esz);
+    }
+    MOVE(f->seq + from, n * sizeof *f->seq);
+    MOVE(f->rpos + (size_t)from * 3, n * 3 * sizeof(int32_t));
+#undef MOVE
+    return o;
+}
+
+size_t qe_forward_cells_bytes(qe_forward *f, long from, long to) {
+    if (!f || f->n_seq > 1 || from < 0 || to <= from || to > (long)f->seq_stride)
+        return 0;
+    return cells_walk(f, from, to, NULL, 0);
+}
+
+int qe_forward_cells_get(qe_forward *f, long from, long to, void *buf) {
+    if (!qe_forward_cells_bytes(f, from, to) || !buf)
+        return -1;
+    cells_walk(f, from, to, buf, 0);
+    return 0;
+}
+
+int qe_forward_cells_put(qe_forward *f, long from, long to, const void *buf) {
+    if (!qe_forward_cells_bytes(f, from, to) || !buf)
+        return -1;
+    cells_walk(f, from, to, (char *)buf, 1);
+    return 0;
+}
+
 int qe_forward_restore(qe_forward *f, const qe_state *in) {
     /* Refused for a batched pass for the reason a snapshot is: the state of a pass
      * driving n_seq sequences holds n_seq copies of every recurrence, and no caller of

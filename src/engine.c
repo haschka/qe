@@ -168,6 +168,20 @@ struct qe_engine {
     qe_model *mm;     /* checkpoint metadata, mapped read-only */
     qe_model *mmproj; /* vision projector, resident like the weights */
     qe_vision *vision; /* its tower, NULL when there is none to drive */
+    /* Cells kept aside for rewind points whose cells another prompt overwrote: a range
+     * of every per-cell cache, the ids it holds, and when it was last of use. Bounded by
+     * span_budget bytes, oldest given up first. See spans_save. */
+    struct kv_span {
+        long from, to;
+        int *ids;   /* the ids of cells [from, to), the transcript's spelling */
+        void *data; /* qe_forward_cells_get of [from, to) */
+        size_t bytes;
+        uint64_t used;
+    } *spans;
+    int n_spans, cap_spans;
+    size_t span_bytes, span_budget;
+    uint64_t span_clock;
+    long span_puts, span_saves; /* for the status line */
     int vis_k, vis_n;  /* the image being encoded, of how many, for the panel */
     qe_model *mtp;    /* draft head, in its own GGUF, resident like the weights */
     qe_tok *tok;       /* real BPE tokenizer, NULL if the file's is unusable */
@@ -429,7 +443,12 @@ static void turns_views(qe_engine *e) {
  * prompt and the best boundary on hand did agree before they disagreed, which is a
  * position in the conversation rather than the fact that one was lost. Callers that
  * match also take the slot out of the eviction queue's future. */
-static int turns_match(qe_engine *e, const int *ids, long np, long *at, long *agreed) {
+/* `limit` is how much of the prompt the cache cells really hold (cells_held, below): a
+ * point longer than that would put its recurrent state back on top of keys and values
+ * that belong to some other prompt. `agreed` is still measured over the whole prompt,
+ * because it is the client's diagnostic and not the engine's. */
+static int turns_match(qe_engine *e, const int *ids, long np, long limit, long *at,
+                       long *agreed) {
     if (!e->turn_views) {
         if (at)
             *at = 0;
@@ -438,10 +457,210 @@ static int turns_match(qe_engine *e, const int *ids, long np, long *at, long *ag
         return -1;
     }
     turns_views(e);
-    const int best = qe_turns_match(e->turn_views, e->n_turns, ids, np, at, agreed,
-                                    &e->turn_clock);
+    if (agreed)
+        qe_turns_match(e->turn_views, e->n_turns, ids, np, NULL, agreed, NULL);
+    const int best = qe_turns_match(e->turn_views, e->n_turns, ids, limit < np ? limit : np,
+                                    at, NULL, &e->turn_clock);
     if (best >= 0)
         e->turns[best].used = e->turn_clock;
+    return best;
+}
+
+/* How much of this prompt the forward pass's caches hold: the length of its agreement
+ * with the transcript that was fed, from cell 0. A rewind point copies the recurrences
+ * and nothing else - keys, values and the indexer's keys stay in the caches, under the
+ * position they were written at - so a point is only the state of its prefix while the
+ * cells under it still hold that prefix. Any prompt fed from a position below the
+ * point's has written over them: another session, a sub-agent, a client's title
+ * request. Restoring the point then is the recurrent state of one conversation on top
+ * of the attention context of another, and the model answers from the mixture - asked
+ * for a code word its system prompt held, it said there was none. */
+static long cells_held(const qe_engine *e, const int *ids, long np) {
+    if (!e->fed || !e->fed_valid)
+        return 0;
+    const long n = e->fed_n < np ? e->fed_n : np;
+    long k = 0;
+    while (k < n && e->fed[k] == ids[k])
+        k++;
+    return k;
+}
+
+/* ------------------------------------------------------------------ kept cells
+ *
+ * cells_held makes a rewind point honest and makes interleaving expensive: a title
+ * request between two turns of a session, or a sub-agent, writes over the cells the
+ * session's points stand on, and the session then reads its whole prompt again. So the
+ * cells a prompt is about to overwrite are copied aside first - only when a held point
+ * still needs them, and only the range it needs - and put back when a later prompt
+ * matches that point. About 20 KiB a cell on this checkpoint: a title request's worth
+ * is a few MiB, a sub-agent's or a long session's a few hundred. */
+
+static void span_drop(qe_engine *e, int k) {
+    struct kv_span *sp = &e->spans[k];
+    e->span_bytes -= sp->bytes;
+    free(sp->ids);
+    free(sp->data);
+    e->spans[k] = e->spans[--e->n_spans];
+}
+
+static void spans_free(qe_engine *e) {
+    while (e->n_spans)
+        span_drop(e, e->n_spans - 1);
+    free(e->spans);
+    e->spans = NULL;
+    e->cap_spans = 0;
+}
+
+/* Room for `need` more bytes, giving up the least recently used spans. */
+static int spans_room(qe_engine *e, size_t need) {
+    if (need > e->span_budget)
+        return -1;
+    while (e->span_bytes + need > e->span_budget && e->n_spans) {
+        int old = 0;
+        for (int k = 1; k < e->n_spans; k++)
+            if (e->spans[k].used < e->spans[old].used)
+                old = k;
+        span_drop(e, old);
+    }
+    return 0;
+}
+
+/* Does point `pt` stand on cells that hold its prefix now, from cell `from` on? */
+static int point_on_fed(const qe_engine *e, const qe_state *pt, long from) {
+    const long pos = qe_state_pos(pt);
+    const uint32_t *pid = qe_state_ids(pt);
+    if (!pid || pos > e->fed_n)
+        return 0;
+    for (long k = from; k < pos; k++)
+        if ((int)pid[k] != e->fed[k])
+            return 0;
+    return 1;
+}
+
+/* Before the cells from `h` on are written over by a prompt that agrees with what
+ * they hold only up to `h`: keep [h, end) when a held point needs it, end being the
+ * longest such point. Its ids are the transcript's, which is what they hold. */
+static void spans_save(qe_engine *e, long h) {
+    if (!e->span_budget || !e->fed || !e->fed_valid || h >= e->fed_n)
+        return;
+    /* Only prompt-end points are kept for. An answer-end point is the state after the
+     * answer as it was generated, which a client that re-renders the turn - crush, and
+     * every client that sends structured tool calls back - never sends again, so it is
+     * the next request's carry-over or nothing; keeping cells for it would stretch every
+     * kept range to the end of an answer nobody returns to, and keep stale ranges alive. */
+    long end = h;
+    for (int i = 0; i < e->n_turns; i++) {
+        const qe_state *st = e->turns[i].st;
+        if (!st || !e->turns[i].tail_valid || e->turns[i].answer)
+            continue;
+        const long pos = qe_state_pos(st);
+        if (pos > end && point_on_fed(e, st, h))
+            end = pos;
+    }
+    if (end <= h)
+        return;
+    for (int k = 0; k < e->n_spans; k++) { /* already kept: the same cells, same ids */
+        struct kv_span *sp = &e->spans[k];
+        if (sp->from <= h && sp->to >= end &&
+            !memcmp(sp->ids + (h - sp->from), e->fed + h, (size_t)(end - h) * sizeof(int))) {
+            sp->used = ++e->span_clock;
+            return;
+        }
+    }
+    /* A span whose every use this one also serves is the same conversation's cells
+     * kept at an earlier turn: two sub-agents taking turns keep each other's cells again
+     * at every switch, one turn longer each time, and the copies they leave behind are
+     * what would otherwise push a waiting session's cells out of the budget. Not "this
+     * one contains it byte for byte" - a kept range ends in the answer as it was
+     * generated, which the next prompt re-renders, so two of them never agree to the
+     * last cell even when every point the older one could put back is in the newer. */
+    for (int k = e->n_spans - 1; k >= 0; k--) {
+        const struct kv_span *sp = &e->spans[k];
+        if (sp->from < h)
+            continue;
+        int needed = 0;
+        for (int i = 0; i < e->n_turns && !needed; i++) {
+            const qe_state *st = e->turns[i].st;
+            if (!st || !e->turns[i].tail_valid || e->turns[i].answer)
+                continue;
+            const long pos = qe_state_pos(st);
+            if (pos <= sp->from || pos > sp->to)
+                continue;
+            const uint32_t *pid = qe_state_ids(st);
+            long q = sp->from;
+            while (q < pos && (int)pid[q] == sp->ids[q - sp->from])
+                q++;
+            if (q < pos)
+                continue; /* not a point this span serves */
+            /* served here; is it served by the new range too? */
+            needed = pos > end || !point_on_fed(e, st, h);
+        }
+        if (!needed)
+            span_drop(e, k);
+    }
+    const size_t bytes = qe_forward_cells_bytes(e->fw, h, end);
+    if (!bytes || spans_room(e, bytes))
+        return;
+    if (e->n_spans == e->cap_spans) {
+        const int cap = e->cap_spans ? e->cap_spans * 2 : 8;
+        struct kv_span *g = realloc(e->spans, (size_t)cap * sizeof *g);
+        if (!g)
+            return;
+        e->spans = g;
+        e->cap_spans = cap;
+    }
+    struct kv_span sp = { .from = h, .to = end, .bytes = bytes, .used = ++e->span_clock };
+    sp.ids = malloc((size_t)(end - h) * sizeof *sp.ids);
+    sp.data = malloc(bytes);
+    if (!sp.ids || !sp.data || qe_forward_cells_get(e->fw, h, end, sp.data)) {
+        free(sp.ids);
+        free(sp.data);
+        return;
+    }
+    memcpy(sp.ids, e->fed + h, (size_t)(end - h) * sizeof *sp.ids);
+    e->spans[e->n_spans++] = sp;
+    e->span_bytes += bytes;
+    e->span_saves++;
+}
+
+/* The longest point this prompt can go back to: one whose cells are still held (up to
+ * `h`), or one whose missing cells [h, pos) a kept span holds with this prompt's ids.
+ * Returns the slot, with *span the span to put back first, or -1 for none needed. */
+static int turns_match_spans(qe_engine *e, const int *ids, long np, long h, long *at,
+                             long *agreed, int *span) {
+    *span = -1;
+    int best = turns_match(e, ids, np, h, at, agreed);
+    long best_pos = best >= 0 ? *at : 0;
+    for (int i = 0; i < e->n_turns && e->n_spans; i++) {
+        const qe_state *st = e->turns[i].st;
+        if (!st || !e->turns[i].tail_valid)
+            continue;
+        const long pos = qe_state_pos(st);
+        if (pos <= h || pos > np || pos <= best_pos)
+            continue;
+        const uint32_t *pid = qe_state_ids(st);
+        long k = 0;
+        while (k < pos && (int)pid[k] == ids[k])
+            k++;
+        if (k != pos)
+            continue;
+        for (int q = 0; q < e->n_spans; q++) {
+            const struct kv_span *sp = &e->spans[q];
+            if (sp->from > h || sp->to < pos)
+                continue;
+            if (memcmp(sp->ids + (h - sp->from), ids + h, (size_t)(pos - h) * sizeof(int)))
+                continue;
+            best = i;
+            best_pos = pos;
+            *span = q;
+            break;
+        }
+    }
+    if (*span >= 0) {
+        e->turns[best].used = ++e->turn_clock;
+        e->spans[*span].used = ++e->span_clock;
+        *at = best_pos;
+    }
     return best;
 }
 
@@ -1025,6 +1244,12 @@ qe_engine *qe_engine_open(const qe_engine_opts *o, char *err, size_t errn) {
                      e->n_batch);
         } else {
             turns_init(e);
+            /* The kept-cells budget: the cells a prompt overwrites under a held point.
+             * 4 GiB holds a long session and two long sub-agents together; 0 turns it off,
+             * and a turn whose cells were overwritten then reads its prompt again. */
+            const char *ev = getenv("QE_KV_SPAN_MIB");
+            const long mib = ev ? atol(ev) : 4096;
+            e->span_budget = e->n_turns > 0 && mib > 0 ? (size_t)mib << 20 : 0;
         }
         /* The walk threshold the operator asked for, which outranks the environment
          * the pass read at open: positive blocks every projection of that size in
@@ -1173,6 +1398,7 @@ void qe_engine_close(qe_engine *e) {
         pthread_cond_wait(&e->lane_cv, &e->lock);
     pthread_mutex_unlock(&e->lock);
     turns_discard(e);
+    spans_free(e);
     free(e->turns);
     free(e->turn_views);
     spec_drop(&e->spec);
@@ -2025,9 +2251,21 @@ static long gen_checkpoint(qe_engine *e, const qe_prompt *p, const qe_gen_opts *
      * after those tokens, at those positions. */
     if (!reuse && e->prefix_cache && e->n_turns > 0) {
         long at = 0, far = 0;
-        int slot = turns_match(e, ids, np, &at, &far);
+        int span = -1;
+        const long h = cells_held(e, ids, np);
+        int slot = turns_match_spans(e, ids, np, h, &at, &far, &span);
         if (far > lcp)
             lcp = far;
+        /* The cells from h on are about to change hands, whichever way this goes:
+         * kept first if a point still stands on them. */
+        spans_save(e, h);
+        if (slot >= 0 && span >= 0) {
+            const struct kv_span *sp = &e->spans[span];
+            if (qe_forward_cells_put(e->fw, sp->from, sp->to, sp->data))
+                slot = -1;
+            else
+                e->span_puts++;
+        }
         if (slot >= 0 && qe_forward_restore(e->fw, e->turns[slot].st) == 0) {
             reuse = at;
             rewound = 1;
@@ -2705,6 +2943,24 @@ size_t qe_engine_proj_chunk(qe_engine *e) {
  * for the one measurement that matters to a cache like this: the same two turns
  * with reuse on and off have to answer identically, and anything that is only
  * approximately the same answer is a wrong answer that happens to be fast. */
+void qe_engine_span_stats(qe_engine *e, long *spans, long long *bytes, long long *budget,
+                          long *saves, long *puts) {
+    if (!e)
+        return;
+    pthread_mutex_lock(&e->lock);
+    if (spans)
+        *spans = e->n_spans;
+    if (bytes)
+        *bytes = (long long)e->span_bytes;
+    if (budget)
+        *budget = (long long)e->span_budget;
+    if (saves)
+        *saves = e->span_saves;
+    if (puts)
+        *puts = e->span_puts;
+    pthread_mutex_unlock(&e->lock);
+}
+
 int qe_engine_prefix_cache(qe_engine *e, int on) {
     if (!e)
         return 0;

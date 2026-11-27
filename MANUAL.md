@@ -293,6 +293,21 @@ position the engine can go back to - a client that re-renders the front of its o
 transcript - while `cached=0 agreed=9820` is a cache that ran out, which is what
 `turn_cache_short` on `/v1/models` reports for the process as a whole.
 
+A rewind point holds the recurrent state and nothing else: the keys and values under it
+stay in the attention caches at the positions they were written to. So a point is only
+good while those cells still hold its prefix, and every prompt fed in between writes
+over them - a title request, a sub-agent, a second session. The engine therefore goes
+back only as far as the cells still agree with the prompt, and keeps the cells a new
+prompt is about to overwrite **when a held prompt-end point still stands on them**. These
+*kept cells* (`QE_KV_SPAN_MIB`, default 4096, `0` off) cost about 20 KiB a token on this
+checkpoint. They are put back before the point is restored, so a session that waited
+behind two sub-agents resumes where it stopped instead of reading 30k tokens again. A
+kept range that a later, longer range of the same conversation covers is given up.
+Otherwise the least recently used range goes first. The banner prints the budget, and
+`/v1/models` reports `kept_cells_*` next to `turn_cache_*`. `make prefix` asserts
+the case: a turn, an unrelated prompt, then the follow-up, which has to rewind through
+kept cells and answer token for token as it does cold.
+
 `POST /v1/completions` takes an array `prompt` as a batch: at most 16 strings,
 run one per engine call, answered with one choice per element and
 `choices[i].index == i`. `stream: true` with an array is a 400 (a batch has one

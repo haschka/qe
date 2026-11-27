@@ -1898,6 +1898,14 @@ int qe_forward_snapshot(const qe_forward *f, qe_state *out);
  * queue - and returns 0, or -1 without touching `f` at all. The snapshot stays
  * valid and can be restored repeatedly. */
 int qe_forward_restore(qe_forward *f, const qe_state *in);
+/* Cells [from, to) of a single-sequence pass - keys, values, the indexer's keys, ids and
+ * rope positions - out of the caches and back. A rewind point holds the recurrences only
+ * and relies on the cells under it staying put; these are what lets a caller keep the
+ * cells another prompt is about to overwrite and give them back to their conversation.
+ * bytes() is 0 for a range or a pass these cannot serve. */
+size_t qe_forward_cells_bytes(qe_forward *f, long from, long to);
+int qe_forward_cells_get(qe_forward *f, long from, long to, void *buf);
+int qe_forward_cells_put(qe_forward *f, long from, long to, const void *buf);
 /* How many tokens a rewind point covers, and the ids of those tokens. Both belong
  * to the snapshot and are good until it is freed. */
 long qe_state_pos(const qe_state *s);
@@ -2484,6 +2492,10 @@ void qe_engine_describe(const qe_engine *e, qe_engine_info *out);
  * that sequence plus new tokens feeds only what was added. On unless turned off,
  * and returns what it was. Turning it off discards what was being held. */
 int qe_engine_prefix_cache(qe_engine *e, int on);
+/* The kept cells (src/engine.c, spans_save): how many ranges, their bytes, the budget,
+ * and how often a range was kept and how often one was put back under a point. */
+void qe_engine_span_stats(qe_engine *e, long *spans, long long *bytes, long long *budget,
+                          long *saves, long *puts);
 /* The checkpoint's tokenizer, or NULL when the file's tokenizer could not be
  * loaded (or this is the selftest engine, which has no vocabulary). Owned by
  * the engine; callers must not close it. Reported token counts use it when it

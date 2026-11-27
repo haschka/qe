@@ -682,6 +682,17 @@ static void qe_block(qe_str *s, server *st, const char *extra) {
         qe_str_appendf(s, ",\"turn_cache_bytes\":%lld", bytes);
         qe_str_appendf(s, ",\"turn_cache_saved\":%lld", saved);
         qe_str_appendf(s, ",\"turn_cache_budget_mib\":%d", st->info.turn_cache_mib);
+        {
+            /* The cells kept for points another prompt wrote over: without them an
+             * interleaved session re-reads its prompt, with them it rewinds. */
+            long ns = 0, sv = 0, pu = 0;
+            long long sb = 0, bud = 0;
+            qe_engine_span_stats(st->eng, &ns, &sb, &bud, &sv, &pu);
+            qe_str_appendf(s, ",\"kept_cells_spans\":%ld,\"kept_cells_bytes\":%lld,"
+                              "\"kept_cells_budget_mib\":%lld,\"kept_cells_saved\":%ld,"
+                              "\"kept_cells_restored\":%ld",
+                           ns, sb, bud >> 20, sv, pu);
+        }
         /* The difference between "the cache is broken" and "this conversation is
          * longer than the cache", which is otherwise a guess a client has to make
          * from a cached_tokens number that stopped rising. */
@@ -1558,6 +1569,13 @@ int qe_serve(const qe_serve_opts *opts) {
              * cache that is broken: the conversation outgrows it and every turn
              * after that reads itself again. Said here, once, at the width the
              * operator still has room to change. */
+            {
+                long long bud = 0;
+                qe_engine_span_stats(eng, NULL, NULL, &bud, NULL, NULL);
+                fprintf(stderr, "qe: kept cells: %lld MiB for the cells another prompt "
+                                "overwrites under a rewind point (QE_KV_SPAN_MIB)\n",
+                        bud >> 20);
+            }
             if (st.info.turn_cache_auto && slots < st.info.turn_cache_points)
                 fprintf(stderr,
                         "qe: turn cache: short of the %d points it asks for, so a "
